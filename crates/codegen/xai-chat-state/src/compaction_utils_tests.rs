@@ -2012,23 +2012,6 @@ async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "I'll read both files for you.".into(),
-            tool_calls: vec![
-                ToolCall {
-                    id: "call_1".into(),
-                    name: "read_file".to_string(),
-                    arguments: r#"{"target_file":"src/main.rs"}"#.into(),
-                },
-                ToolCall {
-                    id: "call_2".into(),
-                    name: "read_file".to_string(),
-                    arguments: r#"{"target_file":"src/lib.rs"}"#.into(),
-                },
-            ],
-            model_id: Some("grok-3".to_string()),
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         // [4] Tool result for call_1
         ConversationItem::tool_result("call_1", "fn main() {\n    println!(\"hello world\");\n}"),
