@@ -8,6 +8,8 @@ pub mod announcements;
 pub mod auto;
 pub mod btw;
 pub mod cd;
+pub mod changes;
+pub mod claude;
 pub mod compact;
 pub mod compact_mode;
 pub mod config_agents;
@@ -34,18 +36,24 @@ pub mod imagine;
 pub mod imagine_video;
 pub mod import_claude;
 pub mod jump;
+#[cfg(feature = "codex-live")]
+pub mod live;
 pub mod login;
 pub mod logout;
 pub mod loop_cmd;
 pub mod mcps;
 pub mod model;
 pub mod multiline;
+pub mod nexus;
+pub mod scoped_models;
 pub mod new;
 pub mod personas;
 pub mod plan;
 pub mod plugin;
 pub mod privacy;
+pub mod providers;
 pub mod queue;
+pub mod readiness;
 pub mod recap;
 pub mod release_notes;
 pub mod remember;
@@ -71,6 +79,23 @@ pub mod voice;
 pub mod workflows;
 use super::command::SlashCommand;
 use std::sync::Arc;
+
+/// Per-platform OAuth login/logout commands shown in error hints.
+///
+/// Shared by `/logout provider <platform>` and `/providers clear <platform>`
+/// so the two slash commands cannot drift on which CLI command to suggest.
+pub(crate) fn oauth_login_logout_hint(
+    platform: xai_grok_models::PlatformId,
+) -> (&'static str, &'static str) {
+    match platform {
+        xai_grok_models::PlatformId::OpenAiCodex => ("/login openai", "grok logout --openai"),
+        xai_grok_models::PlatformId::AnthropicClaude => {
+            ("/login claude", "grok logout --claude")
+        }
+        _ => ("/login kimi", "grok logout --kimi"),
+    }
+}
+
 /// All pager-local builtin commands, in display order.
 ///
 /// This is the single source of truth for the builtin command set.
@@ -96,6 +121,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(screen_mode_switch::ScreenModeSwitchCommand::minimal()),
         Arc::new(screen_mode_switch::ScreenModeSwitchCommand::fullscreen()),
         Arc::new(model::ModelCommand),
+        Arc::new(scoped_models::ScopedModelsCommand),
         Arc::new(effort::EffortCommand),
         Arc::new(always_approve::AlwaysApproveCommand),
         Arc::new(auto::AutoCommand),
@@ -123,7 +149,11 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(btw::BtwCommand),
         Arc::new(recap::RecapCommand),
         Arc::new(doctor::DoctorCommand),
+        Arc::new(readiness::ReadinessCommand),
+        Arc::new(changes::ChangesCommand),
         Arc::new(voice::VoiceCommand),
+        #[cfg(feature = "codex-live")]
+        Arc::new(live::LiveCommand),
         Arc::new(loop_cmd::LoopCommand),
         Arc::new(imagine::ImagineCommand),
         Arc::new(imagine_video::ImagineVideoCommand),
@@ -136,6 +166,9 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(jump::JumpCommand),
         Arc::new(login::LoginCommand),
         Arc::new(logout::LogoutCommand),
+        Arc::new(claude::ClaudeCommand),
+        Arc::new(nexus::NexusCommand),
+        Arc::new(providers::ProvidersCommand),
         Arc::new(import_claude::ImportClaudeCommand),
         Arc::new(usage::UsageCommand),
         Arc::new(queue::QueueCommand),
@@ -251,6 +284,7 @@ mod tests {
             "btw",
             "cd",
             "changelog",
+            "changes",
             "chat",
             "clear",
             "cloud",
@@ -286,6 +320,8 @@ mod tests {
             "imagine-video",
             "import-claude",
             "jump",
+            #[cfg(feature = "codex-live")]
+            "live",
             "login",
             "logout",
             "log",
@@ -306,13 +342,18 @@ mod tests {
             "preferences",
             "prefs",
             "privacy",
+            "provider",
+            "providers",
             "queue",
             "quit",
+            "readiness",
             "recap",
             "release-notes",
             "remember",
             "rename",
+            "repo-check",
             "resume",
+            "review",
             "rewind",
             "scroll-debug",
             "session-info",

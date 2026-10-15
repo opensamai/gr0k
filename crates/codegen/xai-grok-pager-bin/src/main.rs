@@ -29,6 +29,7 @@ use anyhow::Result;
 use std::env;
 use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
+use xai_grok_pager::app::cli::DashboardArgs;
 use xai_grok_pager::app::{
     AgentCmd, Command, HeadlessArgs, LeaderMgmtArgs, LeaderMgmtCommand, LeaderTargetArgs,
     PagerArgs, join_early_prefetch, resolve_use_leader,
@@ -44,7 +45,17 @@ use xai_grok_shell::leader::{
 use xai_grok_shell::leader::{
     ControlPayload, LeaderClient, LeaderEnvUrls, connect_or_spawn, socket_path_for_ws_url,
 };
-use xai_grok_update::{UpdateConfig, auto_update, enforce_version_policy_or_exit};
+use xai_grok_update::{UpdateConfig, auto_update};
+
+/// Community builds skip the upstream version-policy gate (fork releases
+/// follow their own cadence; the required-range check is for official builds).
+fn enforce_version_policy_or_exit_community() {
+    if cfg!(feature = "community-build") {
+        return;
+    }
+    xai_grok_update::enforce_version_policy_or_exit();
+}
+
 /// Apply headless args to an existing config, only overriding values that are
 /// explicitly set. This allows environment defaults to be preserved when
 /// specific args are not provided.
@@ -147,6 +158,39 @@ fn init_tracing_simple(app_entrypoint: &'static str) {
         ),
     );
 }
+/// The local dashboard must not initialize product analytics or external OTEL.
+/// It only needs a small stderr subscriber for server diagnostics.
+fn init_dashboard_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("xai_grok_dashboard=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Run the browser dashboard before pager initialization. This keeps the
+/// read-only observer out of memtrace, Sentry, crash-session cleanup, managed
+/// policy checks, and other TUI startup side effects.
+fn run_web_dashboard(args: &DashboardArgs) -> Result<()> {
+    init_dashboard_tracing();
+    let mut config = xai_grok_dashboard::DashboardServerConfig::new(xai_grok_config::grok_home());
+    if let Some(bind) = args.bind {
+        config.bind = bind;
+    }
+    config.open_browser = !args.no_open;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    run_and_shutdown(
+        runtime,
+        xai_grok_dashboard::serve(config),
+        RUNTIME_SHUTDOWN_GRACE,
+    )
+}
+
 /// `grok setup`: rendering + exit codes only; fetch logic lives in `xai_grok_shell::managed_config`.
 /// `json` prints the served configuration instead of installing it.
 async fn run_setup_command(json: bool) {
@@ -1456,22 +1500,14 @@ fn raise_fd_limit() {
 }
 #[cfg(not(target_os = "macos"))]
 fn raise_fd_limit() {}
-/// Single audit point for the `Command::Dashboard` soft-subcommand.
-/// Sets `GROK_OPEN_DASHBOARD_AT_STARTUP=1` if the user asked for
-/// `grok dashboard`, and clears `args.command` so the regular
-/// subcommand match doesn't try to handle it.
-///
-/// The dashboard is independent of leader mode — it renders local
-/// sessions and, when a leader happens to be present, additionally shows
-/// the leader roster — so `grok dashboard` does NOT force leader mode and
-/// is compatible with `--no-leader`.
-///
-/// The only gate is the feature flag: a disabled dashboard
-/// (`[dashboard].enabled = false` / `GROK_AGENT_DASHBOARD=0`) is a CLI
-/// error here, before the TUI starts, because the welcome view silently
-/// drops the equivalent runtime toast.
+/// Consume the bare `dashboard` soft-subcommand and mark the terminal
+/// dashboard for startup. `dashboard --web` is a real command and deliberately
+/// remains in `args.command` for the async dispatcher below.
 fn flag_dashboard_at_startup_if_requested(args: &mut PagerArgs) -> Result<()> {
-    if !matches!(args.command, Some(Command::Dashboard)) {
+    let Some(Command::Dashboard(dashboard_args)) = &args.command else {
+        return Ok(());
+    };
+    if dashboard_args.web {
         return Ok(());
     }
     if !xai_grok_pager::views::dashboard::dashboard_enabled() {
@@ -1620,8 +1656,15 @@ fn install_heap_profile_hooks() {
     });
 }
 fn version_text(channel_label: &str) -> String {
+    // Community Hyper builds ship the `hyper` binary; keep the official
+    // product name only when this crate is built without `community-build`.
+    let product = if cfg!(feature = "community-build") {
+        "hyper"
+    } else {
+        "grok"
+    };
     format!(
-        "grok {}\n",
+        "{product} {}\n",
         xai_grok_version::display_version_with_commit(env!("VERSION_WITH_COMMIT"), channel_label,)
     )
 }
@@ -1660,6 +1703,15 @@ fn main() {
     }
     let args = PagerArgs::parse_cli();
     if dispatch_version_if_requested(&args) || dispatch_doctor_if_requested(&args) {
+        return;
+    }
+    if let Some(Command::Dashboard(dashboard_args)) = &args.command
+        && dashboard_args.web
+    {
+        if let Err(error) = run_web_dashboard(dashboard_args) {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
         return;
     }
     xai_grok_pager_minimal::install();
@@ -1733,6 +1785,11 @@ fn main() {
     }
 }
 async fn async_main(args: PagerArgs) -> Result<()> {
+    // Record the main runtime handle so sync call sites with no runtime
+    // context (e.g. the Kimi bearer resolver on a plain std thread) can run
+    // their async work on the main runtime, where the shared reqwest client
+    // lives and `tokio::time::timeout` therefore fires.
+    xai_grok_shell::main_runtime::set_main_runtime_handle(&tokio::runtime::Handle::current());
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut args = args.apply_cwd()?;
     if let Some(ref mode) = args.compaction_mode {
@@ -1789,6 +1846,15 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         sandbox_profile_arg.as_deref(),
         args.cwd.as_deref(),
     );
+    // `grok codex` is a shim over the native OpenAI Codex platform: rewrite
+    // the invocation into the standard pager flows (TUI / headless) pinned
+    // to an `openai-codex/*` model before interactive-mode detection.
+    if let Some(Command::Codex(codex_args)) = args.command.clone() {
+        match xai_grok_pager::codex::rewrite_pager_args(&codex_args, &mut args).await? {
+            xai_grok_pager::codex::CodexRewrite::Handled => return Ok(()),
+            xai_grok_pager::codex::CodexRewrite::Continue => {}
+        }
+    }
     flag_dashboard_at_startup_if_requested(&mut args)?;
     let is_interactive = args.command.is_none()
         && args.single.is_none()
@@ -1829,7 +1895,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                          Use `grok-pager agent {flag}` instead."
                     );
                 }
-                enforce_version_policy_or_exit();
+                enforce_version_policy_or_exit_community();
                 return run_agent_command(
                     agent_args,
                     args.permission_mode_flag.clone(),
@@ -1840,8 +1906,11 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 )
                 .await;
             }
+            Command::Codex(_) => {
+                unreachable!("grok codex is rewritten into pager args before dispatch");
+            }
             Command::Doctor(_) => {
-                unreachable!("doctor was consumed before runtime startup")
+                unreachable!("doctor was consumed before runtime startup");
             }
             Command::Inspect { json } => {
                 let cwd = std::env::current_dir().unwrap_or_default();
@@ -1951,25 +2020,107 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 legacy: _,
                 oauth,
                 device_auth,
+                kimi,
+                openai,
+                claude,
                 devbox,
             } => {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let config = AgentConfig::new_from_toml_cfg(&config)
-                    .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                xai_grok_shell::auth::run_cli_login(&config, oauth, device_auth, devbox).await?;
+                if kimi {
+                    xai_grok_shell::auth::kimi::run_kimi_code_login().await?;
+                } else if openai {
+                    let method = if device_auth {
+                        xai_grok_shell::auth::openai_codex::CodexLoginMethod::DeviceCode
+                    } else {
+                        xai_grok_shell::auth::openai_codex::CodexLoginMethod::Browser
+                    };
+                    xai_grok_shell::auth::openai_codex::run_openai_codex_login(None, method)
+                        .await?;
+                } else if claude {
+                    xai_grok_shell::auth::anthropic_claude::run_anthropic_claude_login(None)
+                        .await?;
+                } else {
+                    let config = xai_grok_shell::config::load_effective_config_disk_only()
+                        .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+                    let config = AgentConfig::new_from_toml_cfg(&config)
+                        .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
+                    xai_grok_shell::auth::run_cli_login(&config, oauth, device_auth, devbox)
+                        .await?;
+                }
                 println!();
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
-            Command::Logout => {
+            Command::Logout {
+                kimi,
+                openai,
+                claude,
+                all,
+            } => {
                 init_tracing_simple("cli");
-                let config = xai_grok_shell::config::load_effective_config_disk_only()
-                    .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
-                let config = AgentConfig::new_from_toml_cfg(&config)
-                    .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                xai_grok_shell::auth::run_cli_logout(&config)?;
+                if all {
+                    let config = xai_grok_shell::config::load_effective_config_disk_only()
+                        .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+                    let config = AgentConfig::new_from_toml_cfg(&config)
+                        .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
+                    xai_grok_shell::auth::run_cli_logout_all(&config)?;
+                } else if kimi {
+                    xai_grok_shell::auth::run_cli_logout_kimi()?;
+                } else if openai {
+                    xai_grok_shell::auth::run_cli_logout_openai_codex()?;
+                } else if claude {
+                    xai_grok_shell::auth::run_cli_logout_anthropic_claude()?;
+                } else {
+                    let config = xai_grok_shell::config::load_effective_config_disk_only()
+                        .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+                    let config = AgentConfig::new_from_toml_cfg(&config)
+                        .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
+                    xai_grok_shell::auth::run_cli_logout(&config)?;
+                }
+                xai_grok_shell::instrumentation::finalize_and_exit(0);
+            }
+            Command::Nexus {
+                key,
+                base_url,
+                clear,
+            } => {
+                init_tracing_simple("cli");
+                let home = xai_grok_config::grok_home();
+                if clear {
+                    xai_grok_shell::auth::clear_platform_api_key(&home, "nexus")
+                        .map_err(|e| anyhow::anyhow!("Failed to clear Nexus key: {e}"))?;
+                    println!("✓ Nexus key removed from ~/.grok/auth.json");
+                } else if let Some(key) = key {
+                    xai_grok_shell::auth::store_platform_api_key(
+                        &home,
+                        "nexus",
+                        &key,
+                        base_url.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to save Nexus key: {e}"))?;
+                    println!("✓ Nexus key saved to ~/.grok/auth.json");
+                    if let Some(base) = base_url.as_deref() {
+                        println!("  gateway root: {base}");
+                    }
+                    println!("  models appear as nexus/* after launch.");
+                } else {
+                    // No key, no --clear → print onboarding guide + current status.
+                    println!(
+                        "{}",
+                        xai_grok_pager::slash::commands::nexus::nexus_setup_guide()
+                    );
+                    match xai_grok_shell::auth::read_platform_api_key(&home, "nexus") {
+                        Some(_) => {
+                            let root = xai_grok_shell::auth::read_platform_base_url(&home, "nexus")
+                                .unwrap_or_else(|| {
+                                    xai_grok_pager::slash::commands::nexus::nexus_default_root()
+                                        .to_string()
+                                });
+                            println!("\n当前状态: 已配置 (网关: {root})");
+                        }
+                        None => println!("\n当前状态: 未配置"),
+                    }
+                }
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
             Command::Wrap(ref wrap_args) => {
@@ -1979,9 +2130,18 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 xai_grok_pager::completions_cmd::run(shell);
                 return Ok(());
             }
-            Command::Dashboard => {
-                args.command = Some(Command::Dashboard);
-                flag_dashboard_at_startup_if_requested(&mut args)?;
+            Command::Dashboard(dashboard_args) => {
+                if !dashboard_args.web {
+                    unreachable!("bare dashboard is consumed before command dispatch");
+                }
+                init_dashboard_tracing();
+                let mut config =
+                    xai_grok_dashboard::DashboardServerConfig::new(xai_grok_config::grok_home());
+                if let Some(bind) = dashboard_args.bind {
+                    config.bind = bind;
+                }
+                config.open_browser = !dashboard_args.no_open;
+                return xai_grok_dashboard::serve(config).await;
             }
         }
     }
@@ -1993,7 +2153,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
     if let Some(prompt) = headless_prompt {
         init_tracing_simple(HEADLESS_ENTRYPOINT);
         let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
-        enforce_version_policy_or_exit();
+        enforce_version_policy_or_exit_community();
         let launch_yolo = xai_grok_shell::util::config::effective_yolo_for_launch(
             args.yolo,
             args.permission_mode_flag.as_deref(),
@@ -2049,7 +2209,7 @@ async fn async_main(args: PagerArgs) -> Result<()> {
         )
         .await;
     }
-    enforce_version_policy_or_exit();
+    enforce_version_policy_or_exit_community();
     let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
     type UpdateWaitHandle = tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>>;
     let bg_update_wait: std::sync::Arc<tokio::sync::Mutex<Option<UpdateWaitHandle>>> =
@@ -2162,6 +2322,10 @@ fn build_update_config() -> UpdateConfig {
 /// Central gate for auto-update checks; add new suppression rules here,
 /// not at call sites.
 fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
+    // Community Hyper builds never touch the upstream Grok updater.
+    if cfg!(feature = "community-build") {
+        return false;
+    }
     if cfg!(debug_assertions) {
         return false;
     }
@@ -2220,6 +2384,16 @@ async fn run_update_command(
     channel_switch: Option<&str>,
     base_update_config: &UpdateConfig,
 ) -> Result<()> {
+    if cfg!(feature = "community-build") {
+        // Upstream updater targets x.ai + ~/.grok/bin/grok — never run it for
+        // Hyper community builds. Users upgrade via install.sh / install.ps1.
+        eprintln!(
+            "Updates for Hyper are managed by the installer, not `hyper update`.\n\
+             Re-run install.sh (or install.ps1) to upgrade, e.g.:\n\
+               curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.sh | bash"
+        );
+        return Ok(());
+    }
     if json && !check {
         anyhow::bail!("--json requires --check");
     }
@@ -2568,6 +2742,29 @@ mod tests {
             "startup hook flag must be set",
         );
         unsafe { std::env::remove_var("GROK_OPEN_DASHBOARD_AT_STARTUP") };
+    }
+    /// `dashboard --web` remains a real command for async dispatch and does
+    /// not set the terminal-dashboard startup flag.
+    #[serial_test::serial(GROK_AGENT_DASHBOARD)]
+    #[test]
+    fn web_dashboard_subcommand_is_not_consumed() {
+        let mut args = PagerArgs::try_parse_from([
+            "grok",
+            "dashboard",
+            "--web",
+            "--bind",
+            "127.0.0.1:9191",
+            "--no-open",
+        ])
+        .unwrap();
+        flag_dashboard_at_startup_if_requested(&mut args).unwrap();
+        let Some(Command::Dashboard(dashboard)) = args.command else {
+            panic!("web dashboard command must remain for async dispatch");
+        };
+        assert!(dashboard.web);
+        assert_eq!(dashboard.bind, Some("127.0.0.1:9191".parse().unwrap()));
+        assert!(dashboard.no_open);
+        assert!(std::env::var("GROK_OPEN_DASHBOARD_AT_STARTUP").is_err());
     }
     /// `grok dashboard --no-leader` is allowed — the dashboard does not
     /// require a leader, so the combination launches into the dashboard in

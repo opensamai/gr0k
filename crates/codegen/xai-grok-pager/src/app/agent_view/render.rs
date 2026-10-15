@@ -51,6 +51,10 @@ pub struct AppRenderParams<'a> {
     /// attached-agent popup). Feeds the hint path so the bar never
     /// advertises `Esc cancel` while an app-level owner would consume it.
     pub esc_owned_before_agent: bool,
+    /// Codex Live visualizer state — when present, the prompt container is
+    /// replaced by the fixed-height Live visualizer.
+    #[cfg(feature = "codex-live")]
+    pub live_visualizer: Option<&'a crate::live::state::LiveVisualizerState>,
 }
 impl AgentView {
     pub(crate) fn update_scrollback_selection_state(
@@ -108,23 +112,23 @@ impl AgentView {
         match pav.focus {
             PlanApprovalFocus::Commenting => {
                 vec![
-                    HintItem::new(key!(Enter), "save comment"),
-                    HintItem::new(key!(Esc), "cancel"),
+                    HintItem::new(key!(Enter), rust_i18n::t!("hints.save_comment")),
+                    HintItem::new(key!(Esc), rust_i18n::t!("hints.cancel")),
                 ]
             }
             PlanApprovalFocus::Prompt => {
                 let has_content = !pav.comments.is_empty() || !self.prompt.text().trim().is_empty();
                 if has_content {
                     vec![
-                        HintItem::new(key!(Enter), "request changes"),
-                        HintItem::new(key!(Tab), "plan"),
-                        HintItem::new(key!(Esc), "back"),
+                        HintItem::new(key!(Enter), rust_i18n::t!("hints.request_changes")),
+                        HintItem::new(key!(Tab), rust_i18n::t!("hints.plan")),
+                        HintItem::new(key!(Esc), rust_i18n::t!("hints.back")),
                     ]
                 } else {
                     vec![
-                        HintItem::new(key!(Enter), "approve"),
-                        HintItem::new(key!(Tab), "plan"),
-                        HintItem::new(key!(Esc), "back"),
+                        HintItem::new(key!(Enter), rust_i18n::t!("hints.approve")),
+                        HintItem::new(key!(Tab), rust_i18n::t!("hints.plan")),
+                        HintItem::new(key!(Esc), rust_i18n::t!("hints.back")),
                     ]
                 }
             }
@@ -161,8 +165,8 @@ impl AgentView {
                 match perm.focus {
                     PermissionFocus::FollowupInput => {
                         vec![
-                            HintItem::new(key!(Enter), "send"),
-                            HintItem::new(key!(Esc), "back"),
+                            HintItem::new(key!(Enter), rust_i18n::t!("hints.send")),
+                            HintItem::new(key!(Esc), rust_i18n::t!("hints.back")),
                         ]
                     }
                     PermissionFocus::Options => {
@@ -171,20 +175,34 @@ impl AgentView {
                         let n = perm.options.len().min(9) as u8;
                         let last_ch = char::from(b'0' + n.max(1));
                         let last_key = KeyShortcut::new(KeyCode::Char(last_ch), KeyModifiers::NONE);
-                        let mut hints = vec![HintItem::paired(key!('1'), last_key, "select")];
+                        let mut hints = vec![HintItem::paired(
+                            key!('1'),
+                            last_key,
+                            rust_i18n::t!("hints.select"),
+                        )];
                         if perm.has_adjustable_scope() {
-                            hints.push(HintItem::paired(key!(Left), key!(Right), "scope"));
+                            hints.push(HintItem::paired(
+                                key!(Left),
+                                key!(Right),
+                                rust_i18n::t!("hints.scope"),
+                            ));
                         }
                         if !perm.description.is_empty() {
                             let label = if perm.args_expanded {
-                                "collapse"
+                                rust_i18n::t!("hints.collapse")
                             } else {
-                                "expand"
+                                rust_i18n::t!("hints.expand")
                             };
                             hints.push(HintItem::new(key!('f', CONTROL), label));
                         }
-                        hints.push(HintItem::new(key!('o', CONTROL), "always-approve"));
-                        hints.push(HintItem::new(key!('c', CONTROL), "cancel"));
+                        hints.push(HintItem::new(
+                            key!('o', CONTROL),
+                            rust_i18n::t!("hints.always_approve"),
+                        ));
+                        hints.push(HintItem::new(
+                            key!('c', CONTROL),
+                            rust_i18n::t!("hints.cancel"),
+                        ));
                         hints
                     }
                 }
@@ -202,18 +220,18 @@ impl AgentView {
                 vec![]
             } else if self.is_casual_commenting() {
                 vec![
-                    HintItem::new(key!(Enter), "save comment"),
-                    HintItem::new(key!(Esc), "cancel"),
+                    HintItem::new(key!(Enter), rust_i18n::t!("hints.save_comment")),
+                    HintItem::new(key!(Esc), rust_i18n::t!("hints.cancel")),
                 ]
             } else {
                 let mut h = vec![
-                    HintItem::new(key!('c'), "comment"),
-                    HintItem::new(key!('f', CONTROL), "fullscreen"),
+                    HintItem::new(key!('c'), rust_i18n::t!("hints.comment")),
+                    HintItem::new(key!('f', CONTROL), rust_i18n::t!("hints.fullscreen")),
                 ];
                 if !self.plan_comments.is_empty() {
-                    h.push(HintItem::new(key!('s'), "send"));
+                    h.push(HintItem::new(key!('s'), rust_i18n::t!("hints.send")));
                 }
-                h.push(HintItem::new(key!(Esc), "close"));
+                h.push(HintItem::new(key!(Esc), rust_i18n::t!("hints.close")));
                 h
             }
         } else if let Some(ref qv) = self.question_view {
@@ -222,32 +240,32 @@ impl AgentView {
                 QuestionFocus::InputMode => {
                     if self.prompt.file_search_visible() {
                         vec![
-                            HintItem::paired(key!(Up), key!(Down), "nav"),
-                            HintItem::new(key!(Tab), "accept"),
-                            HintItem::new(key!(Right), "drill"),
-                            HintItem::new(key!(Esc), "dismiss"),
+                            HintItem::paired(key!(Up), key!(Down), rust_i18n::t!("hints.nav")),
+                            HintItem::new(key!(Tab), rust_i18n::t!("hints.accept")),
+                            HintItem::new(key!(Right), rust_i18n::t!("hints.drill")),
+                            HintItem::new(key!(Esc), rust_i18n::t!("hints.dismiss")),
                         ]
                     } else {
                         vec![
-                            HintItem::new(key!(Enter), "submit"),
-                            HintItem::new(key!(Esc), "back"),
+                            HintItem::new(key!(Enter), rust_i18n::t!("hints.submit")),
+                            HintItem::new(key!(Esc), rust_i18n::t!("hints.back")),
                         ]
                     }
                 }
                 QuestionFocus::Navigation => {
                     vec![
-                        HintItem::new(key!(Esc), "unselect"),
-                        HintItem::new(key!(Tab), "scrollback"),
-                        HintItem::new(key!('X'), "dismiss"),
+                        HintItem::new(key!(Esc), rust_i18n::t!("hints.unselect")),
+                        HintItem::new(key!(Tab), rust_i18n::t!("hints.scrollback")),
+                        HintItem::new(key!('X'), rust_i18n::t!("hints.dismiss")),
                     ]
                 }
             }
         } else if self.cancel_turn_view.is_some() {
             vec![
-                HintItem::paired(key!('1'), key!('4'), "select"),
-                HintItem::new(key!(Enter), "confirm"),
-                HintItem::new(key!(Esc), "keep running"),
-                HintItem::new(key!(Tab), "scrollback"),
+                HintItem::paired(key!('1'), key!('4'), rust_i18n::t!("hints.select")),
+                HintItem::new(key!(Enter), rust_i18n::t!("hints.confirm")),
+                HintItem::new(key!(Esc), rust_i18n::t!("hints.keep_running")),
+                HintItem::new(key!(Tab), rust_i18n::t!("hints.scrollback")),
             ]
         } else {
             self.normal_pane_hints(registry, esc_owned_before_agent)
@@ -696,6 +714,8 @@ impl AgentView {
             voice_listening,
             voice_interim,
             esc_owned_before_agent,
+            #[cfg(feature = "codex-live")]
+            live_visualizer,
         } = app_params;
         self.in_dashboard_overlay = in_dashboard_overlay;
         let super::BannerSlotParams {
@@ -838,14 +858,14 @@ impl AgentView {
                 .prompt_input_mode
                 .placeholder_override(self.multiline_mode)
             {
-                Some(ph)
+                Some(ph.into())
             } else if casual_commenting
                 || self
                     .plan_approval_view
                     .as_ref()
                     .is_some_and(|pav| pav.focus == PlanApprovalFocus::Commenting)
             {
-                Some("Type your comment...")
+                Some(rust_i18n::t!("hints.type_comment"))
             } else {
                 None
             },
@@ -1016,7 +1036,26 @@ impl AgentView {
         } else if cancel_turn_view_h > 0 {
             cancel_turn_view_h
         } else {
-            base_prompt_height
+            #[cfg(feature = "codex-live")]
+            {
+                if live_visualizer.is_some() {
+                    // Codex Live visualizer: reserve the fixed height (5 wide,
+                    // 3 narrow) so the visualizer is not clipped by the normal
+                    // empty editor height.
+                    let narrow = inner_width < crate::live::visualizer::NARROW_WIDTH_THRESHOLD;
+                    if narrow {
+                        crate::live::visualizer::VISUALIZER_NARROW_HEIGHT
+                    } else {
+                        crate::live::visualizer::VISUALIZER_HEIGHT
+                    }
+                } else {
+                    base_prompt_height
+                }
+            }
+            #[cfg(not(feature = "codex-live"))]
+            {
+                base_prompt_height
+            }
         };
         let prompt_height =
             prompt_height.max(prompt_style.vpad_top + 1 + prompt_style.info_block(true));
@@ -1779,7 +1818,7 @@ impl AgentView {
         }
         if let Some(msg) = self.active_toast_message() {
             let sb = layout.scrollback;
-            if let Some(toast_text) = fit_toast_text(msg, sb.width) {
+            if let Some(toast_text) = fit_toast_text(&msg, sb.width) {
                 let w = toast_text.chars().count() as u16;
                 if sb.height > 0 {
                     let x = sb.right().saturating_sub(w + 1);
@@ -2311,6 +2350,14 @@ impl AgentView {
         };
         let mut prompt_cursor_pos: Option<(u16, u16)> = None;
         let mut prompt_post_flush: Option<crate::terminal::overlay::PostFlush> = None;
+        // Hit regions are frame-local. Clearing before modal precedence is
+        // important: a permission/question overlay must never leave the prior
+        // Live footer clickable underneath it.
+        #[cfg(feature = "codex-live")]
+        {
+            self.hit_live_mute_button.clear();
+            self.hit_live_stop_button.clear();
+        }
         if permission_view_h > 0 {
             let perm_area = layout.prompt;
             if let Some(perm) = self.permission_queue.front() {
@@ -2731,38 +2778,87 @@ impl AgentView {
                 buttons.clear();
             }
         } else {
-            let collapsed = !prompt_focused && appearance.prompt.collapse_unfocused;
-            let saved_scroll = if collapsed {
-                let s = self.prompt.scroll();
-                let ovr = self.prompt.textarea.scroll_override();
-                self.prompt.textarea.set_scroll_override(Some(0));
-                Some((s, ovr))
+            // Codex Live visualizer: when Live is active, replace the prompt
+            // editor with the fixed-height visualizer. This takes priority
+            // over the normal prompt but is lower than all modals/overlays
+            // (permission, question, rewind, jump, cancel-turn) above.
+            #[cfg(feature = "codex-live")]
+            if let Some(live_state) = live_visualizer {
+                let hits = crate::live::visualizer::render(buf, layout.prompt, live_state);
+                self.hit_live_mute_button.set(hits.mute);
+                self.hit_live_stop_button.set(hits.stop);
             } else {
-                None
-            };
-            let voice_overlay = if voice_available && (voice_listening || voice_interim.is_some()) {
-                Some(crate::views::prompt_widget::VoicePromptOverlay {
-                    interim: voice_interim,
-                    color: theme.accent_running,
-                })
-            } else {
-                None
-            };
-            let prompt_result_inner = self.prompt.draw(
-                buf,
-                layout.prompt,
-                Some(layout.scrollback),
-                &prompt_style,
-                Some(&info),
-                voice_overlay,
-            );
-            if let Some((s, ovr)) = saved_scroll {
-                self.prompt.textarea.set_scroll_override(ovr);
-                self.prompt.set_scroll(s);
+                let collapsed = !prompt_focused && appearance.prompt.collapse_unfocused;
+                let saved_scroll = if collapsed {
+                    let s = self.prompt.scroll();
+                    let ovr = self.prompt.textarea.scroll_override();
+                    self.prompt.textarea.set_scroll_override(Some(0));
+                    Some((s, ovr))
+                } else {
+                    None
+                };
+                let voice_overlay =
+                    if voice_available && (voice_listening || voice_interim.is_some()) {
+                        Some(crate::views::prompt_widget::VoicePromptOverlay {
+                            interim: voice_interim,
+                            color: theme.accent_running,
+                        })
+                    } else {
+                        None
+                    };
+                let prompt_result_inner = self.prompt.draw(
+                    buf,
+                    layout.prompt,
+                    Some(layout.scrollback),
+                    &prompt_style,
+                    Some(&info),
+                    voice_overlay,
+                );
+                if let Some((s, ovr)) = saved_scroll {
+                    self.prompt.textarea.set_scroll_override(ovr);
+                    self.prompt.set_scroll(s);
+                }
+                prompt_cursor_pos = prompt_result_inner.cursor_pos;
+                if let Some(escapes) = prompt_result_inner.post_flush_escapes {
+                    prompt_post_flush = Some(escapes.into());
+                }
             }
-            prompt_cursor_pos = prompt_result_inner.cursor_pos;
-            if let Some(escapes) = prompt_result_inner.post_flush_escapes {
-                prompt_post_flush = Some(escapes.into());
+            #[cfg(not(feature = "codex-live"))]
+            {
+                let collapsed = !prompt_focused && appearance.prompt.collapse_unfocused;
+                let saved_scroll = if collapsed {
+                    let s = self.prompt.scroll();
+                    let ovr = self.prompt.textarea.scroll_override();
+                    self.prompt.textarea.set_scroll_override(Some(0));
+                    Some((s, ovr))
+                } else {
+                    None
+                };
+                let voice_overlay =
+                    if voice_available && (voice_listening || voice_interim.is_some()) {
+                        Some(crate::views::prompt_widget::VoicePromptOverlay {
+                            interim: voice_interim,
+                            color: theme.accent_running,
+                        })
+                    } else {
+                        None
+                    };
+                let prompt_result_inner = self.prompt.draw(
+                    buf,
+                    layout.prompt,
+                    Some(layout.scrollback),
+                    &prompt_style,
+                    Some(&info),
+                    voice_overlay,
+                );
+                if let Some((s, ovr)) = saved_scroll {
+                    self.prompt.textarea.set_scroll_override(ovr);
+                    self.prompt.set_scroll(s);
+                }
+                prompt_cursor_pos = prompt_result_inner.cursor_pos;
+                if let Some(escapes) = prompt_result_inner.post_flush_escapes {
+                    prompt_post_flush = Some(escapes.into());
+                }
             }
         }
         if self.prompt.file_search_visible() {
@@ -3142,8 +3238,8 @@ impl AgentView {
                 match perm.focus {
                     PermissionFocus::FollowupInput => {
                         vec![
-                            HintItem::new(key!(Enter), "send"),
-                            HintItem::new(key!(Esc), "back"),
+                            HintItem::new(key!(Enter), rust_i18n::t!("hints.send")),
+                            HintItem::new(key!(Esc), rust_i18n::t!("hints.back")),
                         ]
                     }
                     PermissionFocus::Options => {
@@ -3152,20 +3248,34 @@ impl AgentView {
                         let n = perm.options.len().min(9) as u8;
                         let last_ch = char::from(b'0' + n.max(1));
                         let last_key = KeyShortcut::new(KeyCode::Char(last_ch), KeyModifiers::NONE);
-                        let mut hints = vec![HintItem::paired(key!('1'), last_key, "select")];
+                        let mut hints = vec![HintItem::paired(
+                            key!('1'),
+                            last_key,
+                            rust_i18n::t!("hints.select"),
+                        )];
                         if perm.has_adjustable_scope() {
-                            hints.push(HintItem::paired(key!(Left), key!(Right), "scope"));
+                            hints.push(HintItem::paired(
+                                key!(Left),
+                                key!(Right),
+                                rust_i18n::t!("hints.scope"),
+                            ));
                         }
                         if !perm.description.is_empty() {
                             let label = if perm.args_expanded {
-                                "collapse"
+                                rust_i18n::t!("hints.collapse")
                             } else {
-                                "expand"
+                                rust_i18n::t!("hints.expand")
                             };
                             hints.push(HintItem::new(key!('f', CONTROL), label));
                         }
-                        hints.push(HintItem::new(key!('o', CONTROL), "always-approve"));
-                        hints.push(HintItem::new(key!('c', CONTROL), "cancel"));
+                        hints.push(HintItem::new(
+                            key!('o', CONTROL),
+                            rust_i18n::t!("hints.always_approve"),
+                        ));
+                        hints.push(HintItem::new(
+                            key!('c', CONTROL),
+                            rust_i18n::t!("hints.cancel"),
+                        ));
                         hints
                     }
                 }
@@ -3191,18 +3301,18 @@ impl AgentView {
                 use crate::views::shortcuts_bar::HintItem;
                 let hints = if self.is_casual_commenting() {
                     vec![
-                        HintItem::new(key!(Enter), "save comment"),
-                        HintItem::new(key!(Esc), "cancel"),
+                        HintItem::new(key!(Enter), rust_i18n::t!("hints.save_comment")),
+                        HintItem::new(key!(Esc), rust_i18n::t!("hints.cancel")),
                     ]
                 } else {
                     let mut h = vec![
-                        HintItem::new(key!('c'), "comment"),
-                        HintItem::new(key!('f', CONTROL), "fullscreen"),
+                        HintItem::new(key!('c'), rust_i18n::t!("hints.comment")),
+                        HintItem::new(key!('f', CONTROL), rust_i18n::t!("hints.fullscreen")),
                     ];
                     if !self.plan_comments.is_empty() {
-                        h.push(HintItem::new(key!('s'), "send"));
+                        h.push(HintItem::new(key!('s'), rust_i18n::t!("hints.send")));
                     }
-                    h.push(HintItem::new(key!(Esc), "close"));
+                    h.push(HintItem::new(key!(Esc), rust_i18n::t!("hints.close")));
                     h
                 };
                 ShortcutsBar::new(&hints)
@@ -3216,23 +3326,23 @@ impl AgentView {
                 QuestionFocus::InputMode => {
                     if self.prompt.file_search_visible() {
                         vec![
-                            HintItem::paired(key!(Up), key!(Down), "nav"),
-                            HintItem::new(key!(Tab), "accept"),
-                            HintItem::new(key!(Right), "drill"),
-                            HintItem::new(key!(Esc), "dismiss"),
+                            HintItem::paired(key!(Up), key!(Down), rust_i18n::t!("hints.nav")),
+                            HintItem::new(key!(Tab), rust_i18n::t!("hints.accept")),
+                            HintItem::new(key!(Right), rust_i18n::t!("hints.drill")),
+                            HintItem::new(key!(Esc), rust_i18n::t!("hints.dismiss")),
                         ]
                     } else {
                         vec![
-                            HintItem::new(key!(Enter), "submit"),
-                            HintItem::new(key!(Esc), "back"),
+                            HintItem::new(key!(Enter), rust_i18n::t!("hints.submit")),
+                            HintItem::new(key!(Esc), rust_i18n::t!("hints.back")),
                         ]
                     }
                 }
                 QuestionFocus::Navigation => {
                     vec![
-                        HintItem::new(key!(Esc), "unselect"),
-                        HintItem::new(key!(Tab), "scrollback"),
-                        HintItem::new(key!('X'), "dismiss"),
+                        HintItem::new(key!(Esc), rust_i18n::t!("hints.unselect")),
+                        HintItem::new(key!(Tab), rust_i18n::t!("hints.scrollback")),
+                        HintItem::new(key!('X'), rust_i18n::t!("hints.dismiss")),
                     ]
                 }
             };
@@ -3240,10 +3350,10 @@ impl AgentView {
         } else if self.cancel_turn_view.is_some() {
             use crate::views::shortcuts_bar::HintItem;
             let hints = vec![
-                HintItem::paired(key!('1'), key!('4'), "select"),
-                HintItem::new(key!(Enter), "confirm"),
-                HintItem::new(key!(Esc), "keep running"),
-                HintItem::new(key!(Tab), "scrollback"),
+                HintItem::paired(key!('1'), key!('4'), rust_i18n::t!("hints.select")),
+                HintItem::new(key!(Enter), rust_i18n::t!("hints.confirm")),
+                HintItem::new(key!(Esc), rust_i18n::t!("hints.keep_running")),
+                HintItem::new(key!(Tab), rust_i18n::t!("hints.scrollback")),
             ];
             ShortcutsBar::new(&hints)
                 .with_pending(pending_hint)
@@ -3259,20 +3369,23 @@ impl AgentView {
                             .find(ActionId::DashboardOverlayStop)
                             .map(|def| def.default_key)
                             .unwrap_or(key!('x', CONTROL)),
-                        "stop",
+                        rust_i18n::t!("hints.stop"),
                     ),
                 );
                 hints.insert(
                     0,
                     HintItem {
                         keys: vec![key!('[', CONTROL), key!(']', CONTROL)],
-                        label: "agents".into(),
+                        label: rust_i18n::t!("hints.agents"),
                         custom_display: Some("Ctrl+[/]"),
                         description: None,
                         pinned: false,
                     },
                 );
-                hints.insert(0, HintItem::new(key!('\\', CONTROL), "dashboard"));
+                hints.insert(
+                    0,
+                    HintItem::new(key!('\\', CONTROL), rust_i18n::t!("hints.dashboard")),
+                );
             }
             let help_hint = registry.find(ActionId::ShortcutsHelp).map(|def| {
                 let mut hint = def.hint();

@@ -186,6 +186,32 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     let mut plugins_changed_needs_skills_refetch = false;
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
+
+    // Codex Live broker: extract TurnCompleted data before the agent borrow
+    // so we can feed it to the broker after the match block releases `agent`.
+    // Only non-replay, non-wake turns are fed (the broker's exactly-once
+    // state handles duplicate rails).
+    #[cfg(feature = "codex-live")]
+    let live_terminal: Option<(String, String, Option<String>)> = {
+        if meta.is_replay {
+            None
+        } else {
+            match &session_notif.update {
+                XaiSessionUpdate::TurnCompleted {
+                    prompt_id,
+                    stop_reason,
+                    agent_result,
+                    ..
+                } if !is_wake_prompt(prompt_id) => {
+                    Some((prompt_id.clone(), stop_reason.clone(), agent_result.clone()))
+                }
+                _ => None,
+            }
+        }
+    };
+    #[cfg(not(feature = "codex-live"))]
+    let _live_terminal: Option<()> = None;
+
     let changed = match session_notif.update {
         ref update @ (XaiSessionUpdate::AutoCompactStarted { .. }
         | XaiSessionUpdate::AutoCompactCompleted { .. }
@@ -256,6 +282,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             model,
             effective_context_source,
             resumed_from,
+            budget,
             capability_mode,
             context_normalized,
             parent_prompt_id,
@@ -276,6 +303,17 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             let persona_display = persona.clone();
             let role_display = role.clone();
             let model_display = model.clone();
+            // Oracle upgrade (design-oracle.md Phase 1): an oracle that resolves
+            // to the SAME model as the parent session is no upgrade at all —
+            // the point is a *stronger* second opinion. Warn (non-fatal) so the
+            // user pins `[subagents.models] oracle` to something stronger.
+            if subagent_type == "oracle"
+                && let Some(child_model) = model.as_deref()
+                && agent.session.models.current_model_id_str() == Some(child_model)
+            {
+                let msg = rust_i18n::t!("warn.oracle_same_model").into_owned();
+                agent.show_toast(&msg);
+            }
             agent.subagent_sessions.insert(
                 child_session_id.clone(),
                 SubagentInfo {
@@ -290,6 +328,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     resumed_from: resumed_from.map(Arc::from),
                     capability_mode: capability_mode.map(Arc::from),
                     workflow_run_id: workflow_run_id.clone().map(Arc::from),
+                    budget,
                     context_normalized,
                     parent_prompt_id: parent_prompt_id.map(Arc::from),
                     started_at: std::time::Instant::now(),
@@ -297,6 +336,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                     finished: false,
                     status: None,
                     error: None,
+                    termination_reason: None,
+                    usage: None,
                     duration_ms: None,
                     tool_calls: None,
                     turns: None,
@@ -503,6 +544,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             child_session_id,
             status,
             error,
+            termination_reason,
+            usage,
             tool_calls,
             turns,
             duration_ms,
@@ -579,6 +622,8 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 info.finished = true;
                 info.status = Some(Arc::from(status));
                 info.error = error.map(Arc::from);
+                info.termination_reason = termination_reason.map(Arc::from);
+                info.usage = usage;
                 info.duration_ms = Some(duration_ms);
                 info.tool_calls = Some(tool_calls);
                 info.turns = Some(turns);
@@ -1028,6 +1073,35 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
             agent.last_seen_event_id = Some(id);
         }
     }
+    // Codex Live broker: feed the durable TurnCompleted rail to the broker.
+    // The broker's exactly-once state handles duplicate rails (TurnCompleted
+    // can arrive via both the durable rail and the legacy prompt_complete).
+    // Failure/cancel stop_reasons route through the single centralized
+    // `on_prompt_failed` rail (one `observe_failure` + one explicit
+    // `CompleteDelegation` per terminal delegation), so the final failure/cancel
+    // message is never dropped by a duplicate `observe_failure` returning an
+    // empty decision.
+    #[cfg(feature = "codex-live")]
+    if let Some((prompt_id, stop_reason, agent_result)) = live_terminal {
+        let sid_str = session_notif.session_id.0.as_ref();
+        let is_error = stop_reason == "error";
+        let is_cancel = stop_reason == "cancelled";
+        if is_error || is_cancel {
+            let msg = if is_error {
+                format!(
+                    "Delegation failed: {}",
+                    agent_result.as_deref().unwrap_or("unknown error")
+                )
+            } else {
+                "Delegation cancelled".to_string()
+            };
+            crate::live::acp_bridge::on_prompt_failed(app, sid_str, &prompt_id, &msg);
+        } else {
+            // Normal completion: wrap the final assistant segment.
+            crate::live::acp_bridge::on_turn_completed(app, sid_str, &prompt_id);
+        }
+    }
+
     if let Some(outcome) = terminal_outcome {
         return super::super::turn_completion::apply_terminal_outcome(
             outcome, app, parent_id, is_active,

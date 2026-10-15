@@ -1,7 +1,8 @@
 //! ConversationRequest assembly — image compaction, pruning, repair, memory injection.
 
 use xai_grok_sampling_types::{
-    ContentPart, ConversationItem, ConversationRequest, ToolSpec, TraceContext,
+    ContentPart, ConversationItem, ConversationRequest, ReasoningModelIdentity, ToolSpec,
+    TraceContext,
 };
 
 use super::ChatStateActor;
@@ -131,10 +132,15 @@ impl ChatStateActor {
             hosted_tools: vec![],
             tool_choice: None,
             model: Some(self.state.sampling_config.model.clone()),
+            reasoning_model_identity: Some(ReasoningModelIdentity::new(
+                self.state.sampling_config.model.clone(),
+                self.state.sampling_config.api_backend.clone(),
+                &self.state.sampling_config.base_url,
+            )),
             temperature: self.state.sampling_config.temperature,
             max_output_tokens: self.state.sampling_config.max_completion_tokens,
             top_p: self.state.sampling_config.top_p,
-            x_grok_conv_id: Some(conv_id),
+            x_grok_conv_id: Some(conv_id.clone()),
             x_grok_req_id: Some(req_id),
             x_grok_session_id: None,
             x_grok_turn_idx: None,
@@ -142,9 +148,15 @@ impl ChatStateActor {
             x_grok_deployment_id: None,
             x_grok_user_id: None,
             trace,
-            prompt_cache_key: None,
+            // OpenAI Responses + Chat Completions sticky key for prefix-cache
+            // affinity (session id). Turn code may overwrite with the live
+            // session id; Anthropic Messages ignores this field.
+            prompt_cache_key: Some(xai_grok_sampling_types::clamp_prompt_cache_key(&conv_id)),
+            prompt_cache_retention: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            // Set by SamplingClient from SamplerConfig.kimi_dialect before wire.
+            kimi_dialect: None,
         }
     }
 }

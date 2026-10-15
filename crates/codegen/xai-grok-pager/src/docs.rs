@@ -54,7 +54,7 @@ pub static USER_GUIDE: &[Doc] = &[
     guide!(
         "02-authentication.md",
         "Authentication",
-        "Browser login, API keys, OIDC, external auth providers"
+        "Multi-provider login (Grok, Codex, Kimi, BYOK), free-usage escape, OIDC"
     ),
     guide!(
         "03-keyboard-shortcuts.md",
@@ -100,6 +100,36 @@ pub static USER_GUIDE: &[Doc] = &[
         "11-custom-models.md",
         "Custom Models",
         "BYOK, Ollama, OpenAI-compatible endpoints"
+    ),
+    guide!(
+        "25-moonshot-providers.md",
+        "Moonshot Providers",
+        "Built-in Moonshot / Kimi open-platform API keys"
+    ),
+    guide!(
+        "26-kimi-code.md",
+        "Kimi Code Subscription",
+        "Device OAuth login for Kimi Code (grok login --kimi)"
+    ),
+    guide!(
+        "27-openai-anthropic.md",
+        "OpenAI & Anthropic",
+        "Built-in OpenAI Responses and Anthropic Messages platforms"
+    ),
+    guide!(
+        "28-openai-codex.md",
+        "OpenAI Codex (ChatGPT)",
+        "ChatGPT subscription login (grok login --openai) and Codex models"
+    ),
+    guide!(
+        "29-models-providers-and-scoped-selection.md",
+        "Models, Providers, Scoped Selection",
+        "OpenAI-compat stance, catalog, /scoped-models shortlist and Alt+] cycle"
+    ),
+    guide!(
+        "30-openai-prompt-caching.md",
+        "OpenAI Prompt Caching",
+        "prompt_cache_key, retention, usage hit rate (OpenAI only — not Anthropic)"
     ),
     guide!(
         "12-project-rules.md",

@@ -1004,27 +1004,149 @@ pub fn perform_logout(
     })
 }
 
-/// `grok logout` CLI handler. Calls [`perform_logout`] and formats
-/// the result to stderr.
+/// `grok logout` / `hyper logout` CLI handler. Clears the **xAI** session only
+/// and formats the result to stderr. Third-party OAuth scopes (Kimi / Codex)
+/// are reported when still present so users know how to clear them.
 pub fn run_cli_logout(config: &crate::agent::config::Config) -> anyhow::Result<()> {
+    clear_xai_session_cli(config)?;
+    print_remaining_third_party_scopes_hint();
+    Ok(())
+}
+
+/// Clear the xAI session and print xAI-only messaging (no third-party hint).
+/// Shared by bare logout and `logout --all`.
+fn clear_xai_session_cli(config: &crate::agent::config::Config) -> anyhow::Result<()> {
     let grok_home = grok_home::grok_home();
     let auth_manager = AuthManager::new(&grok_home, config.grok_com_config.clone());
     let result = perform_logout(&auth_manager, None)
         .map_err(|e| anyhow::anyhow!("Failed to clear auth: {e}"))?;
     if !result.was_logged_in {
-        eprintln!("No cached session to log out of.");
+        eprintln!("No cached xAI session to log out of.");
         if result.api_key_still_set {
             eprintln!("You are authenticated via XAI_API_KEY (environment variable).");
         }
         return Ok(());
     }
     if let Some(email) = result.email {
-        eprintln!("Logged out (was signed in as {email})");
+        eprintln!("Logged out of xAI (was signed in as {email})");
     } else {
-        eprintln!("Logged out");
+        eprintln!("Logged out of xAI");
     }
     if result.api_key_still_set {
         eprintln!("XAI_API_KEY is still set and will be used for authentication.");
+    }
+    Ok(())
+}
+
+/// Clear xAI session **and** Kimi Code + OpenAI Codex OAuth scopes.
+///
+/// Does **not** remove BYOK platform API keys stored under `platform/*` scopes
+/// or environment variables — those use `/logout provider <id>` / unset env.
+///
+/// Attempts both third-party clears even if one fails; returns an aggregated
+/// error if either fails so the caller does not claim a full wipe on I/O error.
+pub fn run_cli_logout_all(config: &crate::agent::config::Config) -> anyhow::Result<()> {
+    // Do not call `run_cli_logout` here: it prints the "run logout --all" hint
+    // while third-party scopes are still present, which confuses users already
+    // on the `--all` path.
+    clear_xai_session_cli(config)?;
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(e) = run_cli_logout_kimi() {
+        errors.push(format!("Kimi Code: {e}"));
+    }
+    if let Err(e) = run_cli_logout_openai_codex() {
+        errors.push(format!("OpenAI Codex: {e}"));
+    }
+    if let Err(e) = run_cli_logout_anthropic_claude() {
+        errors.push(format!("Anthropic Claude: {e}"));
+    }
+    eprintln!(
+        "Note: BYOK platform API keys (if any) were not removed. \
+         Use `/logout provider <platform>` or `/providers clear` in the TUI."
+    );
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "Failed to clear one or more third-party OAuth scopes: {}",
+            errors.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// When Kimi/Codex scopes remain after a bare xAI logout, tell the user how
+/// to clear them (avoids the false impression that "logout" wiped everything).
+fn print_remaining_third_party_scopes_hint() {
+    let auth_path = crate::auth::auth_json_path();
+    let home = auth_path.parent().unwrap_or(std::path::Path::new("."));
+    let kimi = crate::auth::read_kimi_code_auth(home).is_some();
+    let codex = crate::auth::read_openai_codex_auth(home).is_some();
+    if !kimi && !codex {
+        return;
+    }
+    eprintln!();
+    eprintln!("Still signed in to third-party subscriptions:");
+    if kimi {
+        eprintln!("  • Kimi Code  — run: hyper logout --kimi");
+    }
+    if codex {
+        eprintln!("  • OpenAI Codex — run: hyper logout --openai");
+    }
+    eprintln!("  Or clear both (plus xAI): hyper logout --all");
+}
+
+/// Clear only the Kimi Code subscription credential (`oauth/kimi-code`).
+/// Does not touch the xAI session or `XAI_API_KEY`.
+pub fn run_cli_logout_kimi() -> anyhow::Result<()> {
+    // Honor GROK_AUTH_PATH (same path login/store use), not only ~/.grok.
+    let auth_path = crate::auth::auth_json_path();
+    let home = auth_path.parent().unwrap_or(std::path::Path::new("."));
+    let had = crate::auth::read_kimi_code_auth(home).is_some();
+    crate::auth::clear_kimi_code_auth(home)
+        .map_err(|e| anyhow::anyhow!("Failed to clear Kimi Code auth: {e}"))?;
+    crate::auth::platform_refresh_sticky::clear_sticky_family(
+        crate::auth::platform_refresh_sticky::PlatformRefreshFamily::KimiCode,
+    );
+    if had {
+        eprintln!("Logged out of Kimi Code (xAI session unchanged).");
+    } else {
+        eprintln!("No Kimi Code session to log out of.");
+    }
+    Ok(())
+}
+
+/// `grok logout --openai`: clear only the OpenAI Codex (ChatGPT) OAuth scope.
+pub fn run_cli_logout_openai_codex() -> anyhow::Result<()> {
+    // Honor GROK_AUTH_PATH (same path login/store use), not only ~/.grok.
+    let auth_path = crate::auth::auth_json_path();
+    let home = auth_path.parent().unwrap_or(std::path::Path::new("."));
+    let had = crate::auth::read_openai_codex_auth(home).is_some();
+    crate::auth::clear_openai_codex_auth(home)
+        .map_err(|e| anyhow::anyhow!("Failed to clear OpenAI Codex auth: {e}"))?;
+    crate::auth::platform_refresh_sticky::clear_sticky_family(
+        crate::auth::platform_refresh_sticky::PlatformRefreshFamily::OpenAiCodex,
+    );
+    if had {
+        eprintln!("Logged out of OpenAI Codex (xAI session unchanged).");
+    } else {
+        eprintln!("No OpenAI Codex session to log out of.");
+    }
+    Ok(())
+}
+
+/// `hyper logout --claude`: clear only the Anthropic Claude OAuth scope.
+pub fn run_cli_logout_anthropic_claude() -> anyhow::Result<()> {
+    let auth_path = crate::auth::auth_json_path();
+    let home = auth_path.parent().unwrap_or(std::path::Path::new("."));
+    let had = crate::auth::read_anthropic_claude_auth(home).is_some();
+    crate::auth::clear_anthropic_claude_auth(home)
+        .map_err(|e| anyhow::anyhow!("Failed to clear Anthropic Claude auth: {e}"))?;
+    crate::auth::platform_refresh_sticky::clear_sticky_family(
+        crate::auth::platform_refresh_sticky::PlatformRefreshFamily::AnthropicClaude,
+    );
+    if had {
+        eprintln!("Logged out of Anthropic Claude (xAI session unchanged).");
+    } else {
+        eprintln!("No Anthropic Claude session to log out of.");
     }
     Ok(())
 }
@@ -1566,6 +1688,8 @@ mod tests {
             expires_at: None,
             oidc_issuer: None,
             oidc_client_id: None,
+            account_id: None,
+            platform_base_url: None,
         }
     }
 
@@ -1620,7 +1744,7 @@ mod tests {
     }
 
     fn ensure_crypto_provider() {
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
     }
 
     fn team_jwt(principal_id: &str) -> String {

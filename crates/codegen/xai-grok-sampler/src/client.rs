@@ -25,11 +25,12 @@ use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_err
 use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
     ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ResponseModelMetadata, Result, SamplingError, build_messages_request, is_check_event, messages,
-    rs,
+    ReasoningModelIdentity, ResponseModelMetadata, Result, SamplingError, build_messages_request,
+    is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
+use crate::types::ResponsesStreamItem;
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
@@ -40,6 +41,43 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
+const RESPONSES_AUXILIARY_EVENT_TYPES: [&str; 2] = ["keepalive", "response.metadata"];
+
+/// Return whether an SSE frame is an out-of-band Responses API event.
+///
+/// ChatGPT/Codex emits transport heartbeats (`keepalive`) and may emit
+/// side-band `response.metadata` frames. Neither carries model output or maps
+/// to async-openai's `ResponseStreamEvent`, so both must be filtered before
+/// typed deserialization. They can be identified by the SSE `event:` field or
+/// only by the JSON `type` discriminator in `data:`.
+///
+/// Matching stays exact: generated text containing one of these strings is not
+/// swallowed, and every other unknown semantic event still fails loudly.
+fn is_responses_auxiliary_event(event_name: &str, data: &str) -> bool {
+    if RESPONSES_AUXILIARY_EVENT_TYPES.contains(&event_name) {
+        return true;
+    }
+
+    // Avoid reparsing ordinary token deltas unless the payload could contain
+    // one of the auxiliary discriminators. The parsed discriminator below is
+    // still authoritative because generated text can contain either string.
+    if !RESPONSES_AUXILIARY_EVENT_TYPES
+        .iter()
+        .any(|event_type| data.contains(event_type))
+    {
+        return false;
+    }
+
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|event_type| RESPONSES_AUXILIARY_EVENT_TYPES.contains(&event_type))
+        })
+        .unwrap_or(false)
+}
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
@@ -79,13 +117,83 @@ impl GrokRequestHeaders<'_> {
 /// so we only handle that form. HTTP-dates silently return `None` and
 /// the caller falls back to exponential backoff.
 /// Capped at 120s to prevent absurdly long sleeps from a misbehaving upstream.
+/// Every `type` discriminator async-openai's `rs::ResponseStreamEvent`
+/// deserializes. Frames carrying any other `type` are skipped as
+/// [`ResponsesStreamItem::Heartbeat`] instead of failing deserialization
+/// fatally — the same posture as codex-rs, whose `ResponsesStreamEvent.kind`
+/// is a plain `String` with a `_ => trace!` default arm. Without this, every
+/// event type OpenAI adds server-side surfaces here as a non-retryable
+/// `unknown variant` serialization error.
+const RESPONSES_KNOWN_EVENT_TYPES: [&str; 49] = [
+    "response.created",
+    "response.in_progress",
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+    "response.output_item.added",
+    "response.output_item.done",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.refusal.delta",
+    "response.refusal.done",
+    "response.function_call_arguments.delta",
+    "response.function_call_arguments.done",
+    "response.file_search_call.in_progress",
+    "response.file_search_call.searching",
+    "response.file_search_call.completed",
+    "response.web_search_call.in_progress",
+    "response.web_search_call.searching",
+    "response.web_search_call.completed",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+    "response.reasoning_text.delta",
+    "response.reasoning_text.done",
+    "response.image_generation_call.completed",
+    "response.image_generation_call.generating",
+    "response.image_generation_call.in_progress",
+    "response.image_generation_call.partial_image",
+    "response.mcp_call_arguments.delta",
+    "response.mcp_call_arguments.done",
+    "response.mcp_call.completed",
+    "response.mcp_call.failed",
+    "response.mcp_call.in_progress",
+    "response.mcp_list_tools.completed",
+    "response.mcp_list_tools.failed",
+    "response.mcp_list_tools.in_progress",
+    "response.code_interpreter_call.in_progress",
+    "response.code_interpreter_call.interpreting",
+    "response.code_interpreter_call.completed",
+    "response.code_interpreter_call_code.delta",
+    "response.code_interpreter_call_code.done",
+    "response.output_text.annotation.added",
+    "response.queued",
+    "response.custom_tool_call_input.delta",
+    "response.custom_tool_call_input.done",
+    "error",
+];
+
 /// Deserialize a Responses API SSE event, with a fallback for xAI-specific
 /// tool types (e.g., `x_search`) that `async_openai` can't parse.
+///
+/// Returns `Ok(None)` when the frame is parseable JSON but should be skipped
+/// rather than surfaced:
+///
+/// * the `type` discriminator is unknown to this build (forward-compat: new
+///   OpenAI event types must never become fatal `unknown variant` errors), or
+/// * it is `response.output_item.done` / `.added` whose nested `item` is an
+///   `OutputItem` kind async-openai does not model — codex-rs likewise logs
+///   and skips unparseable output items; the deltas and the terminal event
+///   carry the usable content.
 ///
 /// The API echoes the request's `tools` array in `ResponseCompleted` and
 /// `ResponseCreated` events. If we sent `{"type": "x_search"}`, the response
 /// includes it, and `rs::Tool` deserialization fails. On failure, we strip
-/// unrecognized tools from the raw JSON and retry.
+/// unrecognized tools from the raw JSON and retry; terminal events get the
+/// same treatment for unrecognized `output` items.
 ///
 /// On `response.completed` / `response.incomplete`, this also rewrites
 /// `response.usage.total_tokens` in place to the live context length
@@ -97,37 +205,169 @@ impl GrokRequestHeaders<'_> {
 /// `ResponseUsage` unchanged so billing telemetry stays correct. When
 /// the API doesn't emit `context_details` (older deployments) `total_tokens`
 /// passes through unchanged.
-fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
-    let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
-        Ok(event) => event,
-        Err(first_err) => {
-            // Try sanitizing: parse as Value, strip unknown tools, retry.
-            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
-                // Strip tools that async_openai's rs::Tool can't deserialize
-                // (e.g., xAI-specific "x_search"). Instead of maintaining a
-                // hardcoded allowlist, try deserializing each tool entry —
-                // if it fails, drop it.
-                if let Some(tools) = value
-                    .pointer_mut("/response/tools")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
-                }
-                if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
-                    apply_terminal_event_overrides(&mut event, data);
-                    return Ok(event);
-                }
-            }
+fn deserialize_response_event(data: &str) -> Result<Option<rs::ResponseStreamEvent>> {
+    let first_err = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
+        Ok(mut event) => {
+            apply_terminal_event_overrides(&mut event, data);
+            return Ok(Some(event));
+        }
+        Err(first_err) => first_err,
+    };
+
+    // Try sanitizing: parse as Value, drop what async-openai can't model, retry.
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) else {
+        tracing::error!(
+            error = %first_err,
+            raw_data = %data,
+            "Failed to deserialize ResponseStreamEvent from stream"
+        );
+        return Err(SamplingError::Serialization(first_err));
+    };
+
+    if let Some(event_type) = value.get("type").and_then(|v| v.as_str()) {
+        // Forward-compat: unknown top-level event type — skip, never fatal.
+        if !RESPONSES_KNOWN_EVENT_TYPES.contains(&event_type) {
+            tracing::debug!(
+                event_type,
+                "skipping Responses API event of unknown type (forward-compat)"
+            );
+            return Ok(None);
+        }
+        // Known frame carrying an output item kind async-openai cannot model
+        // (e.g. a newly added OutputItem type): skip the frame rather than
+        // fail the stream — streamed deltas and the terminal event still
+        // carry the usable content.
+        if matches!(
+            event_type,
+            "response.output_item.done" | "response.output_item.added"
+        ) && value.get("item").is_some()
+            && serde_json::from_value::<rs::OutputItem>(value["item"].clone()).is_err()
+        {
+            tracing::debug!(
+                event_type,
+                "skipping Responses API event with unknown output item kind"
+            );
+            return Ok(None);
+        }
+    }
+
+    // Strip tools that async_openai's rs::Tool can't deserialize (e.g.,
+    // xAI-specific "x_search"). Instead of maintaining a hardcoded allowlist,
+    // try deserializing each tool entry — if it fails, drop it.
+    if let Some(tools) = value
+        .pointer_mut("/response/tools")
+        .and_then(|v| v.as_array_mut())
+    {
+        tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
+    }
+    // Same for terminal-event `output` items of a kind this build predates.
+    if let Some(output) = value
+        .pointer_mut("/response/output")
+        .and_then(|v| v.as_array_mut())
+    {
+        output.retain(|item| serde_json::from_value::<rs::OutputItem>(item.clone()).is_ok());
+    }
+    match serde_json::from_value::<rs::ResponseStreamEvent>(value) {
+        Ok(mut event) => {
+            apply_terminal_event_overrides(&mut event, data);
+            Ok(Some(event))
+        }
+        Err(_) => {
             tracing::error!(
                 error = %first_err,
                 raw_data = %data,
                 "Failed to deserialize ResponseStreamEvent from stream"
             );
-            return Err(SamplingError::Serialization(first_err));
+            Err(SamplingError::Serialization(first_err))
         }
+    }
+}
+
+/// Decode one Responses SSE frame.
+///
+/// Auxiliary frames (transport heartbeats) and forward-compat skips both
+/// surface as [`ResponsesStreamItem::Heartbeat`] so the layer-2 idle detector
+/// sees server liveness instead of a starved stream. API errors are surfaced
+/// as `SamplingError`; malformed known events stay strict and fatal.
+fn decode_responses_sse_frame(
+    event_name: &str,
+    data: &str,
+) -> std::result::Result<ResponsesStreamItem, SamplingError> {
+    if is_responses_auxiliary_event(event_name, data) {
+        return Ok(ResponsesStreamItem::Heartbeat);
+    }
+
+    if let Some(stream_error) = try_parse_stream_error(data) {
+        Err(stream_error)
+    } else {
+        match deserialize_response_event(data) {
+            Ok(Some(event)) => Ok(ResponsesStreamItem::Event(event)),
+            Ok(None) => Ok(ResponsesStreamItem::Heartbeat),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Every `type` discriminator [`messages::MessageStreamEvent`] deserializes.
+/// Frames carrying any other `type` are mapped to `Ping` (liveness-only)
+/// instead of failing deserialization fatally — same forward-compat posture
+/// as [`RESPONSES_KNOWN_EVENT_TYPES`].
+const MESSAGES_KNOWN_EVENT_TYPES: [&str; 8] = [
+    "message_start",
+    "message_delta",
+    "message_stop",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "ping",
+    "error",
+];
+
+/// Decode one Anthropic Messages SSE frame.
+///
+/// Forward-compat: frames whose `type` is unknown to this build (a newer
+/// Anthropic / provider event kind), and `content_block_start` /
+/// `content_block_delta` frames whose nested block / delta kind is unknown,
+/// are surfaced as `Ping` — the layer-2 liveness-only event — rather than a
+/// fatal `Serialization` error on a healthy stream. Malformed frames of a
+/// known type stay strict and fatal.
+fn decode_messages_sse_frame(data: &str) -> Result<messages::MessageStreamEvent> {
+    let first_err = match serde_json::from_str::<messages::MessageStreamEvent>(data) {
+        Ok(event) => return Ok(event),
+        Err(first_err) => first_err,
     };
-    apply_terminal_event_overrides(&mut event, data);
-    Ok(event)
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data)
+        && let Some(event_type) = value.get("type").and_then(|v| v.as_str())
+    {
+        let skip = if !MESSAGES_KNOWN_EVENT_TYPES.contains(&event_type) {
+            true
+        } else {
+            match event_type {
+                "content_block_start" => value
+                    .get("content_block")
+                    .is_some_and(|b| serde_json::from_value::<messages::ContentBlock>(b.clone()).is_err()),
+                "content_block_delta" => value
+                    .get("delta")
+                    .is_some_and(|d| serde_json::from_value::<messages::StreamDelta>(d.clone()).is_err()),
+                _ => false,
+            }
+        };
+        if skip {
+            tracing::debug!(
+                event_type,
+                "skipping Messages API frame with unknown type/block kind (forward-compat)"
+            );
+            return Ok(messages::MessageStreamEvent::Ping);
+        }
+    }
+
+    tracing::error!(
+        error = %first_err,
+        raw_data = %data,
+        "Failed to deserialize MessageStreamEvent from stream"
+    );
+    Err(SamplingError::Serialization(first_err))
 }
 
 /// On terminal Responses API events (`response.completed` /
@@ -179,6 +419,169 @@ fn apply_terminal_event_overrides(event: &mut rs::ResponseStreamEvent, data: &st
         return;
     };
     usage.total_tokens = total;
+}
+
+/// Stamp OpenAI Responses `prompt_cache_key` from session / conv id when unset.
+///
+/// Used for both public OpenAI-compatible Responses and Codex (Pi clamps to 64).
+fn stamp_responses_prompt_cache_key(request: &mut CreateResponseWrapper) {
+    if request.inner.prompt_cache_key.is_some() {
+        return;
+    }
+    let key = request
+        .x_grok_session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            request
+                .x_grok_conv_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+        });
+    if let Some(key) = key {
+        request.inner.prompt_cache_key =
+            Some(xai_grok_sampling_types::clamp_prompt_cache_key(key));
+    }
+}
+
+/// Apply the ChatGPT Codex backend dialect to a Responses API request.
+///
+/// Mirrors official Pi `openai-codex-responses.ts` request building:
+/// - the system prompt travels in the top-level `instructions` field, not as
+///   `input` items (Pi: `convertResponsesMessages` with
+///   `includeSystemPrompt: false` + `instructions: context.systemPrompt`);
+/// - `prompt_cache_key` is stamped via [`stamp_responses_prompt_cache_key`];
+/// - `text.verbosity` defaults to `low` (Pi default) unless a text format
+///   (e.g. structured output) is already set.
+fn apply_codex_dialect(request: &mut CreateResponseWrapper) {
+    if let rs::InputParam::Items(items) = &mut request.inner.input {
+        let mut system_texts: Vec<String> = Vec::new();
+        items.retain(|item| {
+            if let rs::InputItem::EasyMessage(message) = item
+                && message.role == rs::Role::System
+            {
+                if let rs::EasyInputContent::Text(text) = &message.content {
+                    system_texts.push(text.clone());
+                }
+                return false;
+            }
+            true
+        });
+        if !system_texts.is_empty() && request.inner.instructions.is_none() {
+            request.inner.instructions = Some(system_texts.join("\n\n"));
+        }
+    }
+    if request.inner.instructions.is_none() {
+        // Pi: `instructions: context.systemPrompt || "You are a helpful assistant."`
+        request.inner.instructions = Some("You are a helpful assistant.".to_string());
+    }
+    stamp_responses_prompt_cache_key(request);
+    if request.inner.text.is_none() {
+        // Pi: `text: { verbosity: "low" }`. Format defaults to text when omitted;
+        // typed Text serializes as `{ "type": "text" }` which the backend accepts.
+        request.inner.text = Some(rs::ResponseTextParam {
+            format: rs::TextResponseFormatConfiguration::Text,
+            verbosity: Some(rs::Verbosity::Low),
+        });
+    }
+    // Pi sends `reasoning.summary: "auto"` (the shared default is `concise`).
+    if let Some(reasoning) = request.inner.reasoning.as_mut() {
+        reasoning.summary = Some(rs::ReasoningSummary::Auto);
+    }
+    // ChatGPT Codex backend rejects parameters the public Responses API allows
+    // (verified live against chatgpt.com/backend-api/codex/responses):
+    //   Unsupported parameter: max_output_tokens | temperature | top_p | …
+    // Official Pi never sends these on openai-codex-responses. Our catalog
+    // stamps max_completion_tokens=128k on Codex models, which becomes
+    // max_output_tokens here and 400s every turn.
+    request.inner.max_output_tokens = None;
+    request.inner.temperature = None;
+    request.inner.top_p = None;
+    request.inner.max_tool_calls = None;
+}
+
+/// Strip fields ChatGPT Codex rejects after JSON serialize (defense in depth
+/// if typed defaults re-introduce them).
+fn strip_codex_unsupported_body_fields(body: &mut serde_json::Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "max_tool_calls",
+        "background",
+        "truncation",
+        "top_logprobs",
+        "prompt_cache_retention",
+    ] {
+        obj.remove(key);
+    }
+}
+
+/// Codex / ChatGPT Responses wire form for `reasoning.effort`.
+///
+/// Mirrors official `openai/codex` `ModelClient::reasoning_effort_for_request`
+/// (`codex-rs/core/src/client.rs`):
+///
+/// ```ignore
+/// fn reasoning_effort_for_request(effort) {
+///     match effort {
+///         Ultra => Max,  // UI "ultra" never hits the Responses API as "ultra"
+///         other => other,
+///     }
+/// }
+/// ```
+///
+/// Ultra remains a **client** policy (Codex multi-agent v2 → `Proactive`
+/// delegation in `multi_agents.rs`); the HTTP body always carries
+/// `reasoning.effort: "max"`.
+///
+/// async-openai only types through `xhigh`, so Max would also collapse on
+/// serialize without this post-serialize rewrite.
+///
+/// - `None` → drop `reasoning` (off)
+/// - `Minimal` → `"low"` (Pi alias on Codex xhigh models)
+/// - `Max` / `Ultra` → `"max"` (official Ultra→Max)
+/// - others → their `as_str()` token
+fn patch_codex_reasoning_effort_wire(
+    body: &mut serde_json::Value,
+    effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+) {
+    use xai_grok_sampling_types::ReasoningEffort as E;
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    match effort {
+        None => {}
+        Some(E::None) => {
+            obj.remove("reasoning");
+        }
+        Some(e) => {
+            // Keep in lockstep with openai/codex `reasoning_effort_for_request`.
+            let wire = match e {
+                E::None => unreachable!(),
+                E::Minimal => "low",
+                E::Low => "low",
+                E::Medium => "medium",
+                E::High => "high",
+                E::Xhigh => "xhigh",
+                // Ultra is multi-agent UX only; backend receives max.
+                E::Max | E::Ultra => "max",
+            };
+            let reasoning = obj
+                .entry("reasoning")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(r) = reasoning.as_object_mut() {
+                r.insert("effort".into(), serde_json::Value::String(wire.into()));
+                r.entry("summary")
+                    .or_insert_with(|| serde_json::Value::String("auto".into()));
+            }
+        }
+    }
 }
 
 /// Metadata key for cost ticks past typed Response events.
@@ -348,6 +751,11 @@ struct ClientDefaults {
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    responses_codex_dialect: bool,
+    kimi_dialect: bool,
+    /// Session reasoning effort. Needed for Codex wire rewrite: async-openai
+    /// only types through `xhigh`, so Max/Ultra must be restored post-serialize.
+    reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
 }
 
 /// Endpoint URL builder, resolved once at client construction so each request
@@ -636,6 +1044,9 @@ impl SamplingClient {
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
             doom_loop_recovery: config.doom_loop_recovery,
+            responses_codex_dialect: config.responses_codex_dialect,
+            kimi_dialect: config.kimi_dialect,
+            reasoning_effort: config.reasoning_effort,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
@@ -657,15 +1068,22 @@ impl SamplingClient {
         self.defaults.api_backend.clone()
     }
 
-    /// POST with default headers. When a bearer_resolver is wired it is the
-    /// sole auth source: a missing live bearer strips default Authorization /
-    /// x-api-key so a hard-expired seed key cannot ride on the wire.
-    fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    /// POST with default headers. A live resolver is evaluated exactly once;
+    /// the returned prefix is carried to 401 attribution so logging never
+    /// performs another potentially blocking credential lookup.
+    /// When a bearer_resolver is wired it is the sole auth source: a missing
+    /// live bearer strips default Authorization / x-api-key so a hard-expired
+    /// seed key cannot ride on the wire.
+    fn post(&self, url: impl reqwest::IntoUrl) -> (reqwest::RequestBuilder, Option<String>) {
         let mut headers = self.default_headers.clone();
         if let Some(resolver) = &self.bearer_resolver {
+            // A resolver is authoritative. Remove construction-time auth even
+            // when refresh returns `None`; otherwise an expired catalog stamp
+            // is silently sent after a failed refresh.
             headers.remove(AUTHORIZATION);
             headers.remove(HeaderName::from_static("x-api-key"));
-            if let Some(fresh) = resolver.current_bearer() {
+            let resolution = resolver.resolve_bearer();
+            if let Some(fresh) = resolution.bearer {
                 match self.defaults.auth_scheme {
                     AuthScheme::XApiKey => {
                         if let Ok(v) = HeaderValue::from_str(&fresh) {
@@ -679,6 +1097,10 @@ impl SamplingClient {
                     }
                 }
             }
+            for name in resolution.remove_headers {
+                headers.remove(name);
+            }
+            headers.extend(resolution.headers);
         }
         {
             let auth_prefix = headers
@@ -706,79 +1128,80 @@ impl SamplingClient {
         if let Some(injector) = &self.header_injector {
             injector.inject(&mut headers);
         }
-        self.http.post(url).headers(headers)
+        let sent_bearer_prefix = self.extract_sent_bearer_from(&headers);
+        (self.http.post(url).headers(headers), sent_bearer_prefix)
+    }
+
+    fn truncate_bearer_prefix(bearer: &str) -> String {
+        // Authorization and x-api-key values are ASCII, so this byte boundary
+        // is also a UTF-8 character boundary.
+        bearer[..crate::attribution::SENT_BEARER_PREFIX_LEN.min(bearer.len())].to_string()
     }
 
     /// Bearer prefix for 401 attribution. When a resolver is wired it is
     /// authoritative (including `None` ⇒ nothing was sent). Without a resolver,
     /// fall back to construction-time default headers.
+    ///
+    /// Prefer the prefix returned by [`Self::post`] for request-path
+    /// attribution so the live credential is resolved only once.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn current_sent_bearer_prefix(&self) -> Option<String> {
         if self.bearer_resolver.is_some() {
             return self
                 .bearer_resolver
                 .as_ref()
                 .and_then(|r| r.current_bearer())
-                .map(|mut s| {
-                    s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
-                    s
-                });
+                .map(|s| Self::truncate_bearer_prefix(&s));
         }
         self.extract_sent_bearer()
     }
 
-    /// Extract the bearer from `default_headers`, truncated to prefix length.
-    /// Reads `x-api-key` (Anthropic Messages API) or `Authorization` (OpenAI-completions).
+    /// Extract the construction-time bearer, truncated to prefix length.
     fn extract_sent_bearer(&self) -> Option<String> {
-        let raw = match self.defaults.auth_scheme {
-            AuthScheme::XApiKey => self
-                .default_headers
-                .get(HeaderName::from_static("x-api-key"))
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string()),
-            AuthScheme::Bearer => self
-                .default_headers
-                .get(AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .map(|s| s.to_string()),
-        };
-        raw.map(|mut s| {
-            // Truncate in-place so we never materialize a heap-resident
-            // copy of the full bearer outside the local stack of this
-            // function. `String::truncate` operates on byte indices and
-            // panics on a non-char-boundary cut; bearer tokens are
-            // ASCII (per the `Authorization` and `x-api-key` header
-            // grammars) so the byte index is always safe.
-            s.truncate(crate::attribution::SENT_BEARER_PREFIX_LEN.min(s.len()));
-            s
-        })
+        self.extract_sent_bearer_from(&self.default_headers)
     }
 
-    /// Invoke the optional 401 attribution callback for one logical
-    /// 401 response. Each of the six UNAUTHORIZED arms in this file
-    /// calls this helper immediately before returning
-    /// `SamplingError::Auth(...)`. Emit happens at the lowest layer
-    /// that saw the status, so higher layers that react to a 401 must
-    /// not emit a duplicate event.
-    ///
-    /// The bearer passed to the callback is already truncated to
-    /// [`crate::attribution::SENT_BEARER_PREFIX_LEN`] characters by
-    /// [`Self::extract_sent_bearer`]; the trait contract guarantees
-    /// that callers downstream of this crate never see the full
-    /// bearer.
-    fn record_401_attribution(&self, consumer: crate::attribution::SamplingConsumer) {
+    /// Extract the bearer that will actually be sent from a finalized header map.
+    fn extract_sent_bearer_from(&self, headers: &HeaderMap) -> Option<String> {
+        let raw = match self.defaults.auth_scheme {
+            AuthScheme::XApiKey => headers
+                .get(HeaderName::from_static("x-api-key"))
+                .and_then(|v| v.to_str().ok()),
+            AuthScheme::Bearer => headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer ")),
+        };
+        raw.map(Self::truncate_bearer_prefix)
+    }
+
+    /// Attribute a 401 to the exact bearer already resolved for this request.
+    fn record_401_attribution(
+        &self,
+        consumer: crate::attribution::SamplingConsumer,
+        sent_bearer_prefix: Option<&str>,
+    ) {
         if let Some(cb) = self.attribution_callback.as_ref() {
-            let sent_prefix = self.current_sent_bearer_prefix();
-            cb.record_401(consumer, sent_prefix.as_deref());
+            cb.record_401(consumer, sent_bearer_prefix);
         }
     }
 
     pub fn auth_info(&self) -> crate::sampling_log::AuthInfo {
-        let auth_prefix = self.current_sent_bearer_prefix();
-        let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
-            (AuthScheme::XApiKey, Some(_)) => "x-api-key",
-            (AuthScheme::Bearer, Some(_)) => "bearer",
-            (_, None) => "none",
+        // Span construction must stay network-free. Live resolver prefixes are
+        // captured later by `post()` and carried to 401 attribution.
+        let auth_prefix = if self.bearer_resolver.is_some() {
+            None
+        } else {
+            self.extract_sent_bearer()
+        };
+        let has_auth = self.bearer_resolver.is_some() || auth_prefix.is_some();
+        let auth_type = if has_auth {
+            match self.defaults.auth_scheme {
+                AuthScheme::XApiKey => "x-api-key",
+                AuthScheme::Bearer => "bearer",
+            }
+        } else {
+            "none"
         };
         crate::sampling_log::AuthInfo {
             auth_type,
@@ -839,10 +1262,33 @@ impl SamplingClient {
             request.top_p = self.defaults.top_p;
         }
 
+        // OpenAI Chat Completions: sticky prompt_cache_key for automatic
+        // prefix-cache affinity when the provider supports it.
+        if request.prompt_cache_key.is_none() {
+            let key = request
+                .x_grok_session_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    request
+                        .x_grok_conv_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                });
+            if let Some(key) = key {
+                request.prompt_cache_key =
+                    Some(xai_grok_sampling_types::clamp_prompt_cache_key(key));
+            }
+        }
+
         Ok(request)
     }
 
-    async fn handle_response(&self, response: reqwest::Response) -> Result<ChatCompletionResponse> {
+    async fn handle_response(
+        &self,
+        response: reqwest::Response,
+        sent_bearer_prefix: Option<&str>,
+    ) -> Result<ChatCompletionResponse> {
         let status = response.status();
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
@@ -851,7 +1297,10 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletions);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::ChatCompletions,
+                    sent_bearer_prefix,
+                );
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(SamplingError::Auth(format!(
                     "Unauthorized (401): {server_message}"
@@ -908,9 +1357,8 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
-            .json(&payload);
+        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("chat/completions"));
+        let http_request = grok_headers.apply(http_request).json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
@@ -918,7 +1366,8 @@ impl SamplingClient {
             e
         })?;
 
-        self.handle_response(response).await
+        self.handle_response(response, sent_bearer_prefix.as_deref())
+            .await
     }
 
     /// Start a streaming chat completion request. Returns a stream of typed chunks.
@@ -966,8 +1415,9 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
+        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("chat/completions"));
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply(http_request)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
@@ -1001,6 +1451,7 @@ impl SamplingClient {
                 span.record("error", "unauthorized (401)");
                 self.record_401_attribution(
                     crate::attribution::SamplingConsumer::ChatCompletionsStream,
+                    sent_bearer_prefix.as_deref(),
                 );
                 let endpoint = self.endpoint("chat/completions");
                 let body = response.bytes().await.unwrap_or_default();
@@ -1135,6 +1586,15 @@ impl SamplingClient {
             includes.push(rs::IncludeEnum::ReasoningEncryptedContent);
         }
 
+        // OpenAI-compatible Responses: always pin prompt_cache_key for
+        // session-affinity routing (automatic prefix cache). Codex dialect
+        // does additional instruction reshaping below.
+        stamp_responses_prompt_cache_key(request);
+
+        if self.defaults.responses_codex_dialect {
+            apply_codex_dialect(request);
+        }
+
         Ok(())
     }
 
@@ -1179,9 +1639,18 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
-            .json(&request_body);
+        if self.defaults.responses_codex_dialect {
+            // ChatGPT Codex backend rejects non-stream requests:
+            // `{"detail":"Stream must be set to true"}`.
+            request_body["stream"] = serde_json::json!(true);
+            strip_codex_unsupported_body_fields(&mut request_body);
+            patch_codex_reasoning_effort_wire(
+                &mut request_body,
+                self.defaults.reasoning_effort,
+            );
+        }
+        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("responses"));
+        let http_request = grok_headers.apply(http_request).json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1196,7 +1665,10 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(crate::attribution::SamplingConsumer::Responses);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::Responses,
+                    sent_bearer_prefix.as_deref(),
+                );
                 let endpoint = self.endpoint("responses");
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(SamplingError::Auth(format!(
@@ -1264,7 +1736,7 @@ impl SamplingClient {
         &self,
         mut request: CreateResponseWrapper,
     ) -> Result<(
-        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        BoxStream<'static, Result<ResponsesStreamItem>>,
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
@@ -1315,14 +1787,27 @@ impl SamplingClient {
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        // Always force stream on the wire for Responses streaming calls.
+        // ChatGPT Codex (`chatgpt.com/backend-api/codex/responses`) hard-requires
+        // `stream: true` and returns FastAPI `{"detail":"Stream must be set to true"}`
+        // otherwise — which our error parser used to collapse to a generic 400.
+        request_body["stream"] = serde_json::json!(true);
+        if self.defaults.responses_codex_dialect {
+            strip_codex_unsupported_body_fields(&mut request_body);
+            patch_codex_reasoning_effort_wire(
+                &mut request_body,
+                self.defaults.reasoning_effort,
+            );
+        }
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
             .defaults
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
+        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("responses"));
         let mut http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply(http_request)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if doom_loop.is_some() {
             // Presence opts in; the server ignores the value.
@@ -1355,7 +1840,10 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(crate::attribution::SamplingConsumer::ResponsesStream);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::ResponsesStream,
+                    sent_bearer_prefix.as_deref(),
+                );
                 let endpoint = self.endpoint("responses");
                 let body = response.bytes().await.unwrap_or_default();
                 let server_message = user_facing_api_error_message(status, body.as_ref());
@@ -1407,9 +1895,10 @@ impl SamplingClient {
 
         let doom_loop_for_stream = doom_loop.clone();
 
-        // The scan item is an `Option`: `Some(None)` skips an absorbed
-        // doom-loop event without terminating the stream (`filter_map`
-        // below), while an outer `None` still ends it.
+        // Absorbed frames (doom-loop check events) and auxiliary frames both
+        // surface as heartbeats: they carry no model output but prove server
+        // liveness, which the layer-2 idle detector needs in order not to
+        // mistake a long heartbeat-only phase for a dead connection.
         let events = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -1440,21 +1929,18 @@ impl SamplingClient {
                             None => is_check_event(&event.event, data),
                         };
                         if swallow {
-                            Some(None)
-                        } else if let Some(stream_error) = try_parse_stream_error(data) {
-                            Some(Some(Err(stream_error)))
+                            Ok(ResponsesStreamItem::Heartbeat)
                         } else {
-                            Some(Some(deserialize_response_event(data)))
+                            decode_responses_sse_frame(&event.event, data)
                         }
                     }
                     Err(e) => {
                         *had_transport_error = true;
-                        Some(Some(Err(SamplingError::EventStreamError(e.to_string()))))
+                        Err(SamplingError::EventStreamError(e.to_string()))
                     }
                 };
-                std::future::ready(item)
+                std::future::ready(Some(item))
             })
-            .filter_map(std::future::ready)
             .boxed();
 
         Ok((events, model_metadata, doom_loop))
@@ -1518,9 +2004,8 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
-            .json(&request.inner);
+        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("messages"));
+        let http_request = grok_headers.apply(http_request).json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1535,7 +2020,10 @@ impl SamplingClient {
 
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                self.record_401_attribution(crate::attribution::SamplingConsumer::Messages);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::Messages,
+                    sent_bearer_prefix.as_deref(),
+                );
                 let endpoint = self.endpoint("messages");
                 let server_message = user_facing_api_error_message(status, bytes.as_ref());
                 return Err(SamplingError::Auth(format!(
@@ -1625,8 +2113,9 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
+        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("messages"));
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply(http_request)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
@@ -1655,7 +2144,10 @@ impl SamplingClient {
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
-                self.record_401_attribution(crate::attribution::SamplingConsumer::MessagesStream);
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::MessagesStream,
+                    sent_bearer_prefix.as_deref(),
+                );
                 let endpoint = self.endpoint("messages");
                 let body = response.bytes().await.unwrap_or_default();
                 let server_message = user_facing_api_error_message(status, body.as_ref());
@@ -1730,18 +2222,7 @@ impl SamplingClient {
                         if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Err(stream_error))
                         } else {
-                            Some(
-                                serde_json::from_str::<messages::MessageStreamEvent>(data).map_err(
-                                    |e| {
-                                        tracing::error!(
-                                            error = %e,
-                                            raw_data = %data,
-                                            "Failed to deserialize MessageStreamEvent from stream"
-                                        );
-                                        SamplingError::Serialization(e)
-                                    },
-                                ),
-                            )
+                            Some(decode_messages_sse_frame(data))
                         }
                     }
                     Err(e) => {
@@ -1761,7 +2242,13 @@ impl SamplingClient {
     // =========================================================================
 
     /// Apply default configuration to a ConversationRequest.
-    fn apply_conversation_defaults(&self, request: &mut ConversationRequest) -> Result<()> {
+    ///
+    /// The actor calls this before constructing its Layer 2 stream so it can
+    /// carry the exact route identity onto the accepted response.
+    pub(crate) fn apply_conversation_defaults(
+        &self,
+        request: &mut ConversationRequest,
+    ) -> Result<()> {
         if request.model.is_none() {
             request.model = Some(self.defaults.model.clone());
         }
@@ -1777,6 +2264,20 @@ impl SamplingClient {
         if request.max_output_tokens.is_none() {
             request.max_output_tokens = self.defaults.max_completion_tokens;
         }
+
+        // The client is authoritative for the route that will actually carry
+        // this request. Overwrite caller provenance so side requests (recap,
+        // compaction, classifiers) cannot replay opaque reasoning across an
+        // endpoint/backend switch merely because they reused the same slug.
+        request.reasoning_model_identity = Some(ReasoningModelIdentity::new(
+            request.model.clone().unwrap_or_default(),
+            self.defaults.api_backend.clone(),
+            &self.base_url,
+        ));
+
+        // Production always stamps dialect from SamplerConfig so bare
+        // model-name matching cannot reshape Ollama/OpenRouter payloads.
+        request.kimi_dialect = Some(self.defaults.kimi_dialect);
 
         Ok(())
     }
@@ -1832,7 +2333,7 @@ impl SamplingClient {
         &self,
         mut request: ConversationRequest,
     ) -> Result<(
-        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        BoxStream<'static, Result<ResponsesStreamItem>>,
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
@@ -1968,8 +2469,10 @@ impl SamplingClient {
     /// Backend-aware streaming call that collects the full response.
     pub async fn conversation_collect(
         &self,
-        request: ConversationRequest,
+        mut request: ConversationRequest,
     ) -> Result<ConversationResponse> {
+        self.apply_conversation_defaults(&mut request)?;
+        let reasoning_model_identity = request.reasoning_model_identity.clone();
         let request_id = crate::types::RequestId::random();
         let idle_timeout = std::time::Duration::from_secs(300);
         let result = match self.api_backend() {
@@ -1992,7 +2495,14 @@ impl SamplingClient {
             }
         };
         result
-            .map(|(response, _metrics)| response)
+            .map(|(mut response, _metrics)| {
+                for item in &mut response.items {
+                    if let xai_grok_sampling_types::ConversationItem::Assistant(assistant) = item {
+                        assistant.reasoning_model_identity = reasoning_model_identity.clone();
+                    }
+                }
+                response
+            })
             .map_err(|info| SamplingError::Api {
                 status: info
                     .status_code
@@ -2043,7 +2553,41 @@ mod tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            responses_codex_dialect: false,
+            kimi_dialect: false,
         }
+    }
+
+    #[test]
+    fn conversation_defaults_use_the_actual_client_route_identity() {
+        let cfg = SamplerConfig {
+            base_url: "https://actual.example/v1/".to_string(),
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let mut request = ConversationRequest {
+            model: Some("side-request-model".to_string()),
+            reasoning_model_identity: Some(ReasoningModelIdentity::new(
+                "wrong-model",
+                ApiBackend::Messages,
+                "https://wrong.example/v1",
+            )),
+            ..Default::default()
+        };
+
+        client
+            .apply_conversation_defaults(&mut request)
+            .expect("defaults should apply");
+
+        assert_eq!(
+            request.reasoning_model_identity,
+            Some(ReasoningModelIdentity::new(
+                "side-request-model",
+                ApiBackend::Responses,
+                "https://actual.example/v1",
+            ))
+        );
     }
 
     /// Verify the serialized shape of StreamingChatRequest matches the
@@ -2060,11 +2604,13 @@ mod tests {
             frequency_penalty: None,
             presence_penalty: None,
             user: None,
+            prompt_cache_key: None,
             tools: None,
             tool_choice: None,
             search_parameters: None,
             response_format: None,
             reasoning_effort: None,
+            thinking: None,
             x_grok_conv_id: None,
             x_grok_req_id: None,
             x_grok_session_id: None,
@@ -2108,6 +2654,83 @@ mod tests {
 
         assert!(obj.get("max_tokens").is_none());
         assert!(obj.get("tools").is_none());
+    }
+
+    #[test]
+    fn codex_dialect_moves_system_prompt_to_instructions() {
+        use xai_grok_sampling_types::ConversationRequest;
+
+        let mut config = minimal_config();
+        config.api_backend = ApiBackend::Responses;
+        config.responses_codex_dialect = true;
+        let client = SamplingClient::new(config).unwrap();
+
+        let request = ConversationRequest::from_items(vec![
+            xai_grok_sampling_types::ConversationItem::system("you are codex"),
+            xai_grok_sampling_types::ConversationItem::user("hello"),
+        ]);
+        let responses_request: rs::CreateResponse = (&request).into();
+        let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.x_grok_session_id = Some("session-123".to_string());
+
+        client.apply_response_defaults(&mut wrapper).unwrap();
+        let body = serde_json::to_value(&wrapper.inner).unwrap();
+
+        assert_eq!(body["instructions"], "you are codex");
+        assert_eq!(body["prompt_cache_key"], "session-123");
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["store"], false);
+        let input = body["input"].as_array().expect("input items");
+        assert!(
+            input.iter().all(|item| item["role"] != "system"),
+            "system items must be lifted out of input: {input:?}"
+        );
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn codex_dialect_off_keeps_system_in_input() {
+        use xai_grok_sampling_types::ConversationRequest;
+
+        let mut config = minimal_config();
+        config.api_backend = ApiBackend::Responses;
+        let client = SamplingClient::new(config).unwrap();
+
+        let request = ConversationRequest::from_items(vec![
+            xai_grok_sampling_types::ConversationItem::system("you are grok"),
+            xai_grok_sampling_types::ConversationItem::user("hello"),
+        ]);
+        let responses_request: rs::CreateResponse = (&request).into();
+        let mut wrapper = CreateResponseWrapper::new(responses_request);
+        wrapper.x_grok_session_id = Some("sess-openai".to_string());
+
+        client.apply_response_defaults(&mut wrapper).unwrap();
+        let body = serde_json::to_value(&wrapper.inner).unwrap();
+
+        assert!(body.get("instructions").is_none());
+        let input = body["input"].as_array().expect("input items");
+        assert!(input.iter().any(|item| item["role"] == "system"));
+        // Non-Codex OpenAI Responses still stamps prompt_cache_key for affinity.
+        assert_eq!(body["prompt_cache_key"], "sess-openai");
+    }
+
+    #[test]
+    fn responses_prompt_cache_key_from_conversation_request() {
+        use xai_grok_sampling_types::ConversationRequest;
+
+        let mut req = ConversationRequest::from_items(vec![
+            xai_grok_sampling_types::ConversationItem::user("hi"),
+        ]);
+        req.prompt_cache_key = Some("explicit-key".into());
+        req.prompt_cache_retention = Some("24h".into());
+        let body: rs::CreateResponse = (&req).into();
+        assert_eq!(body.prompt_cache_key.as_deref(), Some("explicit-key"));
+        assert_eq!(
+            body.prompt_cache_retention,
+            Some(rs::PromptCacheRetention::Hours24)
+        );
     }
 
     #[test]
@@ -2307,10 +2930,8 @@ mod tests {
         let mut config = minimal_config();
         config.header_injector = Some(std::sync::Arc::new(TestInjector));
         let client = SamplingClient::new(config).expect("build");
-        let req = client
-            .post("http://localhost/test")
-            .build()
-            .expect("build request");
+        let (req, _) = client.post("http://localhost/test");
+        let req = req.build().expect("build request");
         assert!(
             req.headers().contains_key("traceparent"),
             "HeaderInjector should inject traceparent into post() requests"
@@ -2363,6 +2984,42 @@ mod tests {
     impl crate::config::BearerResolver for StaticBearerResolver {
         fn current_bearer(&self) -> Option<String> {
             Some(self.0.to_string())
+        }
+    }
+
+    #[derive(Debug)]
+    struct MissingBearerResolver;
+
+    impl crate::config::BearerResolver for MissingBearerResolver {
+        fn current_bearer(&self) -> Option<String> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct CompanionHeaderResolver {
+        account_id: Option<&'static str>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::config::BearerResolver for CompanionHeaderResolver {
+        fn current_bearer(&self) -> Option<String> {
+            panic!("post() must use the single resolve_bearer() result")
+        }
+
+        fn resolve_bearer(&self) -> crate::config::BearerResolution {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let name = HeaderName::from_static("chatgpt-account-id");
+            let mut resolution =
+                crate::config::BearerResolution::from_bearer(Some("fresh-bearer".to_string()));
+            resolution.remove_headers.push(name.clone());
+            if let Some(account_id) = self.account_id {
+                resolution.headers.insert(
+                    name,
+                    HeaderValue::from_str(account_id).expect("valid account id"),
+                );
+            }
+            resolution
         }
     }
 
@@ -2441,16 +3098,115 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/messages")
-            .build()
-            .expect("request should build");
+        let (request, _) = client.post("https://example.test/v1/messages");
+        let request = request.build().expect("request should build");
         let auth = request
             .headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
         assert_eq!(auth, Some("Bearer fresh-bearer"));
         assert!(request.headers().get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn invalid_live_bearer_is_not_attributed_as_sent() {
+        let cfg = SamplerConfig {
+            api_key: Some("stale-bearer".to_string()),
+            bearer_resolver: Some(std::sync::Arc::new(StaticBearerResolver("invalid\nbearer"))),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let (request, sent_bearer_prefix) = client.post("https://example.test/v1/responses");
+        let request = request.build().expect("request should build");
+
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+        assert!(sent_bearer_prefix.is_none());
+    }
+
+    #[test]
+    fn bearer_resolution_atomically_replaces_companion_headers() {
+        for (account_id, expected) in [(Some("acct-new"), Some("acct-new")), (None, None)] {
+            let mut cfg = minimal_config();
+            cfg.api_key = Some("stale-bearer".to_string());
+            cfg.extra_headers
+                .insert("chatgpt-account-id".to_string(), "acct-stale".to_string());
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            cfg.bearer_resolver = Some(std::sync::Arc::new(CompanionHeaderResolver {
+                account_id,
+                calls: calls.clone(),
+            }));
+            let client = SamplingClient::new(cfg).expect("client should build");
+            let info = client.auth_info();
+            assert_eq!(info.auth_type, "bearer");
+            assert!(info.auth_prefix.is_none());
+            let (request, sent_bearer_prefix) = client.post("https://example.test/v1/responses");
+            let request = request.build().expect("request should build");
+
+            assert_eq!(
+                request
+                    .headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer fresh-bearer")
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("chatgpt-account-id")
+                    .and_then(|value| value.to_str().ok()),
+                expected
+            );
+            assert_eq!(sent_bearer_prefix.as_deref(), Some("fresh-bearer"));
+            client.record_401_attribution(
+                crate::attribution::SamplingConsumer::Responses,
+                sent_bearer_prefix.as_deref(),
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "span metadata, request auth, companion header, and 401 attribution must share one resolution"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_live_bearer_does_not_fall_back_to_stale_catalog_token() {
+        let cfg = SamplerConfig {
+            api_key: Some("expired-catalog-token".to_string()),
+            api_backend: ApiBackend::Messages,
+            auth_scheme: AuthScheme::Bearer,
+            bearer_resolver: Some(std::sync::Arc::new(MissingBearerResolver)),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let (request, sent_bearer_prefix) = client.post("https://example.test/v1/messages");
+        let request = request.build().expect("request should build");
+        assert!(
+            request.headers().get(AUTHORIZATION).is_none(),
+            "failed refresh must not send the expired construction-time bearer"
+        );
+        assert!(request.headers().get("x-api-key").is_none());
+        assert!(sent_bearer_prefix.is_none());
+    }
+
+    #[test]
+    fn missing_live_x_api_key_does_not_fall_back_to_stale_catalog_key() {
+        let cfg = SamplerConfig {
+            api_key: Some("expired-catalog-key".to_string()),
+            api_backend: ApiBackend::Messages,
+            auth_scheme: AuthScheme::XApiKey,
+            bearer_resolver: Some(std::sync::Arc::new(MissingBearerResolver)),
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        let (request, sent_bearer_prefix) = client.post("https://example.test/v1/messages");
+        let request = request.build().expect("request should build");
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+        assert!(
+            request.headers().get("x-api-key").is_none(),
+            "failed live resolution must not send a stale construction-time x-api-key"
+        );
+        assert!(sent_bearer_prefix.is_none());
     }
 
     /// Regression: when `api_key` (which seeds `default_headers` with an
@@ -2469,10 +3225,8 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/responses")
-            .build()
-            .expect("request should build");
+        let (request, _) = client.post("https://example.test/v1/responses");
+        let request = request.build().expect("request should build");
         let auth_count = request.headers().get_all(AUTHORIZATION).iter().count();
         assert_eq!(
             auth_count, 1,
@@ -2497,10 +3251,8 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/messages")
-            .build()
-            .expect("request should build");
+        let (request, _) = client.post("https://example.test/v1/messages");
+        let request = request.build().expect("request should build");
         let api_key = request
             .headers()
             .get("x-api-key")
@@ -2540,7 +3292,11 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        client.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletionsStream);
+        let sent_bearer_prefix = client.extract_sent_bearer();
+        client.record_401_attribution(
+            crate::attribution::SamplingConsumer::ChatCompletionsStream,
+            sent_bearer_prefix.as_deref(),
+        );
         let calls = cb.invocations.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
@@ -2602,14 +3358,15 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let request = client
-            .post("https://example.test/v1/responses")
-            .body("")
-            .build()
-            .expect("request should build");
+        let (builder, sent_bearer_prefix) = client.post("https://example.test/v1/responses");
+        let request = builder.body("").build().expect("request should build");
         assert!(
             request.headers().get(AUTHORIZATION).is_none(),
             "stale default Authorization must not be sent when resolver is empty"
+        );
+        assert!(
+            sent_bearer_prefix.is_none(),
+            "resolver None must not attribute a stripped default seed"
         );
     }
 
@@ -2638,7 +3395,7 @@ mod tests {
         let client = SamplingClient::new(cfg).expect("client should build");
 
         // Build a request to inspect the final headers.
-        let builder = client.post("https://example.test/v1/responses");
+        let (builder, _) = client.post("https://example.test/v1/responses");
         let request = builder.body("").build().expect("request should build");
 
         let auth_values: Vec<_> = request.headers().get_all(AUTHORIZATION).iter().collect();
@@ -2671,7 +3428,152 @@ mod tests {
         };
         let client = SamplingClient::new(cfg).expect("client should build");
         // Must not panic.
-        client.record_401_attribution(crate::attribution::SamplingConsumer::ChatCompletions);
+        client.record_401_attribution(
+            crate::attribution::SamplingConsumer::ChatCompletions,
+            Some("bearer"),
+        );
+    }
+
+    #[test]
+    fn decode_responses_sse_frame_maps_auxiliary_events_to_heartbeats() {
+        for event_type in RESPONSES_AUXILIARY_EVENT_TYPES {
+            let named = decode_responses_sse_frame(event_type, r#"{"side_band":true}"#);
+            assert!(
+                matches!(named, Ok(ResponsesStreamItem::Heartbeat)),
+                "event: {event_type} should surface as a heartbeat"
+            );
+
+            let payload = serde_json::json!({
+                "type": event_type,
+                "sequence_number": 7,
+                "metadata": { "request_id": "req_test" }
+            })
+            .to_string();
+            let data_only = decode_responses_sse_frame("", &payload);
+            assert!(
+                matches!(data_only, Ok(ResponsesStreamItem::Heartbeat)),
+                "type: {event_type} should surface as a heartbeat"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_responses_sse_frame_does_not_swallow_auxiliary_name_in_output_text() {
+        let payload = serde_json::json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 8,
+            "item_id": "item_test",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "literal response.metadata and keepalive text",
+            "logprobs": []
+        })
+        .to_string();
+
+        let Ok(ResponsesStreamItem::Event(rs::ResponseStreamEvent::ResponseOutputTextDelta(
+            event,
+        ))) = decode_responses_sse_frame("", &payload)
+        else {
+            panic!("a normal text delta containing auxiliary names must be preserved");
+        };
+        assert_eq!(event.delta, "literal response.metadata and keepalive text");
+    }
+
+    #[test]
+    fn decode_responses_sse_frame_skips_unknown_event_types() {
+        // Forward-compat: an event type this build does not model is a
+        // heartbeat skip, not a fatal serialization error (codex-rs posture).
+        let decoded = decode_responses_sse_frame(
+            "",
+            r#"{"type":"response.future_semantic_event","sequence_number":9}"#,
+        );
+        assert!(matches!(decoded, Ok(ResponsesStreamItem::Heartbeat)));
+    }
+
+    #[test]
+    fn decode_responses_sse_frame_skips_unknown_output_item_kinds() {
+        // A known frame whose nested item is an OutputItem kind async-openai
+        // predates: skip the frame, keep the stream alive.
+        let payload = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": 10,
+            "output_index": 0,
+            "item": { "type": "brand_new_item_kind", "id": "item_1" }
+        })
+        .to_string();
+        let decoded = decode_responses_sse_frame("", &payload);
+        assert!(matches!(decoded, Ok(ResponsesStreamItem::Heartbeat)));
+    }
+
+    #[test]
+    fn decode_responses_sse_frame_keeps_malformed_known_events_strict() {
+        // A known event type with a malformed payload stays a fatal
+        // serialization error — forward-compat leniency must not hide wire
+        // corruption on events we do model.
+        let decoded = decode_responses_sse_frame(
+            "",
+            r#"{"type":"response.output_text.delta","sequence_number":9}"#,
+        );
+        assert!(matches!(
+            decoded,
+            Err(SamplingError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn decode_messages_sse_frame_skips_unknown_event_types() {
+        // Forward-compat: a Messages event type this build does not model is
+        // a liveness Ping, not a fatal serialization error.
+        let decoded = decode_messages_sse_frame(r#"{"type":"citation","index":0}"#);
+        assert!(matches!(
+            decoded,
+            Ok(messages::MessageStreamEvent::Ping)
+        ));
+    }
+
+    #[test]
+    fn decode_messages_sse_frame_skips_unknown_content_block_kinds() {
+        let decoded = decode_messages_sse_frame(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"brand_new_block","id":"b1"}}"#,
+        );
+        assert!(matches!(
+            decoded,
+            Ok(messages::MessageStreamEvent::Ping)
+        ));
+
+        let decoded = decode_messages_sse_frame(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"brand_new_delta","x":"y"}}"#,
+        );
+        assert!(matches!(
+            decoded,
+            Ok(messages::MessageStreamEvent::Ping)
+        ));
+    }
+
+    #[test]
+    fn decode_messages_sse_frame_keeps_malformed_known_events_strict() {
+        // Missing required fields on a known type: still a fatal
+        // serialization error (wire corruption must not be hidden).
+        let decoded = decode_messages_sse_frame(r#"{"type":"content_block_stop"}"#);
+        assert!(matches!(
+            decoded,
+            Err(SamplingError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn decode_messages_sse_frame_parses_ping_and_text_delta() {
+        assert!(matches!(
+            decode_messages_sse_frame(r#"{"type":"ping"}"#),
+            Ok(messages::MessageStreamEvent::Ping)
+        ));
+        let decoded = decode_messages_sse_frame(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        );
+        assert!(matches!(
+            decoded,
+            Ok(messages::MessageStreamEvent::ContentBlockDelta { .. })
+        ));
     }
 
     /// `response.completed` carrying
@@ -2704,7 +3606,9 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = deserialize_response_event(sse)
+            .expect("parse")
+            .expect("event present");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -2742,7 +3646,9 @@ mod tests {
             )
         };
 
-        let event = deserialize_response_event(&make(78)).expect("parse");
+        let event = deserialize_response_event(&make(78))
+            .expect("parse")
+            .expect("event present");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -2756,7 +3662,9 @@ mod tests {
         );
 
         // The REST mapper backfills 0 for unbilled requests: no stash.
-        let event = deserialize_response_event(&make(0)).expect("parse");
+        let event = deserialize_response_event(&make(0))
+            .expect("parse")
+            .expect("event present");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -2786,7 +3694,9 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = deserialize_response_event(sse)
+            .expect("parse")
+            .expect("event present");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -2823,7 +3733,9 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = deserialize_response_event(sse)
+            .expect("parse")
+            .expect("event present");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -2844,10 +3756,52 @@ mod tests {
             "delta": "hello",
             "logprobs": []
         }"#;
-        let event = deserialize_response_event(sse).expect("non-terminal event parses");
+        let event = deserialize_response_event(sse)
+            .expect("non-terminal event parses")
+            .expect("event present");
         assert!(matches!(
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    /// openai/codex maps Ultra → Max before the Responses body is built
+    /// (`reasoning_effort_for_request`). Sending `effort: "ultra"` 400s.
+    #[test]
+    fn codex_wire_maps_ultra_to_max_like_official_cli() {
+        use xai_grok_sampling_types::ReasoningEffort as E;
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": { "effort": "xhigh", "summary": "auto" }
+        });
+        patch_codex_reasoning_effort_wire(&mut body, Some(E::Ultra));
+        assert_eq!(body["reasoning"]["effort"], "max");
+        patch_codex_reasoning_effort_wire(&mut body, Some(E::Max));
+        assert_eq!(body["reasoning"]["effort"], "max");
+        patch_codex_reasoning_effort_wire(&mut body, Some(E::Xhigh));
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        patch_codex_reasoning_effort_wire(&mut body, Some(E::None));
+        assert!(body.get("reasoning").is_none());
+    }
+
+    /// Codex backend 400s on max_output_tokens/temperature/top_p — strip them.
+    #[test]
+    fn strip_codex_unsupported_body_fields_removes_sampling_knobs() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "max_output_tokens": 131072,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_tool_calls": 8,
+            "instructions": "hi",
+        });
+        strip_codex_unsupported_body_fields(&mut body);
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("max_tool_calls").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["model"], "gpt-5.5");
     }
 }

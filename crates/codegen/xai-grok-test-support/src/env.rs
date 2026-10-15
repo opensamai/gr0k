@@ -66,7 +66,7 @@ fn target_dir() -> PathBuf {
 fn local_grok_binary_path() -> PathBuf {
     target_dir()
         .join("debug")
-        .join(format!("xai-grok-pager{}", std::env::consts::EXE_SUFFIX))
+        .join(format!("hyper{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn ensure_local_grok_binary(binary: &Path) {
@@ -82,30 +82,30 @@ fn ensure_local_grok_binary(binary: &Path) {
             "-p",
             "xai-grok-pager-bin",
             "--bin",
-            "xai-grok-pager",
+            "hyper",
         ])
         .stdin(std::process::Stdio::null())
         .envs(xai_tty_utils::pager_env());
     xai_tty_utils::detach_std_command(&mut cmd);
     let output = cmd
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build xai-grok-pager: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build hyper: {e}"));
 
     assert!(
         output.status.success(),
-        "failed to build xai-grok-pager for lifecycle tests (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        "failed to build hyper for lifecycle tests (exit {:?})\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
         binary.exists(),
-        "xai-grok-pager build completed but binary missing at {}",
+        "hyper build completed but binary missing at {}",
         binary.display()
     );
 }
 
-/// Resolve grok binary: `GROK_BINARY` env (CI) or a locally built `xai-grok-pager` binary.
+/// Resolve binary: `GROK_BINARY` env (CI) or a locally built `hyper` binary.
 pub fn grok_binary() -> PathBuf {
     if let Ok(path) = std::env::var("GROK_BINARY") {
         let p = PathBuf::from(path);
@@ -113,7 +113,7 @@ pub fn grok_binary() -> PathBuf {
         return p;
     }
 
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_xai-grok-pager") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_hyper") {
         let p = PathBuf::from(path);
         if p.exists() {
             return p;
@@ -125,7 +125,64 @@ pub fn grok_binary() -> PathBuf {
     binary
 }
 
+/// Unset every BYOK platform API-key env var that the built-in platform
+/// catalog (`inject_moonshot_builtin_models` / `platform_builtin_models`)
+/// stamps onto catalog entries' `env_key`. Returns one [`EnvGuard`] per var
+/// so the caller can hold them for the test's lifetime.
+///
+/// Why: `ModelEntry::has_own_credentials()` resolves `env_key` against the
+/// process environment. A developer shell with `ANTHROPIC_API_KEY` (etc.)
+/// set makes every `anthropic/*` catalog entry "have credentials",
+/// leaking into tests that only intend to exercise a user-supplied
+/// `[model.*]` BYOK entry. Callers MUST be `#[serial]` (the underlying
+/// [`EnvGuard`] mutates the process-global environment).
+///
+/// Note: KimiCode / OpenAiCodex use OAuth and expose no API-key env names,
+/// so they contribute nothing here — that's intentional.
+pub fn unset_all_byok_platform_api_key_envs() -> Vec<EnvGuard> {
+    let mut guards = Vec::new();
+    // Collect first to deduplicate (MOONSHOT_API_KEY / ZAI_API_KEY / MINIMAX_API_KEY
+    // are shared across platforms) so we don't double-unset and clobber the
+    // restored value mid-iteration.
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for platform in xai_grok_models::PlatformId::ALL {
+        for &name in platform.api_key_env_names() {
+            if seen.insert(name) {
+                guards.push(EnvGuard::unset(name));
+            }
+        }
+    }
+    guards
+}
+
 /// Create an owned, git-initialized [`TestSandbox`].
 pub fn git_workdir() -> TestSandbox {
     TestSandbox::builder().git().build()
+}
+
+/// Point grok at the mock server with a fake API key and telemetry disabled.
+pub fn test_env_cmd_tokio(
+    cmd: &mut tokio::process::Command,
+    mock_url: &str,
+    home: &std::path::Path,
+) {
+    cmd.env("HOME", home)
+        // HOME alone does not sandbox grok on Windows: the product resolves
+        // `~` via `USERPROFILE`/Known Folders (`std::env::home_dir()`), so
+        // without an explicit GROK_HOME every spawned child shares the real
+        // `%USERPROFILE%\.grok` — test 1's models_cache.json (which embeds
+        // its per-test mock-server URL) then poisons every later test's
+        // prompt (the windows-x86_64 lifecycle "prompt timed out" failure).
+        // Mirrors `leader.rs` and the pty-harness `env_for_pager`.
+        .env("GROK_HOME", home.join(".grok"))
+        .env("GROK_CLI_CHAT_PROXY_BASE_URL", mock_url)
+        .env("GROK_XAI_API_BASE_URL", mock_url)
+        .env("XAI_API_KEY", "test-key-for-ci")
+        .env("GROK_TELEMETRY_ENABLED", "false")
+        .env("GROK_FEEDBACK_ENABLED", "false")
+        .env("GROK_TRACE_UPLOAD", "false")
+        .env("GROK_INSTRUMENTATION", "disabled")
+        // Release binaries (CI lifecycle tests) otherwise spawn a background
+        // update check that hits the network and can add latency under Rosetta.
+        .env("GROK_DISABLE_AUTOUPDATER", "1");
 }

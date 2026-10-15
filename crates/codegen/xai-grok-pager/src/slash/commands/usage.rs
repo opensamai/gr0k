@@ -41,12 +41,18 @@ impl SlashCommand for UsageCommand {
                 match_text: "show".into(),
                 insert_text: "show".into(),
                 description: "View usage".into(),
+                locked: false,
+                action_id: None,
+                hidden: false,
             },
             ArgItem {
                 display: "manage".into(),
                 match_text: "manage".into(),
                 insert_text: "manage".into(),
                 description: "Manage billing".into(),
+                locked: false,
+                action_id: None,
+                hidden: false,
             },
         ])
     }

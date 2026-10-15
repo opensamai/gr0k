@@ -60,10 +60,54 @@ The `spawn_subagent` tool accepts a `subagent_type` parameter that selects the c
 | Type              | Description                                          |
 | ----------------- | ---------------------------------------------------- |
 | `general-purpose` | Default type. Full-capability agent for any task.    |
-| `explore`         | Research agent. Searches, reads, greps, and runs shell commands, but does not edit files. Use it for codebase investigation. |
-| `plan`            | Planning agent. Explores the codebase and produces a structured implementation plan; does not edit files. |
+| `explore`         | Fast read-only research agent. Reads files, lists directories, and searches code; it has no shell or editing tools. |
+| `plan`            | Read-only planning agent. Inspects the codebase and maintains a planning todo list; it has no shell or editing tools. |
+| `oracle`          | Deep-analysis advisor. Read-only; the working agent consults it when stuck, debugging a complex issue, or weighing approaches, then acts on its recommendation. Pin it to a stronger model for best effect. |
 
 Project- or user-defined agents can add new types or shadow these built-ins by name.
+
+### Consulting the Oracle
+
+The oracle pattern pairs a **working model** with a **stronger analysis model**: the main agent keeps working on its own model, and when it hits a problem that needs deeper reasoning it spawns the `oracle` subagent, reads its recommendation, and continues. The oracle is read-only at the toolset level, so it can inspect the repo but never edits it.
+
+**Pin a stronger model or the pattern does nothing useful.** Without a pin, Oracle **inherits the session model**. If the main session is already on that model (for example Grok), Oracle is the same model with a fancier prompt — not Amp-style deep think.
+
+Pin Oracle with `/agents` → select `oracle` → `m`, or in `config.toml`:
+
+```toml
+[subagents.models]
+oracle = "openai/gpt-5.6"   # example; use any stronger slug you have credentials for
+```
+
+Typical setup: cheap/fast model on the main session, frontier model on `oracle` only.
+
+**When the main agent should consult Oracle** (it decides via `spawn_subagent`; Hyper does not auto-run Oracle every turn like some cloud products):
+
+- Same test or error still failing after repeated edit attempts
+- Unclear root cause, architecture trade-off, or high-risk change
+- You ask it to rethink, review the approach, or get a second opinion
+
+If the working model keeps thrashing instead of calling Oracle, **say so in the chat** — there is no `/oracle` slash. For example: “用 oracle 看为什么测试还红”, “ask oracle why this still fails”, or “spawn oracle on the root cause”. Pin a stronger model first so the consult is worth the cost.
+
+**Observability.** Two guards keep the pin honest:
+
+- If an `oracle` subagent spawns and its resolved model is the **same** as the session's, a toast warns: *"Oracle is using the same model as this session — pin a stronger one via `/agents` → `oracle` → `m`."*
+- `/doctor` reports a recommendation when Oracle has no `[subagents.models]` pin at all — and, in the TUI, when the pin equals the session model.
+
+The built-in Oracle is bounded by default: 12 model/tool-use rounds, 40 tool calls, and 180 seconds total wall-clock time. Thirty seconds are reserved for finalization. Near a limit, Grok Build tells Oracle to stop investigating and return its best structured recommendation; if it ignores the warning, the hard tool/time limit cancels it. The Oracle response contract includes findings, evidence, alternatives, risks, a verification handoff, confidence, and a final recommendation.
+
+Design notes (pin warnings, chat-trigger obedience): repository `docs/design-oracle.md`.
+
+Custom or shadowing agent definitions can use the same YAML frontmatter fields:
+
+```yaml
+maxTurns: 12
+maxToolCalls: 40
+timeoutSecs: 180
+finalizeGraceSecs: 30
+```
+
+All values must be greater than zero. `maxTurns` is the existing model/tool-loop limit; the other fields are optional. Agents without these fields remain unbounded, except when they inherit a parent `maxTurns` limit.
 
 ---
 
@@ -87,7 +131,9 @@ Grok Build discovers file-based personas from these locations, in priority order
 
 Each file defines one persona, and the file name (without the extension) becomes the persona name. Inline `config.toml` personas take precedence over files. Only `.toml` files are discovered.
 
-Manage personas in the Personas tab of the agents modal (`/personas`). Bundled personas are read-only; personas you define are editable.
+Manage personas in the Personas tab of the agents modal (`/personas`). Personas you define (user or project files) are editable; bundled personas are read-only, but applying a model to one writes a customized copy to `~/.grok/personas/` that shadows the bundled definition.
+
+To set a persona's model from the TUI, select it in the Personas tab and press `m` — the same model picker as agent pins opens (type to filter, `↑`/`↓` to choose, Enter to apply, **inherit** to clear). Only models with configured credentials are offered. The choice is written as the `model` key in the persona's `.toml` file. Project personas (`.grok/personas/`) are re-discovered at every spawn, so their model applies immediately; user personas (`~/.grok/personas/`) load at session start, so their model applies in new sessions.
 
 > **Note:** Grok Build applies personas through subagent resolution and roles, not through a `spawn_subagent` parameter. The main agent does not pass a persona name when it spawns a child.
 
@@ -100,7 +146,7 @@ Manage personas in the Personas tab of the agents modal (`/personas`). Bundled p
 | `description`       | Short summary shown in the persona catalog. Falls back to the first paragraph of `instructions`. |
 | `inputs` / `outputs`| Declared input and output contract (see below).                     |
 | `model`             | Model override applied when the persona is used.                    |
-| `reasoning_effort`  | Reasoning effort applied when the persona is used.                  |
+| `reasoning_effort`  | Validated reasoning effort (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`). |
 | `default_isolation` | Default isolation mode (`none` or `worktree`).                      |
 
 ### Input/Output Contracts
@@ -125,16 +171,17 @@ Each field has a `name`, an `io_type` (defaults to `file`), a `required` flag, a
 
 ### Persona Resolution
 
-When a persona applies, Grok Build resolves the effective model and reasoning effort in this order, highest priority first:
+When a persona applies, Grok Build resolves the effective model and reasoning effort once at the spawn boundary, in this order (highest priority first):
 
 1. Explicit spawn-time override
 2. Role default
 3. Persona default
-4. Parent session
+4. Agent-definition default
+5. Parent session
 
-Isolation follows the same order for the first three steps but defaults to `none` (no worktree) rather than inheriting from the parent session.
+Isolation follows the same first four layers but defaults to `none` (no worktree) rather than inheriting from the parent session. Capability mode is intentionally stricter: the explicit request, role, and agent-definition modes are intersected as security ceilings. A caller can narrow access, but cannot widen an `oracle`, `explore`, or `plan` agent beyond read-only. The clamp runs after default tool assembly, and built-in read-only agents do not inherit unclassified MCP tools; `explore` and `oracle` keep their exact curated toolsets.
 
-If a persona is requested but cannot be resolved -- it is not found, has no instructions, or its `instructions_file` is unreadable -- the spawn fails.
+If a persona is requested but cannot be resolved -- it is not found, has no instructions, or its `instructions_file` is unreadable -- the spawn fails. Reasoning-effort values are parsed into a fixed enum during configuration loading, so misspellings fail early instead of silently reaching a provider.
 
 ---
 
@@ -147,7 +194,7 @@ The main agent calls the `spawn_subagent` tool. Its parameters:
 | `prompt`          | The full task prompt for the subagent.                           |
 | `description`     | A short label for the task (3-5 words).                          |
 | `subagent_type`   | The agent type to launch. Defaults to `general-purpose`.         |
-| `background`       | Run the subagent in the background and return immediately with a subagent ID. Defaults to `false`. |
+| `background`       | Run the subagent in the background and return immediately with a subagent ID. Defaults to `true`. |
 | `capability_mode` | Restrict the subagent's tools: `read-only`, `read-write`, `execute`, or `all`. |
 | `isolation`       | `none` (shared workspace, the default) or `worktree` (isolated git worktree). |
 | `resume_from`     | Continue a completed subagent's conversation. Pass its subagent ID. |
@@ -168,7 +215,7 @@ A capability mode is an optional, coarse filter on a subagent's tools:
 | `execute`    | Yes  | No    | Yes     | Read, plus run shell commands and background tasks. No file edits. |
 | `all`        | Yes  | Yes   | Yes     | Unrestricted tool access.                    |
 
-If you omit `capability_mode`, the subagent uses its agent type's toolset. The built-in `explore` and `plan` types read, search, and run shell commands but cannot edit files; `general-purpose` ships the full toolset.
+If you omit `capability_mode`, the subagent uses its agent type's toolset. The built-in `explore`, `plan`, and `oracle` types are enforced read-only and have no shell or editing tools; `general-purpose` ships the full toolset.
 
 ---
 
@@ -248,6 +295,20 @@ explore = "grok-build"               # route explore to a specific model
 
 Per-type model overrides apply for any parent. Without an override, a subagent inherits the parent's model.
 
+You can also manage model pins from the TUI: open `/agents`, select an agent, and press `m`. A model picker opens listing the models you have credentials for — type to filter, choose with `↑`/`↓`, and press Enter to pin. Pick **inherit** (the first row) to clear the pin and follow the session model again. Pinned agents show `→ <model>` in the list and a `pinned — [subagents.models]` note in the expanded detail. Pins are written to `~/.grok/config.toml` and apply to the next subagent spawn — no restart needed.
+
+### Per-Type Reasoning Effort
+
+Pin an effort level per agent type — e.g. a cheap model for `explore`, a deep-thinking one for `oracle`:
+
+```toml
+[subagents.effort]
+oracle = "high"      # none, minimal, low, medium, high, xhigh, max, ultra
+explore = "low"
+```
+
+Precedence (highest first): an explicit per-spawn override, then a role's `reasoning_effort`, then a persona's, then this `[subagents.effort]` pin, then the agent definition's own `effort:` field, and finally the parent session's effort. Pins that name an unknown level are ignored with a log warning. `/agents` shows pinned effort next to the model pin (`effort: <level>` in the row, and a `pinned — [subagents.effort]` note in the expanded detail); editing is via `config.toml` for now.
+
 ### Custom Roles and Personas
 
 Define custom roles with their own capability and model defaults:
@@ -281,7 +342,7 @@ Grok Build shows running and finished work in side panes on the agent screen:
 
 To view the available agent types and personas, open the command palette with `Ctrl+P` and choose **Manage Agents** (`/config-agents`).
 
-Subagents appear at the top of the tasks pane in their own collapsible "Subagents" group.
+Subagents appear at the top of the tasks pane in their own collapsible "Subagents" group. Running rows show elapsed time (and the wall-clock limit when configured), live tool calls against their limit, and current context tokens. Finished rows switch to cumulative model usage and show trustworthy reported cost when available. Runtime-driven endings are labeled with reasons such as `tool limit`, `time limit`, or `budget finalized`.
 
 ---
 

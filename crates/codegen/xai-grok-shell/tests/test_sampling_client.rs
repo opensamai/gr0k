@@ -407,7 +407,7 @@ async fn chat_completions_upgrade_folds_reconstructed_reasoning_into_request() {
             "\n",
             r#"{"type":"user","content":[{"type":"text","text":"q1"}]}"#,
             "\n",
-            r#"{"type":"assistant","content":"a1","reasoning":{"text":"legacy chain of thought","id":"rs_legacy"}}"#,
+            r#"{"type":"assistant","content":"a1","reasoning":{"text":"legacy chain of thought","id":"rs_legacy"},"model_id":"test-model"}"#,
             "\n",
         ),
     )
@@ -493,7 +493,9 @@ async fn responses_upgrade_roundtrips_reconstructed_reasoning_as_typed_input() {
 
     let server = MockInferenceServer::start().await.unwrap();
     server.set_response("ok");
-    let client = create_test_client(&server.url(), ApiBackend::Responses);
+    let mut config = test_sampler_config(&server.url(), ApiBackend::Responses, &[]);
+    config.model = "grok-build".to_string();
+    let client = Client::new(config).unwrap();
 
     let _ = client
         .conversation_collect(ConversationRequest::from_items(items))
@@ -571,7 +573,9 @@ async fn messages_upgrade_emits_reconstructed_reasoning_as_thinking_block() {
 
     let server = MockInferenceServer::start().await.unwrap();
     server.set_response("ok");
-    let client = create_test_client(&server.url(), ApiBackend::Messages);
+    let mut config = test_sampler_config(&server.url(), ApiBackend::Messages, &[]);
+    config.model = "grok-4.5".to_string();
+    let client = Client::new(config).unwrap();
 
     let _ = client
         .conversation_collect(ConversationRequest::from_items(items))
@@ -712,6 +716,11 @@ async fn test_responses_api_streaming_text() {
     let mut completed = false;
     while let Some(event_result) = stream.next().await {
         let event = event_result.unwrap();
+        // Heartbeat frames (keepalive / forward-compat skips) carry no
+        // model output — skip them in raw-frame assertions.
+        let xai_grok_sampler::ResponsesStreamItem::Event(event) = event else {
+            continue;
+        };
         use xai_grok_shell::sampling::rs::ResponseStreamEvent;
         match event {
             ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
@@ -755,6 +764,11 @@ async fn test_responses_api_streaming_tool_call() {
     let mut function_call_found = false;
     while let Some(event_result) = stream.next().await {
         let event = event_result.unwrap();
+        // Heartbeat frames (keepalive / forward-compat skips) carry no
+        // model output — skip them in raw-frame assertions.
+        let xai_grok_sampler::ResponsesStreamItem::Event(event) = event else {
+            continue;
+        };
         use xai_grok_shell::sampling::rs::ResponseStreamEvent;
         if let ResponseStreamEvent::ResponseCompleted(completed) = event {
             for output in completed.response.output {
@@ -798,6 +812,11 @@ async fn test_responses_api_with_reasoning_and_encrypted_content() {
 
     while let Some(event_result) = stream.next().await {
         let event = event_result.unwrap();
+        // Heartbeat frames (keepalive / forward-compat skips) carry no
+        // model output — skip them in raw-frame assertions.
+        let xai_grok_sampler::ResponsesStreamItem::Event(event) = event else {
+            continue;
+        };
         use xai_grok_shell::sampling::rs::ResponseStreamEvent;
         if let ResponseStreamEvent::ResponseCompleted(completed) = event {
             for output in &completed.response.output {
@@ -861,6 +880,11 @@ async fn test_responses_api_reasoning_without_encrypted() {
     let mut found_reasoning = false;
     while let Some(event_result) = stream.next().await {
         let event = event_result.unwrap();
+        // Heartbeat frames (keepalive / forward-compat skips) carry no
+        // model output — skip them in raw-frame assertions.
+        let xai_grok_sampler::ResponsesStreamItem::Event(event) = event else {
+            continue;
+        };
         use xai_grok_shell::sampling::rs::ResponseStreamEvent;
         if let ResponseStreamEvent::ResponseCompleted(completed) = event {
             for output in &completed.response.output {
@@ -1208,7 +1232,12 @@ async fn test_doom_loop_check_enabled_sends_header_and_absorbs_check_event() {
     let mut completed = false;
     while let Some(event_result) = stream.next().await {
         let event = event_result.expect("absorbed check event must not fail the typed stream");
-        if matches!(event, rs::ResponseStreamEvent::ResponseCompleted(_)) {
+        if matches!(
+            event,
+            xai_grok_sampler::ResponsesStreamItem::Event(
+                rs::ResponseStreamEvent::ResponseCompleted(_)
+            )
+        ) {
             completed = true;
         }
     }
@@ -1249,7 +1278,12 @@ async fn test_doom_loop_check_disabled_sends_no_header_and_drops_check_frames() 
     let mut completed = false;
     while let Some(event_result) = stream.next().await {
         let event = event_result.expect("check frames must be dropped, not fail the stream");
-        if matches!(event, rs::ResponseStreamEvent::ResponseCompleted(_)) {
+        if matches!(
+            event,
+            xai_grok_sampler::ResponsesStreamItem::Event(
+                rs::ResponseStreamEvent::ResponseCompleted(_)
+            )
+        ) {
             completed = true;
         }
     }
@@ -1320,6 +1354,11 @@ async fn test_responses_api_multi_turn_with_tool_calls() {
     let mut completed = false;
     while let Some(event_result) = stream.next().await {
         let event = event_result.unwrap();
+        // Heartbeat frames (keepalive / forward-compat skips) carry no
+        // model output — skip them in raw-frame assertions.
+        let xai_grok_sampler::ResponsesStreamItem::Event(event) = event else {
+            continue;
+        };
         use xai_grok_shell::sampling::rs::ResponseStreamEvent;
         if let ResponseStreamEvent::ResponseCompleted(_) = event {
             completed = true;

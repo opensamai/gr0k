@@ -255,6 +255,13 @@ fn build_unpinned(
         login_label,
         has_auth_provider_command,
     );
+    // Always advertise Kimi Code as an optional interactive method so the
+    // TUI/CLI can select it without replacing the primary xAI login.
+    methods.push(kimi_code_auth_method());
+    // Same for the OpenAI Codex (ChatGPT) subscription OAuth login.
+    methods.push(openai_codex_auth_method());
+    // Same for the Anthropic Claude (Pro/Max) subscription OAuth login.
+    methods.push(anthropic_claude_auth_method());
 
     BuiltAuthMethods {
         methods,
@@ -291,6 +298,12 @@ pub enum AuthMethodKind {
     CachedToken,
     GrokCom,
     Oidc,
+    /// Kimi Code subscription device OAuth (third-party; not xAI session).
+    KimiCode,
+    /// OpenAI Codex subscription ChatGPT OAuth (third-party; not xAI session).
+    OpenAiCodex,
+    /// Anthropic Claude subscription OAuth (third-party; not xAI session).
+    AnthropicClaude,
     Unknown,
 }
 
@@ -301,6 +314,9 @@ impl AuthMethodKind {
             CACHED_TOKEN_AUTH_METHOD_ID => Self::CachedToken,
             GROK_COM_METHOD_ID => Self::GrokCom,
             OIDC_METHOD_ID => Self::Oidc,
+            KIMI_CODE_METHOD_ID => Self::KimiCode,
+            OPENAI_CODEX_METHOD_ID => Self::OpenAiCodex,
+            ANTHROPIC_CLAUDE_METHOD_ID => Self::AnthropicClaude,
             _ => Self::Unknown,
         }
     }
@@ -311,13 +327,22 @@ impl AuthMethodKind {
     }
 
     /// `true` for session-based methods (cached_token, grok.com, oidc).
+    /// Kimi Code / OpenAI Codex are intentionally excluded — they must not
+    /// unlock xAI OAuth-only catalog entries or drive xAI refresh.
     pub fn is_session_based(self) -> bool {
         matches!(self, Self::CachedToken | Self::GrokCom | Self::Oidc)
     }
 
     /// Requires user interaction (browser, OIDC redirect, or external auth command).
     pub fn needs_interactive_login(self) -> bool {
-        matches!(self, Self::GrokCom | Self::Oidc)
+        matches!(
+            self,
+            Self::GrokCom
+                | Self::Oidc
+                | Self::KimiCode
+                | Self::OpenAiCodex
+                | Self::AnthropicClaude
+        )
     }
 
     pub fn auth_error_message(self) -> &'static str {
@@ -479,6 +504,51 @@ pub fn oidc_auth_method(issuer: &str, label: Option<&str>) -> acp::AuthMethod {
     )
 }
 
+/// ACP method id for Kimi Code subscription device OAuth.
+pub const KIMI_CODE_METHOD_ID: &str = "kimi-code";
+
+pub fn kimi_code_auth_method() -> acp::AuthMethod {
+    acp::AuthMethod::Agent(
+        acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(KIMI_CODE_METHOD_ID),
+            "Kimi Code".to_string(),
+        )
+        .description(Some(
+            "Sign in with a Kimi Code subscription (device OAuth)".to_string(),
+        )),
+    )
+}
+
+/// ACP method id for the OpenAI Codex (ChatGPT) subscription OAuth login.
+pub const OPENAI_CODEX_METHOD_ID: &str = "openai-codex";
+
+pub fn openai_codex_auth_method() -> acp::AuthMethod {
+    acp::AuthMethod::Agent(
+        acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(OPENAI_CODEX_METHOD_ID),
+            "OpenAI Codex".to_string(),
+        )
+        .description(Some(
+            "Sign in with a ChatGPT Plus/Pro subscription (browser or device code)".to_string(),
+        )),
+    )
+}
+
+/// ACP method id for the Anthropic Claude (Pro/Max) subscription OAuth login.
+pub const ANTHROPIC_CLAUDE_METHOD_ID: &str = "anthropic-claude";
+
+pub fn anthropic_claude_auth_method() -> acp::AuthMethod {
+    acp::AuthMethod::Agent(
+        acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(ANTHROPIC_CLAUDE_METHOD_ID),
+            "Anthropic Claude".to_string(),
+        )
+        .description(Some(
+            "Sign in with a Claude Pro/Max subscription (browser OAuth)".to_string(),
+        )),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,7 +622,7 @@ mod tests {
         )));
     }
 
-    use xai_grok_test_support::EnvGuard;
+    use xai_grok_test_support::{EnvGuard, unset_all_byok_platform_api_key_envs};
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -681,17 +751,29 @@ mod tests {
         );
     }
 
-    /// Brand-new user (no API key, no cached token): only `grok.com` is
-    /// advertised, and the pager will (correctly) show the login screen.
-    /// `default_auth_method_id` is None so the pager falls back to the
-    /// advertised login method.
+    /// Brand-new user (no API key, no cached token): `grok.com` leads so the
+    /// pager shows the login screen with the primary xAI method, with
+    /// Kimi Code / OpenAI Codex OAuth always advertised as alternative
+    /// interactive methods. `default_auth_method_id` is None so the pager
+    /// falls back to the advertised login method.
     #[test]
-    fn fresh_user_only_advertises_grok_com_and_requires_login() {
+    fn fresh_user_requires_login_grok_com_first_kimi_code_advertised() {
         let built = build_auth_methods(default_inputs());
 
         assert_eq!(first_kind(&built.methods), Some(AuthMethodKind::GrokCom));
         assert!(built.default_auth_method_id.is_none());
-        assert_eq!(built.methods.len(), 1);
+        assert_eq!(
+            built
+                .methods
+                .iter()
+                .map(|m| AuthMethodKind::from_id(m.id()))
+                .collect::<Vec<_>>(),
+            [
+                AuthMethodKind::GrokCom,
+                AuthMethodKind::KimiCode,
+                AuthMethodKind::OpenAiCodex
+            ],
+        );
     }
 
     /// Enterprise OIDC replaces `grok.com` (mutually exclusive). xai.api_key,
@@ -770,6 +852,22 @@ mod tests {
         // Make sure no global key is masking the per-model path we're trying
         // to exercise. Held until end-of-scope so we restore on panic too.
         let _global = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        // Also unset every BYOK platform API-key env var (ANTHROPIC_API_KEY,
+        // OPENAI_API_KEY, MOONSHOT_API_KEY, …): `resolve_model_list` injects
+        // the built-in platform catalog, whose entries carry `env_key` for
+        // the platform's API-key name. A developer shell with one of these
+        // set makes those catalog entries `has_own_credentials() == true`,
+        // leaking into `should_advertise_xai_api_key` and masking the
+        // per-model enterprise `env_key` path this test exercises.
+        let _byok = unset_all_byok_platform_api_key_envs();
+        // Redirect auth.json to an empty file so `apply_platform_credentials`
+        // can't stamp OAuth bearer tokens (kimi/codex) from the developer's
+        // real ~/.grok/auth.json onto `kimi-code/*` / `openai-codex/*` entries
+        // — those would also flip `has_own_credentials` and advertise
+        // `xai.api_key`, masking the "no external key" branch below.
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("no-auth.json");
+        let _auth_path = EnvGuard::set("GROK_AUTH_PATH", auth_path.to_str().unwrap());
 
         let dm = crate::models::default_model();
         let toml: toml::Value = toml::from_str(&format!(

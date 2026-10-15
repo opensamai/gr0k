@@ -1,13 +1,33 @@
-use std::fs::File;
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use super::model::{API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth, lookup_auth};
+use fs2::FileExt;
+
+use super::model::{
+    ANTHROPIC_CLAUDE_OAUTH_SCOPE, API_KEY_SCOPE, AuthMode, AuthStore, GrokAuth,
+    KIMI_CODE_OAUTH_SCOPE, OPENAI_CODEX_OAUTH_SCOPE, lookup_auth, platform_api_key_scope,
+};
 
 /// RAII guard for an exclusive advisory lock on `auth.json.lock`.
 /// The lock is released when the inner `File` is dropped (closing the FD).
 pub(crate) struct AuthFileLock {
     pub(super) _file: File,
+}
+
+#[cfg(unix)]
+fn file_refers_to_path(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(fd_meta), Ok(path_meta)) = (file.metadata(), std::fs::metadata(path)) else {
+        return false;
+    };
+    fd_meta.ino() == path_meta.ino() && fd_meta.dev() == path_meta.dev()
+}
+
+#[cfg(not(unix))]
+fn file_refers_to_path(_file: &File, _path: &Path) -> bool {
+    true
 }
 
 impl AuthFileLock {
@@ -29,21 +49,33 @@ impl AuthFileLock {
     /// token and trip token-family revocation.
     ///
     /// Non-Unix has no inode concept, so this conservatively returns `true`.
-    #[cfg(unix)]
     pub(crate) fn still_live(&self, auth_json_path: &Path) -> bool {
-        use std::os::unix::fs::MetadataExt;
         let lock_path = auth_json_path.with_file_name("auth.json.lock");
-        let (Ok(fd_meta), Ok(path_meta)) = (self._file.metadata(), std::fs::metadata(&lock_path))
-        else {
-            // Lock file gone or unreadable → we no longer hold the live lock.
-            return false;
-        };
-        fd_meta.ino() == path_meta.ino() && fd_meta.dev() == path_meta.dev()
+        file_refers_to_path(&self._file, &lock_path)
     }
+}
 
-    #[cfg(not(unix))]
-    pub(crate) fn still_live(&self, _auth_json_path: &Path) -> bool {
-        true
+/// Resolve the path to the user's `auth.json`.
+///
+/// Honors `GROK_AUTH_PATH` so tests can point at a scratch file instead of a
+/// developer's real `~/.grok/auth.json`. Falls back to `$GROK_HOME/auth.json`.
+pub fn auth_json_path() -> PathBuf {
+    std::env::var("GROK_AUTH_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| xai_grok_config::grok_home().join("auth.json"))
+}
+
+/// Resolve the auth.json path for a storage helper that still takes `grok_home`.
+///
+/// When `GROK_AUTH_PATH` is set, use that exact path (including a non-default
+/// basename such as `scratch.json`). Otherwise fall back to
+/// `grok_home.join("auth.json")` so hermetic tests that pass a tempdir keep
+/// working without setting the env var.
+fn resolve_auth_json_path(grok_home: &Path) -> PathBuf {
+    if std::env::var_os("GROK_AUTH_PATH").is_some() {
+        auth_json_path()
+    } else {
+        grok_home.join("auth.json")
     }
 }
 
@@ -354,7 +386,7 @@ fn restore_prior_bytes(auth_file: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Falls back to the legacy `https://accounts.x.ai/sign-in` scope key
 /// when the requested scope is not found (devbox auth.json migration).
 pub fn read_token_by_scope(grok_home: &Path, scope: &str) -> anyhow::Result<String> {
-    let path = grok_home.join("auth.json");
+    let path = resolve_auth_json_path(grok_home);
     let store =
         read_auth_json(&path).map_err(|_| anyhow::anyhow!("Not logged in. Run `grok login`."))?;
     lookup_auth(&store, scope).map(|a| a.key).ok_or_else(|| {
@@ -364,7 +396,7 @@ pub fn read_token_by_scope(grok_home: &Path, scope: &str) -> anyhow::Result<Stri
 
 /// Read the API key from the `xai::api_key` scope in auth.json.
 pub fn read_api_key(grok_home: &Path) -> Option<String> {
-    let path = grok_home.join("auth.json");
+    let path = resolve_auth_json_path(grok_home);
     let map = read_auth_json(&path).ok()?;
     map.get(API_KEY_SCOPE).map(|a| a.key.clone())
 }
@@ -373,32 +405,677 @@ pub fn read_api_key(grok_home: &Path) -> Option<String> {
 ///
 /// Uses the corrupt-recovery reader so a malformed auth.json (e.g. from a
 /// previous crash) can be healed when the user sets an API key.
+///
+/// Serializes through `auth.json.lock` so a concurrent OAuth/platform writer
+/// cannot be clobbered by a stale whole-map RMW.
 pub fn store_api_key(grok_home: &Path, api_key: &str) -> std::io::Result<()> {
-    let path = grok_home.join("auth.json");
-    let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
-    map.insert(
-        API_KEY_SCOPE.to_owned(),
-        GrokAuth {
-            key: api_key.to_owned(),
-            auth_mode: AuthMode::ApiKey,
-            ..Default::default()
-        },
-    );
-    write_auth_json(&path, &map)
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+        map.insert(
+            API_KEY_SCOPE.to_owned(),
+            GrokAuth {
+                key: api_key.to_owned(),
+                auth_mode: AuthMode::ApiKey,
+                ..Default::default()
+            },
+        );
+        write_auth_json(&path, &map)
+    })
 }
 
 /// Remove the `xai::api_key` scope from auth.json.
 pub fn clear_api_key(grok_home: &Path) -> std::io::Result<()> {
-    let path = grok_home.join("auth.json");
-    if let Ok(mut map) = read_auth_json(&path) {
-        map.remove(API_KEY_SCOPE);
-        if map.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else {
-            write_auth_json(&path, &map)?;
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || clear_scope_from_auth_json(&path, API_KEY_SCOPE))
+}
+
+/// Remove one scope under lock. Missing file is success; other read/write
+/// errors propagate (unlike the old `if let Ok` swallow).
+fn clear_scope_from_auth_json(path: &Path, scope: &str) -> std::io::Result<()> {
+    let mut map = match read_auth_json(path) {
+        Ok(map) => map,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    map.remove(scope);
+    if map.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        write_auth_json(path, &map)
+    }
+}
+
+/// Read the Kimi Code OAuth credential from `auth.json` (scope
+/// [`KIMI_CODE_OAUTH_SCOPE`]).
+pub fn read_kimi_code_auth(grok_home: &Path) -> Option<GrokAuth> {
+    let path = resolve_auth_json_path(grok_home);
+    let map = read_auth_json(&path).ok()?;
+    let auth = map.get(KIMI_CODE_OAUTH_SCOPE)?.clone();
+    (auth.auth_mode == AuthMode::KimiCode).then_some(auth)
+}
+
+/// Persist a Kimi Code OAuth credential under [`KIMI_CODE_OAUTH_SCOPE`].
+/// Merges with existing scopes so xAI / OpenAI Codex login is preserved.
+///
+/// Serializes through `auth.json.lock` (same as Codex) so a concurrent
+/// whole-map RMW cannot drop sibling scopes.
+pub fn store_kimi_code_auth(grok_home: &Path, auth: &GrokAuth) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+        let mut stored = auth.clone();
+        stored.auth_mode = AuthMode::KimiCode;
+        map.insert(KIMI_CODE_OAUTH_SCOPE.to_owned(), stored);
+        write_auth_json(&path, &map)
+    })
+}
+
+/// Like [`store_kimi_code_auth`], but if a sibling already rotated past
+/// `spent_refresh`, adopt their on-disk entry instead of overwriting.
+///
+/// The refresh path already holds `auth.json.lock` across the IdP call. Reuse
+/// that guard rather than opening a second flock, which is not re-entrant for
+/// an independently opened file descriptor on all supported systems.
+pub(crate) fn store_kimi_code_auth_after_refresh_locked(
+    grok_home: &Path,
+    candidate: &GrokAuth,
+    spent_refresh: &str,
+    file_lock: &AuthFileLock,
+) -> std::io::Result<GrokAuth> {
+    let path = resolve_auth_json_path(grok_home);
+    ensure_live_auth_file_lock(file_lock, &path)?;
+    let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+    if let Some(existing) = map.get(KIMI_CODE_OAUTH_SCOPE).cloned()
+        && existing.auth_mode == AuthMode::KimiCode
+        && !super::model::is_expired(&existing)
+    {
+        let existing_rt = existing.refresh_token.as_deref().unwrap_or("");
+        if existing_rt != spent_refresh {
+            return Ok(existing);
+        }
+        if existing.key == candidate.key {
+            return Ok(existing);
         }
     }
+    let mut stored = candidate.clone();
+    stored.auth_mode = AuthMode::KimiCode;
+    map.insert(KIMI_CODE_OAUTH_SCOPE.to_owned(), stored.clone());
+    write_auth_json(&path, &map)?;
+    Ok(stored)
+}
+
+/// Remove the Kimi Code OAuth scope from auth.json.
+pub fn clear_kimi_code_auth(grok_home: &Path) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        clear_scope_from_auth_json(&path, KIMI_CODE_OAUTH_SCOPE)
+    })
+}
+
+/// Read the OpenAI Codex (ChatGPT) OAuth credential, if present and correctly scoped.
+pub fn read_openai_codex_auth(grok_home: &Path) -> Option<GrokAuth> {
+    let path = resolve_auth_json_path(grok_home);
+    let map = read_auth_json(&path).ok()?;
+    let auth = map.get(OPENAI_CODEX_OAUTH_SCOPE)?.clone();
+    (auth.auth_mode == AuthMode::OpenAiCodex).then_some(auth)
+}
+
+/// Persist an OpenAI Codex OAuth credential under [`OPENAI_CODEX_OAUTH_SCOPE`].
+/// Merges with existing scopes so xAI login is preserved.
+///
+/// Serializes through `auth.json.lock` and re-reads under the lock so a
+/// concurrent xAI/Kimi writer cannot be clobbered by a stale whole-map RMW.
+pub fn store_openai_codex_auth(grok_home: &Path, auth: &GrokAuth) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+        let mut stored = auth.clone();
+        stored.auth_mode = AuthMode::OpenAiCodex;
+        map.insert(OPENAI_CODEX_OAUTH_SCOPE.to_owned(), stored);
+        write_auth_json(&path, &map)
+    })
+}
+
+/// Like [`store_openai_codex_auth`], but if a sibling already rotated past
+/// `spent_refresh` (their RT no longer matches the one we just spent), adopt
+/// their on-disk entry instead of overwriting. Returns the credential that is
+/// on disk after the call.
+///
+/// Important: a still-valid access token that still uses `spent_refresh` must
+/// **not** block us — force-refresh after a 401 mints a new access token under
+/// the same RT, and preferring the old access would re-send the rejected
+/// bearer.
+pub(crate) fn store_openai_codex_auth_after_refresh_locked(
+    grok_home: &Path,
+    candidate: &GrokAuth,
+    spent_refresh: &str,
+    file_lock: &AuthFileLock,
+) -> std::io::Result<GrokAuth> {
+    let path = resolve_auth_json_path(grok_home);
+    ensure_live_auth_file_lock(file_lock, &path)?;
+    let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+    if let Some(existing) = map.get(OPENAI_CODEX_OAUTH_SCOPE).cloned()
+        && existing.auth_mode == AuthMode::OpenAiCodex
+        && !super::model::is_expired(&existing)
+    {
+        let existing_rt = existing.refresh_token.as_deref().unwrap_or("");
+        // Sibling already rotated past the RT we spent — prefer their write
+        // so we do not clobber a newer family or double-spend.
+        if existing_rt != spent_refresh {
+            return Ok(existing);
+        }
+        // Same RT, same access: idempotent no-op.
+        if existing.key == candidate.key {
+            return Ok(existing);
+        }
+        // Same RT, different access: we just minted a replacement (e.g.
+        // force-refresh after 401) — fall through and persist candidate.
+    }
+    let mut stored = candidate.clone();
+    stored.auth_mode = AuthMode::OpenAiCodex;
+    map.insert(OPENAI_CODEX_OAUTH_SCOPE.to_owned(), stored.clone());
+    write_auth_json(&path, &map)?;
+    Ok(stored)
+}
+
+/// Remove the OpenAI Codex OAuth scope from auth.json.
+pub fn clear_openai_codex_auth(grok_home: &Path) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        clear_scope_from_auth_json(&path, OPENAI_CODEX_OAUTH_SCOPE)
+    })
+}
+
+/// Read the Anthropic Claude (Pro/Max) OAuth credential, if present and scoped.
+pub fn read_anthropic_claude_auth(grok_home: &Path) -> Option<GrokAuth> {
+    let path = resolve_auth_json_path(grok_home);
+    let map = read_auth_json(&path).ok()?;
+    let auth = map.get(ANTHROPIC_CLAUDE_OAUTH_SCOPE)?.clone();
+    (auth.auth_mode == AuthMode::AnthropicClaude).then_some(auth)
+}
+
+/// Persist an Anthropic Claude OAuth credential under
+/// [`ANTHROPIC_CLAUDE_OAUTH_SCOPE`]. Merges with existing scopes so xAI / Kimi /
+/// Codex sessions are preserved; serialized through `auth.json.lock`.
+pub fn store_anthropic_claude_auth(grok_home: &Path, auth: &GrokAuth) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+        let mut stored = auth.clone();
+        stored.auth_mode = AuthMode::AnthropicClaude;
+        map.insert(ANTHROPIC_CLAUDE_OAUTH_SCOPE.to_owned(), stored);
+        write_auth_json(&path, &map)
+    })
+}
+
+/// Remove the Anthropic Claude OAuth scope from auth.json.
+pub fn clear_anthropic_claude_auth(grok_home: &Path) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        clear_scope_from_auth_json(&path, ANTHROPIC_CLAUDE_OAUTH_SCOPE)
+    })
+}
+
+fn ensure_live_auth_file_lock(
+    file_lock: &AuthFileLock,
+    auth_json_path: &Path,
+) -> std::io::Result<()> {
+    if file_lock.still_live(auth_json_path) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "auth.json.lock guard no longer owns the live lock file",
+        ))
+    }
+}
+
+/// Hold an exclusive flock on `auth.json.lock` for a short disk RMW.
+///
+/// Blocking is intentional: these writers only touch disk (no network under
+/// the lock). Writes `PID:TS` holder info so the AuthManager stale-lock path
+/// can still identify the holder. Failure to open or acquire the lock aborts
+/// the write: proceeding unlocked can lose a sibling process's auth scope.
+fn with_auth_json_scope_lock<R>(
+    auth_json_path: &Path,
+    f: impl FnOnce() -> std::io::Result<R>,
+) -> std::io::Result<R> {
+    with_auth_json_scope_lock_using(auth_json_path, |file| file.lock_exclusive(), f)
+}
+
+fn with_auth_json_scope_lock_using<R>(
+    auth_json_path: &Path,
+    acquire_lock: impl FnOnce(&File) -> std::io::Result<()>,
+    f: impl FnOnce() -> std::io::Result<R>,
+) -> std::io::Result<R> {
+    let lock_path = auth_json_path.with_file_name("auth.json.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "could not open auth scope lock {}: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+    acquire_lock(&file).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "could not acquire auth scope lock {}: {error}",
+                lock_path.display()
+            ),
+        )
+    })?;
+    if !file_refers_to_path(&file, &lock_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "acquired auth scope lock belongs to a replaced lock-file inode",
+        ));
+    }
+    if let Err(error) = write_scope_lock_holder_info(&mut file) {
+        tracing::warn!(
+            error = %error,
+            "auth: failed to write auth.json.lock holder info"
+        );
+    }
+    let out = f();
+    drop(file); // unlock before returning the closure result
+    out
+}
+
+fn write_scope_lock_holder_info(file: &mut File) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    file.set_len(0)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    write!(file, "{pid}:{ts}")?;
+    file.sync_all()?;
     Ok(())
+}
+
+/// Read a third-party platform API key from `auth.json` (`platform/<id>`).
+///
+/// Set by the TUI `/providers` flow. Never log the returned value.
+pub fn read_platform_api_key(grok_home: &Path, platform: &str) -> Option<String> {
+    let path = resolve_auth_json_path(grok_home);
+    let map = read_auth_json(&path).ok()?;
+    let auth = map.get(&platform_api_key_scope(platform))?;
+    let key = auth.key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_owned())
+    }
+}
+
+/// Read a self-hosted BYOK platform's per-account gateway root (Nexus).
+///
+/// Returns the bare root persisted by `/providers <platform> <key> [base_url]`,
+/// or `None` when the login used the env/compiled default.
+pub fn read_platform_base_url(grok_home: &Path, platform: &str) -> Option<String> {
+    let path = resolve_auth_json_path(grok_home);
+    let map = read_auth_json(&path).ok()?;
+    let auth = map.get(&platform_api_key_scope(platform))?;
+    let base = auth.platform_base_url.as_deref()?.trim();
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_owned())
+    }
+}
+
+/// Persist a third-party platform API key under `platform/<id>`.
+///
+/// Empty/`clear` removes the scope. Merges with existing scopes so xAI / Kimi
+/// OAuth sessions are preserved. `base_url` (Nexus self-hosted gateway root)
+/// is stored alongside the key; `None` leaves it unset (env/compiled default).
+///
+/// Serializes through `auth.json.lock` (same as Kimi/Codex) so a concurrent
+/// whole-map RMW cannot drop sibling scopes.
+pub fn store_platform_api_key(
+    grok_home: &Path,
+    platform: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> std::io::Result<()> {
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return clear_platform_api_key(grok_home, platform);
+    }
+    let base = base_url
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_owned);
+    let path = resolve_auth_json_path(grok_home);
+    with_auth_json_scope_lock(&path, || {
+        let mut map = read_auth_json_or_empty_recovering_corrupt(&path)?;
+        map.insert(
+            platform_api_key_scope(platform),
+            GrokAuth {
+                key: trimmed.to_owned(),
+                auth_mode: AuthMode::ApiKey,
+                platform_base_url: base.clone(),
+                ..Default::default()
+            },
+        );
+        write_auth_json(&path, &map)
+    })
+}
+
+/// Remove a platform API key scope from auth.json.
+pub fn clear_platform_api_key(grok_home: &Path, platform: &str) -> std::io::Result<()> {
+    let path = resolve_auth_json_path(grok_home);
+    let scope = platform_api_key_scope(platform);
+    with_auth_json_scope_lock(&path, || clear_scope_from_auth_json(&path, &scope))
+}
+
+#[cfg(test)]
+mod scope_lock_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::cell::Cell;
+    use xai_grok_test_support::EnvGuard;
+
+    #[test]
+    fn scope_write_does_not_run_when_lock_file_cannot_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        std::fs::create_dir(dir.path().join("auth.json.lock")).unwrap();
+        let ran = Cell::new(false);
+
+        let error = with_auth_json_scope_lock(&auth_path, || {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(!ran.get(), "scope mutation must not run without a lock");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::IsADirectory | std::io::ErrorKind::PermissionDenied
+            ),
+            "unexpected open error: {error}"
+        );
+    }
+
+    #[test]
+    fn scope_write_does_not_run_when_flock_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let ran = Cell::new(false);
+
+        let error = with_auth_json_scope_lock_using(
+            &auth_path,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            || {
+                ran.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(!ran.get(), "scope mutation must not run without a lock");
+        assert!(
+            !auth_path.exists(),
+            "failed locking must not write auth.json"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_write_rejects_lock_inode_replaced_after_acquire() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let lock_path = dir.path().join("auth.json.lock");
+        let ran = Cell::new(false);
+
+        let error = with_auth_json_scope_lock_using(
+            &auth_path,
+            |file| {
+                file.lock_exclusive()?;
+                std::fs::remove_file(&lock_path)?;
+                File::create(&lock_path)?;
+                Ok(())
+            },
+            || {
+                ran.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!ran.get(), "replaced-inode lock must not guard a write");
+        assert!(!auth_path.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn first_scope_write_creates_missing_auth_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("nested").join("grok-home");
+        let _guard = EnvGuard::unset("GROK_AUTH_PATH");
+
+        store_api_key(&home, "first-key").unwrap();
+
+        assert_eq!(read_api_key(&home).as_deref(), Some("first-key"));
+        assert!(home.join("auth.json.lock").is_file());
+    }
+
+    #[test]
+    #[serial]
+    fn refresh_persist_reuses_existing_live_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::unset("GROK_AUTH_PATH");
+        let auth_path = dir.path().join("auth.json");
+        let lock_path = dir.path().join("auth.json.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        file.lock_exclusive().unwrap();
+        let file_lock = AuthFileLock { _file: file };
+        let candidate = GrokAuth {
+            key: "fresh-kimi-access".to_string(),
+            refresh_token: Some("fresh-kimi-refresh".to_string()),
+            auth_mode: AuthMode::KimiCode,
+            ..Default::default()
+        };
+
+        let stored = store_kimi_code_auth_after_refresh_locked(
+            dir.path(),
+            &candidate,
+            "spent-refresh",
+            &file_lock,
+        )
+        .unwrap();
+
+        assert_eq!(stored.key, "fresh-kimi-access");
+        assert_eq!(
+            read_kimi_code_auth(dir.path()).map(|auth| auth.key),
+            Some("fresh-kimi-access".to_string())
+        );
+        assert!(auth_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn refresh_persist_rejects_guard_for_replaced_lock_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::unset("GROK_AUTH_PATH");
+        let auth_path = dir.path().join("auth.json");
+        let lock_path = dir.path().join("auth.json.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        file.lock_exclusive().unwrap();
+        let file_lock = AuthFileLock { _file: file };
+        std::fs::remove_file(&lock_path).unwrap();
+        File::create(&lock_path).unwrap();
+        let candidate = GrokAuth {
+            key: "must-not-write".to_string(),
+            auth_mode: AuthMode::KimiCode,
+            ..Default::default()
+        };
+
+        let error = store_kimi_code_auth_after_refresh_locked(
+            dir.path(),
+            &candidate,
+            "spent-refresh",
+            &file_lock,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!auth_path.exists(), "stale guard must not write auth.json");
+    }
+}
+
+#[cfg(test)]
+mod platform_api_key_tests {
+    use super::*;
+    use serial_test::serial;
+
+    // `store_platform_api_key` resolves its path via `resolve_auth_json_path`,
+    // which honors the process-global `GROK_AUTH_PATH` env var over the passed
+    // `grok_home`. Other tests in this file set `GROK_AUTH_PATH` (under
+    // `#[serial]`); without serialization this test can run concurrently with
+    // one of those and have its writes redirected to the sibling's scratch
+    // file, flaking the round-trip assertions. Run serially with the
+    // `GROK_AUTH_PATH`-setting tests.
+    #[test]
+    #[serial]
+    fn platform_api_key_roundtrips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        assert!(read_platform_api_key(home, "zai").is_none());
+        store_platform_api_key(home, "zai", " sk-zai-test ", None).unwrap();
+        assert_eq!(
+            read_platform_api_key(home, "zai").as_deref(),
+            Some("sk-zai-test")
+        );
+        // Sibling scopes preserved.
+        store_api_key(home, "xai-key").unwrap();
+        assert_eq!(read_api_key(home).as_deref(), Some("xai-key"));
+        assert_eq!(
+            read_platform_api_key(home, "zai").as_deref(),
+            Some("sk-zai-test")
+        );
+        store_platform_api_key(home, "zai", "", None).unwrap();
+        assert!(read_platform_api_key(home, "zai").is_none());
+        assert_eq!(read_api_key(home).as_deref(), Some("xai-key"));
+    }
+
+    #[test]
+    #[serial]
+    fn platform_base_url_roundtrips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        assert!(read_platform_base_url(home, "nexus").is_none());
+        // Whitespace-only base_url is treated as unset.
+        store_platform_api_key(home, "nexus", "sk-nexus", Some("   ")).unwrap();
+        assert!(read_platform_base_url(home, "nexus").is_none());
+        // A real root persists and trims.
+        store_platform_api_key(home, "nexus", "sk-nexus", Some(" https://gw.example ")).unwrap();
+        assert_eq!(
+            read_platform_base_url(home, "nexus").as_deref(),
+            Some("https://gw.example")
+        );
+        // Clearing the key clears the whole scope (base included).
+        store_platform_api_key(home, "nexus", "", None).unwrap();
+        assert!(read_platform_base_url(home, "nexus").is_none());
+        assert!(read_platform_api_key(home, "nexus").is_none());
+    }
+}
+
+#[cfg(test)]
+mod grok_auth_path_tests {
+    use super::*;
+    use crate::auth::model::{AuthMode, GrokAuth};
+    use serial_test::serial;
+    use xai_grok_test_support::EnvGuard;
+
+    /// Login/store helpers must honor `GROK_AUTH_PATH` pointing at a non-default
+    /// basename (e.g. `scratch.json`), matching the refresh path that already
+    /// calls [`auth_json_path`].
+    #[test]
+    #[serial]
+    fn openai_codex_store_roundtrips_through_grok_auth_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_file = dir.path().join("scratch.json");
+        let _guard = EnvGuard::set("GROK_AUTH_PATH", auth_file.to_str().unwrap());
+
+        let path = auth_json_path();
+        assert_eq!(path, auth_file);
+        let home = path.parent().unwrap();
+
+        let auth = GrokAuth {
+            key: "codex-access-token".to_owned(),
+            refresh_token: Some("codex-refresh".to_owned()),
+            auth_mode: AuthMode::OpenAiCodex,
+            email: Some("user@example.com".to_owned()),
+            ..Default::default()
+        };
+        store_openai_codex_auth(home, &auth).unwrap();
+
+        let loaded = read_openai_codex_auth(home).expect("token should be on GROK_AUTH_PATH");
+        assert_eq!(loaded.key, "codex-access-token");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("codex-refresh"));
+        assert!(auth_file.is_file(), "credential written to GROK_AUTH_PATH");
+        // Default ~/.grok/auth.json must not have been touched by this write path.
+        // (We cannot assert absence of the real home file; only that our scratch exists.)
+    }
+
+    #[test]
+    #[serial]
+    fn kimi_store_roundtrips_through_grok_auth_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_file = dir.path().join("isolated-auth.json");
+        let _guard = EnvGuard::set("GROK_AUTH_PATH", auth_file.to_str().unwrap());
+
+        let path = auth_json_path();
+        let home = path.parent().unwrap();
+
+        let auth = GrokAuth {
+            key: "kimi-access".to_owned(),
+            refresh_token: Some("kimi-refresh".to_owned()),
+            auth_mode: AuthMode::KimiCode,
+            ..Default::default()
+        };
+        store_kimi_code_auth(home, &auth).unwrap();
+        let loaded = read_kimi_code_auth(home).expect("kimi token on GROK_AUTH_PATH");
+        assert_eq!(loaded.key, "kimi-access");
+        clear_kimi_code_auth(home).unwrap();
+        assert!(read_kimi_code_auth(home).is_none());
+    }
 }
 
 #[cfg(test)]

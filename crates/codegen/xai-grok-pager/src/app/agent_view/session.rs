@@ -203,6 +203,10 @@ impl AgentView {
             privacy_banner: Default::default(),
             hit_upgrade_cta: Default::default(),
             hit_voice_stop_button: Default::default(),
+            #[cfg(feature = "codex-live")]
+            hit_live_mute_button: Default::default(),
+            #[cfg(feature = "codex-live")]
+            hit_live_stop_button: Default::default(),
             hit_scrollbar: Default::default(),
             scrollbar_dragging: false,
             dropdown_items_area: None,
@@ -1293,6 +1297,7 @@ mod resolve_turn_activity_tests {
                 resumed_from: None,
                 capability_mode: None,
                 workflow_run_id: None,
+                budget: None,
                 context_normalized: false,
                 parent_prompt_id: None,
                 started_at: now,
@@ -1300,6 +1305,8 @@ mod resolve_turn_activity_tests {
                 finished: false,
                 status: None,
                 error: None,
+                termination_reason: None,
+                usage: None,
                 duration_ms: None,
                 tool_calls: None,
                 turns: None,

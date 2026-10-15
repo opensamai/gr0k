@@ -6,8 +6,10 @@ pub mod acp;
 pub mod actions;
 pub mod app;
 pub mod client_identity;
+pub mod codex;
 pub mod completions_cmd;
 mod config_toml_edit;
+mod scoped_models;
 pub mod diagnostics;
 pub mod diff;
 pub mod docs;
@@ -16,6 +18,7 @@ pub mod export_cmd;
 pub mod git_info;
 pub mod headless;
 pub mod hyperlink_route;
+pub mod i18n;
 pub mod inline_media_ffmpeg;
 pub mod input;
 pub mod input_log;
@@ -44,6 +47,7 @@ pub mod obf;
 pub mod plugin_cmd;
 pub mod project_picker;
 pub mod pty_wrap;
+pub mod readiness;
 pub mod scrollback;
 pub mod search;
 pub mod sessions_cmd;
@@ -67,6 +71,8 @@ pub use xai_grok_pager_render::{
     appearance, clipboard, gboom, glyphs, host, link_opener, modal_window_state, prompt_images,
     render, syntax, terminal, theme, util,
 };
+#[cfg(feature = "codex-live")]
+pub mod live;
 pub mod trace_cmd;
 pub mod tracing;
 pub mod unified_log;
@@ -76,3 +82,8 @@ pub mod worktree_cmd;
 
 #[cfg(test)]
 pub mod test_util;
+
+// Load the embedded translation bundles (`locales/*.yml`) and generate the
+// per-crate `t!` backend. English is the fallback for missing keys/locales.
+// The active locale is set at startup via `i18n::init` (see `app/event_loop`).
+rust_i18n::i18n!("locales", fallback = "en");

@@ -38,8 +38,8 @@ pub use attribution::{
 };
 pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
 pub use config::{
-    AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy, SamplerConfig,
-    SharedBearerResolver, SharedHeaderInjector,
+    AuthScheme, BearerResolution, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy,
+    SamplerConfig, SharedBearerResolver, SharedHeaderInjector,
 };
 pub use doom_loop::DoomLoopSignalCollector;
 pub use events::{SamplingChannel, SamplingErrorInfo, SamplingErrorKind, SamplingEvent};
@@ -51,4 +51,4 @@ pub use retry::{
 };
 pub use sampling_log::AuthInfo;
 pub use stream::{collect_response, stream_chat_completions, stream_messages, stream_responses};
-pub use types::RequestId;
+pub use types::{RequestId, ResponsesStreamItem};

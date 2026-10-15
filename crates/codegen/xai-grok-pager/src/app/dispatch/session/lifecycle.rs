@@ -597,9 +597,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         return vec![];
     }
     if !app.cwd_has_git_ancestor {
-        let msg: String = "Not inside a git repository. Navigate to a git repo \
-                      or run 'git init' first."
-            .into();
+        let msg: String = rust_i18n::t!("warn.not_git_repo").into_owned();
         if !app.startup_warnings.iter().any(|w| w.message == msg) {
             app.startup_warnings.push(crate::startup::StartupWarning {
                 severity: crate::startup::WarningSeverity::Warning,
@@ -750,7 +748,7 @@ pub(in crate::app::dispatch) fn refuse_chat_mode_build_agent(app: &mut AppView, 
         app.session_picker_state.selected = 0;
         app.session_picker_content_results = None;
         app.session_picker_content_loading = false;
-        let msg = crate::app::session_startup::CHAT_MODE_LOCAL_BUILD_REFUSAL.to_string();
+        let msg = rust_i18n::t!("warn.chat_active").into_owned();
         if !app.startup_warnings.iter().any(|w| w.message == msg) {
             app.startup_warnings.push(crate::startup::StartupWarning {
                 severity: crate::startup::WarningSeverity::Warning,
@@ -1023,7 +1021,7 @@ pub(in crate::app::dispatch) fn handle_session_failed(
     error: String,
 ) -> Vec<Effect> {
     tracing::error!(agent = ?agent_id, error = %error, "Session creation failed");
-    let msg = format!("Session creation failed: {error}");
+    let msg = rust_i18n::t!("warn.session_create_failed", error = error.as_str()).into_owned();
     let is_orphan = app
         .agents
         .get(&agent_id)
@@ -1094,7 +1092,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
             app.session_picker_content_results = None;
             app.session_picker_content_loading = false;
         }
-        let msg = format!("Cannot create worktree: {error}");
+        let msg = rust_i18n::t!("warn.worktree_failed", error = error.as_str()).into_owned();
         if !app.startup_warnings.iter().any(|w| w.message == msg) {
             app.startup_warnings.push(crate::startup::StartupWarning {
                 severity: crate::startup::WarningSeverity::Warning,
@@ -1120,6 +1118,31 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     }
     vec![]
 }
+const MODEL_SWITCH_CONTEXT_HINT_PERCENT: u64 = 85;
+
+/// Advisory shown after a successful switch when the existing transcript is
+/// already close to (or beyond) the target model's advertised window. The
+/// shell remains authoritative and performs its normal pre-sampling compaction
+/// check; this merely makes that otherwise invisible behavior explicit and
+/// points users to the on-demand `/compact` path.
+pub(in crate::app::dispatch) fn model_switch_context_hint(
+    used_tokens: u64,
+    target_window: Option<u64>,
+    target_name: &str,
+) -> Option<String> {
+    let target_window = target_window.filter(|window| *window > 0)?;
+    let percent = used_tokens.saturating_mul(100) / target_window;
+    if percent < MODEL_SWITCH_CONTEXT_HINT_PERCENT {
+        return None;
+    }
+    Some(format!(
+        "Current context is about {percent}% of {target_name}'s context window \
+         ({used_tokens}/{target_window} tokens). Grok Build will check whether \
+         compaction is needed before the next model call; run `/compact` first \
+         if you want to guide the summary."
+    ))
+}
+
 pub(in crate::app::dispatch) fn handle_switch_model_complete(
     app: &mut AppView,
     agent_id: AgentId,
@@ -1142,10 +1165,22 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     .unwrap_or_else(|| model_id.0.to_string());
                 let prev_model = agent.session.models.current.clone();
                 let prev_effort = agent.session.models.reasoning_effort;
+                let model_changed = prev_model.as_ref() != Some(&model_id);
+                let context_hint = model_changed
+                    .then(|| {
+                        model_switch_context_hint(
+                            agent
+                                .context_state
+                                .as_ref()
+                                .map_or(0, |context| context.used),
+                            agent.session.models.context_window_for(&model_id),
+                            &display_name,
+                        )
+                    })
+                    .flatten();
                 agent.session.models.set_current(model_id.clone(), effort);
                 let resolved_effort = agent.session.models.reasoning_effort;
-                let unchanged =
-                    prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
+                let unchanged = !model_changed && prev_effort == resolved_effort;
                 if !unchanged {
                     let msg = if let Some(eff) = resolved_effort {
                         format!("Switched to {display_name} ({eff} effort)")
@@ -1154,7 +1189,10 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.scrollback.push_block(RenderBlock::system(msg));
                 }
-                if unchanged {
+                if let Some(hint) = context_hint {
+                    agent.scrollback.push_block(RenderBlock::system(hint));
+                }
+                if unchanged || crate::acp::router::is_codex_model(&model_id) {
                     vec![]
                 } else {
                     vec![Effect::PersistPreferredModel {

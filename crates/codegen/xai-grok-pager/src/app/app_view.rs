@@ -452,7 +452,7 @@ pub enum InputOutcome {
     ArmPending {
         action: Action,
         shortcut: KeyShortcut,
-        label: Option<&'static str>,
+        label: Option<std::borrow::Cow<'static, str>>,
         ttl: Duration,
     },
     /// Something changed visually (prompt text, scroll). Redraw needed.
@@ -486,7 +486,8 @@ pub struct PendingAction {
     /// The specific key that was pressed (narrowed from the binding).
     pub shortcut: KeyShortcut,
     /// When `Some`, shortcuts bar shows "press again to {label}".
-    pub label: Option<&'static str>,
+    /// Localized at arm time (`actions.{id}.label` via `tr_or`).
+    pub label: Option<std::borrow::Cow<'static, str>>,
     /// When this pending action expires.
     pub expires_at: Instant,
 }
@@ -494,8 +495,12 @@ impl PendingAction {
     pub const TTL: Duration = Duration::from_millis(1000);
     /// Double-press timeout for idle Esc clear / rewind arms.
     pub const ESC_DOUBLE_PRESS_TTL: Duration = Duration::from_millis(800);
-    pub fn new(action: Action, shortcut: KeyShortcut, label: &'static str) -> Self {
-        Self::with_ttl(action, shortcut, Some(label), Self::TTL)
+    pub fn new(
+        action: Action,
+        shortcut: KeyShortcut,
+        label: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Self {
+        Self::with_ttl(action, shortcut, Some(label.into()), Self::TTL)
     }
     /// Like [`Self::new`] but with an explicit confirm window. Used by
     /// the dashboard-overlay stop (Ctrl+X), which mirrors the
@@ -504,7 +509,7 @@ impl PendingAction {
     pub fn with_ttl(
         action: Action,
         shortcut: KeyShortcut,
-        label: Option<&'static str>,
+        label: Option<std::borrow::Cow<'static, str>>,
         ttl: Duration,
     ) -> Self {
         Self {
@@ -1169,6 +1174,15 @@ pub struct AppView {
     /// combinations are unrepresentable; production mutates it only through the
     /// `AppView::voice_*` transition methods.
     pub voice_state: VoiceState,
+    /// Codex Live (`/live`) runtime — session lifecycle, visualizer state,
+    /// delegation broker, context channel. Only present when the `codex-live`
+    /// feature is enabled.
+    #[cfg(feature = "codex-live")]
+    pub live_runtime: crate::live::state::LiveRuntime,
+    /// The Codex Live gate (resolved at startup). When false, `/live` is a
+    /// silent no-op.
+    #[cfg(feature = "codex-live")]
+    pub live_mode_enabled: bool,
 }
 /// Reshow window elapsed? None/0 = never. Unparseable ack fails open (show).
 fn privacy_banner_reshow_elapsed(acked_at: &str, reshow_days: Option<u64>) -> bool {
@@ -1557,6 +1571,10 @@ impl AppView {
             voice_auth: None,
             voice_cmd_tx: None,
             voice_state: VoiceState::Idle,
+            #[cfg(feature = "codex-live")]
+            live_runtime: crate::live::state::LiveRuntime::default(),
+            #[cfg(feature = "codex-live")]
+            live_mode_enabled: false,
         }
     }
     /// Seed `deferred_model_switch` from CLI `-m`. The CLI effort token is
@@ -1831,6 +1849,100 @@ impl AppView {
             return;
         }
         self.voice_reset();
+    }
+
+    // ── Codex Live (`/live`) helper methods ────────────────────────────────
+    #[cfg(feature = "codex-live")]
+    /// Whether the Live session is bound to the active agent + session.
+    pub fn is_live_bound_to_active(
+        &self,
+        agent_id: crate::app::agent::AgentId,
+        session_id: &str,
+    ) -> bool {
+        match self.active_view {
+            ActiveView::Agent(active) if active == agent_id => {
+                self.agents.get(&agent_id).is_some_and(|a| {
+                    a.session
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|s| s.0.as_ref() == session_id)
+                })
+            }
+            _ => false,
+        }
+    }
+    #[cfg(feature = "codex-live")]
+    /// Whether the Live session is active (visualizer shown).
+    pub fn live_active(&self) -> bool {
+        self.live_runtime.state.is_active()
+    }
+    #[cfg(feature = "codex-live")]
+    /// Returns the Live visualizer state for the active agent, if Live is
+    /// active and bound to the currently-visible agent. Used by the render
+    /// path to replace the prompt editor with the visualizer.
+    pub fn live_visualizer_state_for_active(
+        &self,
+    ) -> Option<&crate::live::state::LiveVisualizerState> {
+        if !self.live_active() {
+            return None;
+        }
+        // Only show the visualizer on the agent that Live is bound to.
+        let (agent_id, _session_id) = match &self.live_runtime.state {
+            crate::live::state::LiveState::Active {
+                agent_id,
+                session_id,
+                ..
+            } => (*agent_id, session_id.as_str()),
+            _ => return None,
+        };
+        match self.active_view {
+            ActiveView::Agent(active) if active == agent_id => Some(&self.live_runtime.visualizer),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "codex-live")]
+    /// Whether a Live start is pending.
+    pub fn live_pending(&self) -> bool {
+        self.live_runtime.state.is_pending()
+    }
+    #[cfg(feature = "codex-live")]
+    /// Whether any Live session is in flight (active, pending, or stopping).
+    pub fn live_in_flight(&self) -> bool {
+        self.live_runtime.state.is_in_flight()
+    }
+    #[cfg(feature = "codex-live")]
+    /// Hard teardown of the Live session: send Shutdown, drop the channel,
+    /// reset state, forget delegations. Idempotent.
+    pub fn live_reset(&mut self) {
+        // OMP finalizes any transient spoken-assistant transcript when Live
+        // stops, even if no `turn.done` arrived before disconnect/teardown.
+        crate::live::handle::finish_live_assistant_transcript(self);
+        self.live_runtime.teardown();
+    }
+    #[cfg(feature = "codex-live")]
+    /// Send a best-effort command into the Live pipeline (no-op if not up).
+    /// Critical commands (`CompleteDelegation`, `Shutdown`) are queued for
+    /// reliable delivery if the channel is full.
+    pub fn live_send_cmd(&mut self, cmd: crate::live::LiveCommand) {
+        self.live_runtime.send_cmd(cmd);
+    }
+    #[cfg(feature = "codex-live")]
+    /// Toggle the Live mute state.
+    pub fn live_toggle_mute(&mut self) {
+        self.live_runtime.muted = !self.live_runtime.muted;
+        self.live_send_cmd(crate::live::LiveCommand::ToggleMute);
+    }
+    #[cfg(feature = "codex-live")]
+    /// Set the Live mute state explicitly.
+    pub fn live_set_muted(&mut self, muted: bool) {
+        self.live_runtime.muted = muted;
+        self.live_send_cmd(crate::live::LiveCommand::SetMuted(muted));
+    }
+    #[cfg(feature = "codex-live")]
+    /// Sync the Live gate into slash surfaces.
+    pub fn apply_live_mode_enabled(&mut self, enabled: bool) {
+        self.live_mode_enabled = enabled;
+        crate::live::state::set_live_enabled(enabled);
     }
     /// Esc handling shared by the agent and dashboard surfaces: while voice is
     /// active, Esc aborts it (and consumes the key) rather than falling into the
@@ -2528,7 +2640,7 @@ impl AppView {
                                 self.pending_action = Some(PendingAction::with_ttl(
                                     Action::DashboardOverlayStop,
                                     KeyShortcut::from(*key),
-                                    Some("close this session"),
+                                    Some(rust_i18n::t!("hints.close_session")),
                                     crate::views::dashboard::state::STOP_CONFIRM_WINDOW,
                                 ));
                                 return InputOutcome::Changed;
@@ -2643,6 +2755,36 @@ impl AppView {
                 }
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
                     return outcome;
+                }
+                // Codex Live keyboard: Space toggles mute, Esc/Ctrl+C stops.
+                // This runs after app-level modal/voice handling but before the
+                // ordinary agent composer can consume Space/Esc. The agent-owned
+                // overlay predicate below yields to every modal, plan/question
+                // flow, viewer, and focused overlay layered above the composer.
+                #[cfg(feature = "codex-live")]
+                if self.live_active()
+                    && let Event::Key(key) = ev
+                    && key.kind == KeyEventKind::Press
+                {
+                    // Respect every agent-level input owner before treating
+                    // these keys as Live controls.
+                    let agent_overlay_active = self
+                        .agents
+                        .get(&id)
+                        .is_some_and(|agent| agent.live_key_intercept_blocked());
+                    if !agent_overlay_active {
+                        if key.code == KeyCode::Char(' ') && key.modifiers.is_empty() {
+                            return InputOutcome::Action(Action::LiveToggleMute);
+                        }
+                        if (key.code == KeyCode::Esc && key.modifiers.is_empty())
+                            || (key.code == KeyCode::Char('c')
+                                && key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL))
+                        {
+                            return InputOutcome::Action(Action::LiveStop);
+                        }
+                    }
                 }
                 if let Event::Key(key) = ev
                     && key.kind != KeyEventKind::Release
@@ -2873,8 +3015,11 @@ impl AppView {
                         git_ref: git_ref.clone(),
                     };
                     let shortcut = KeyShortcut::from(*key);
-                    self.pending_action =
-                        Some(PendingAction::new(action, shortcut, "new in worktree"));
+                    self.pending_action = Some(PendingAction::new(
+                        action,
+                        shortcut,
+                        rust_i18n::t!("hints.new_in_worktree"),
+                    ));
                     return InputOutcome::Changed;
                 }
                 _ => unreachable!(),
@@ -2889,7 +3034,11 @@ impl AppView {
                 } else {
                     def.default_key
                 };
-                self.pending_action = Some(PendingAction::new(action, shortcut, def.label));
+                self.pending_action = Some(PendingAction::new(
+                    action,
+                    shortcut,
+                    crate::i18n::tr_or(&format!("actions.{}.label", def.id.i18n_key()), def.label),
+                ));
                 return InputOutcome::Changed;
             }
         }
@@ -2914,7 +3063,7 @@ impl AppView {
             self.pending_action = Some(PendingAction::new(
                 Action::Quit,
                 KeyShortcut::from(*key),
-                "quit",
+                crate::i18n::tr_or("actions.quit.label", "quit"),
             ));
             return InputOutcome::Changed;
         }
@@ -2956,7 +3105,11 @@ impl AppView {
             } else {
                 action
             };
-            self.pending_action = Some(PendingAction::new(action, shortcut, def.label));
+            self.pending_action = Some(PendingAction::new(
+                action,
+                shortcut,
+                crate::i18n::tr_or(&format!("actions.{}.label", def.id.i18n_key()), def.label),
+            ));
             InputOutcome::Changed
         } else {
             InputOutcome::Action(action)
@@ -2976,7 +3129,11 @@ impl AppView {
         };
         if def.requires_confirmation {
             let shortcut = KeyShortcut::from(*key);
-            self.pending_action = Some(PendingAction::new(Action::Quit, shortcut, def.label));
+            self.pending_action = Some(PendingAction::new(
+                Action::Quit,
+                shortcut,
+                crate::i18n::tr_or(&format!("actions.{}.label", def.id.i18n_key()), def.label),
+            ));
             InputOutcome::Changed
         } else {
             InputOutcome::Action(Action::Quit)
@@ -2996,8 +3153,11 @@ impl AppView {
         };
         if def.requires_confirmation {
             let shortcut = KeyShortcut::from(*key);
-            self.pending_action =
-                Some(PendingAction::new(Action::ExitSession, shortcut, def.label));
+            self.pending_action = Some(PendingAction::new(
+                Action::ExitSession,
+                shortcut,
+                crate::i18n::tr_or(&format!("actions.{}.label", def.id.i18n_key()), def.label),
+            ));
             InputOutcome::Changed
         } else {
             InputOutcome::Action(Action::ExitSession)
@@ -3251,19 +3411,22 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
         );
         let entry_count = entry_map.len();
         let non_selectable_flags: Vec<bool> = entry_map.iter().map(|e| e.is_none()).collect();
+        let picker_sc = crate::views::picker::picker_shortcuts();
+        let sf_label = source_filter.label();
+        let resume_title = rust_i18n::t!("modal.title.resume_session");
         let config = PickerConfig {
-            title: Some("Resume session"),
+            title: Some(resume_title.as_ref()),
             show_search_hint: true,
             expandable: true,
             esc_clears_query: true,
-            shortcuts: Some(crate::views::picker::picker_shortcuts()),
+            shortcuts: Some(&picker_sc),
             pending_hint: None,
             non_selectable: &non_selectable_flags,
             non_selectable_clickable: &[],
             shortcuts_area: None,
             tabs: None,
             active_tab: 0,
-            filter_label: (!ctx.chat_mode).then(|| source_filter.label()),
+            filter_label: (!ctx.chat_mode).then(|| sf_label.as_ref()),
             filter_key_hint: (!ctx.chat_mode).then_some("f"),
             filter_active: !ctx.chat_mode && source_filter.is_active(),
             header_note: None,
@@ -4168,6 +4331,21 @@ impl AppView {
                 &self.hidden_announcement_ids,
             );
         let agent_mouse_pos = self.last_mouse_pos;
+        // Compute the Live visualizer state for the active agent BEFORE the
+        // destructuring borrow below, so the closure can use it without
+        // re-borrowing `self`. Sync the `muted` and `delegation_active` fields
+        // from the runtime so the visualizer reflects honest status.
+        #[cfg(feature = "codex-live")]
+        let live_visualizer_state: Option<crate::live::state::LiveVisualizerState> = {
+            // Sync muted and delegation_active into the visualizer state.
+            self.live_runtime.visualizer.muted = self.live_runtime.muted;
+            self.live_runtime.visualizer.delegation_active =
+                !self.live_runtime.delegations.is_empty()
+                    && self.live_runtime.delegations.values().any(|d| !d.terminal);
+            self.live_visualizer_state_for_active().cloned()
+        };
+        #[cfg(not(feature = "codex-live"))]
+        let _live_visualizer_state: Option<()> = None;
         let Self {
             active_view,
             agents,
@@ -4184,6 +4362,7 @@ impl AppView {
             .filter(|p| !p.expired())
             .and_then(|p| {
                 p.label
+                    .clone()
                     .map(|label| crate::views::shortcuts_bar::PendingHint {
                         shortcut: p.shortcut,
                         label,
@@ -4556,6 +4735,8 @@ impl AppView {
                                     voice_listening,
                                     voice_interim: voice_interim.as_deref(),
                                     esc_owned_before_agent,
+                                    #[cfg(feature = "codex-live")]
+                                    live_visualizer: live_visualizer_state.as_ref(),
                                 },
                             );
                             if let Some(modal) = self.import_claude_modal.as_mut() {
@@ -5025,6 +5206,12 @@ impl AppView {
         let mut needs_redraw = false;
         needs_redraw |= self.minimal_state.transcript.is_some();
         needs_redraw |= self.poll_clipboard_focus_tip();
+        #[cfg(feature = "codex-live")]
+        if self.live_active() && self.live_runtime.visualizer.peak_decay > 0.0 {
+            let before = self.live_runtime.visualizer.peak_decay;
+            self.live_runtime.visualizer.decay_peak(0.88);
+            needs_redraw |= self.live_runtime.visualizer.peak_decay != before;
+        }
         if matches!(self.active_view, ActiveView::Welcome) {
             self.welcome_tick = self.welcome_tick.wrapping_add(1);
             if let Some(expires_at) = self.welcome_toast.as_ref().map(|(_, at)| *at) {
@@ -5374,6 +5561,10 @@ impl AppView {
             return TickDemand::Fast;
         }
         if self.voice_listening() {
+            return TickDemand::Fast;
+        }
+        #[cfg(feature = "codex-live")]
+        if self.live_active() && self.live_runtime.visualizer.peak_decay > 0.0 {
             return TickDemand::Fast;
         }
         if self.session_picker_content_loading {
@@ -5829,6 +6020,10 @@ pub(crate) mod tests {
             voice_auth: None,
             voice_cmd_tx: None,
             voice_state: VoiceState::Idle,
+            #[cfg(feature = "codex-live")]
+            live_runtime: crate::live::state::LiveRuntime::default(),
+            #[cfg(feature = "codex-live")]
+            live_mode_enabled: false,
         }
     }
     pub(crate) fn test_app_with_agent() -> AppView {
@@ -6110,6 +6305,106 @@ pub(crate) mod tests {
             !app.needs_animation(),
             "release builds must not request animation ticks just because \
              tracing_rx exists (always true after startup)"
+        );
+    }
+    #[cfg(feature = "codex-live")]
+    #[test]
+    fn live_peak_decay_arms_then_releases_animation_ticks() {
+        let mut app = test_app_with_agent();
+        let agent_id = super::super::agent::AgentId(0);
+        app.live_runtime.state = crate::live::state::LiveState::Active {
+            agent_id,
+            session_id: "test-session".to_string(),
+            generation: 1,
+            draft: crate::live::state::DraftSnapshot::default(),
+        };
+        app.live_runtime.visualizer.peak_decay = 0.8;
+
+        assert!(app.needs_animation());
+        let before = app.live_runtime.visualizer.peak_decay;
+        assert!(app.tick());
+        assert!(app.live_runtime.visualizer.peak_decay < before);
+
+        for _ in 0..128 {
+            app.tick();
+        }
+        assert_eq!(app.live_runtime.visualizer.peak_decay, 0.0);
+        assert!(
+            !app.needs_animation(),
+            "a silent Live session must not keep the 30 fps clock armed"
+        );
+    }
+    #[cfg(feature = "codex-live")]
+    #[test]
+    fn plan_approval_keeps_space_and_esc_priority_over_live_controls() {
+        let mut app = test_app_with_agent();
+        let agent_id = super::super::agent::AgentId(0);
+        app.live_runtime.state = crate::live::state::LiveState::Active {
+            agent_id,
+            session_id: "test-session".to_string(),
+            generation: 1,
+            draft: crate::live::state::DraftSnapshot::default(),
+        };
+
+        let request = crate::views::plan_approval_view::ExitPlanModeExtRequest {
+            session_id: "test-session".into(),
+            tool_call_id: "plan-call".into(),
+            plan_content: Some("# Plan\n\n- verify Live input priority".into()),
+        };
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let mut plan = crate::views::plan_approval_view::PlanApprovalViewState::new(
+            request,
+            crate::views::prompt_widget::StashedPrompt::default(),
+            response_tx,
+        );
+        plan.focus = crate::views::plan_approval_view::PlanApprovalFocus::Prompt;
+        let agent = app.agents.get_mut(&agent_id).unwrap();
+        agent.active_pane = crate::app::agent_view::AgentPane::Prompt;
+        agent.plan_approval_view = Some(plan);
+
+        let space = app.handle_input(&key_event(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            matches!(space, InputOutcome::Changed),
+            "plan approval should consume Space, got {space:?}"
+        );
+        assert_eq!(app.agents[&agent_id].prompt.text(), " ");
+        assert!(app.live_active(), "Space must not stop the Live session");
+
+        let esc = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(esc, InputOutcome::Changed));
+        assert!(app.live_active(), "Esc must stay owned by plan approval");
+    }
+    #[cfg(feature = "codex-live")]
+    #[test]
+    fn live_closed_preserves_terminal_error_in_toast() {
+        let mut app = test_app_with_agent();
+        let agent_id = super::super::agent::AgentId(0);
+        app.live_runtime.state = crate::live::state::LiveState::Active {
+            agent_id,
+            session_id: "test-session".to_string(),
+            generation: 1,
+            draft: crate::live::state::DraftSnapshot::default(),
+        };
+
+        let error = crate::live::LiveEvent::Error {
+            message: "Codex live sideband closed (1008): policy changed".to_owned(),
+        };
+        let (error_draw, error_actions) = crate::live::handle::handle_live_event(&mut app, error);
+        assert!(error_draw);
+        assert!(error_actions.is_empty());
+
+        let (closed_draw, closed_actions) =
+            crate::live::handle::handle_live_event(&mut app, crate::live::LiveEvent::Closed);
+        assert!(closed_draw);
+        assert!(closed_actions.is_empty());
+        assert!(!app.live_active());
+        let toast = app.agents[&agent_id]
+            .toast
+            .as_ref()
+            .map(|(message, _)| message.as_str());
+        assert_eq!(
+            toast,
+            Some("Live stopped: Codex live sideband closed (1008): policy changed")
         );
     }
     #[test]
@@ -7984,7 +8279,10 @@ pub(crate) mod tests {
             "first Ctrl+D should set pending quit, got: {outcome:?}",
         );
         assert!(app.pending_action.is_some());
-        assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+        assert_eq!(
+            app.pending_action.as_ref().unwrap().label.as_deref(),
+            Some("quit")
+        );
         let outcome = app.handle_input(&ctrl_d());
         assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
         assert!(app.pending_action.is_none());
@@ -8009,7 +8307,10 @@ pub(crate) mod tests {
             "first Ctrl+D should set pending quit, got: {outcome:?}",
         );
         assert!(app.pending_action.is_some());
-        assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+        assert_eq!(
+            app.pending_action.as_ref().unwrap().label.as_deref(),
+            Some("quit")
+        );
         let outcome = app.handle_input(&ctrl_d());
         assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
         assert!(app.pending_action.is_none());
@@ -8020,7 +8321,10 @@ pub(crate) mod tests {
         let outcome = app.handle_input(&ctrl_q());
         assert!(matches!(outcome, InputOutcome::Changed));
         assert!(app.pending_action.is_some());
-        assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+        assert_eq!(
+            app.pending_action.as_ref().unwrap().label.as_deref(),
+            Some("quit")
+        );
     }
     #[test]
     fn ctrl_q_double_press_quits() {
@@ -8068,7 +8372,7 @@ pub(crate) mod tests {
         let outcome = app.handle_input(&ctrl_n());
         assert!(matches!(outcome, InputOutcome::Changed));
         let pending = app.pending_action.as_ref().expect("pending action");
-        assert_eq!(pending.label, Some("new"));
+        assert_eq!(pending.label.as_deref(), Some("new"));
     }
     #[test]
     fn second_ctrl_n_opens_new_session_mode_question_when_mode_is_ask() {
@@ -8116,14 +8420,17 @@ pub(crate) mod tests {
         let outcome = app.handle_input(&ctrl_c());
         assert!(matches!(outcome, InputOutcome::Changed));
         assert!(app.pending_action.is_some());
-        assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+        assert_eq!(
+            app.pending_action.as_ref().unwrap().label.as_deref(),
+            Some("quit")
+        );
     }
     fn assert_pending_quit(app: &AppView) {
         let pending = app
             .pending_action
             .as_ref()
             .expect("expected pending action");
-        assert_eq!(pending.label, Some("quit"));
+        assert_eq!(pending.label.as_deref(), Some("quit"));
         assert!(matches!(pending.action, Action::Quit));
     }
     #[test]
@@ -8471,7 +8778,7 @@ pub(crate) mod tests {
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Changed));
         let pending = app.pending_action.as_ref().expect("arm clear");
-        assert_eq!(pending.label, Some("clear"));
+        assert_eq!(pending.label.as_deref(), Some("clear"));
         assert!(matches!(pending.action, Action::ClearPrompt));
         let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(outcome, InputOutcome::Action(Action::ClearPrompt)));
@@ -8736,7 +9043,7 @@ pub(crate) mod tests {
             "expired first Esc must not clear"
         );
         let pending = app.pending_action.as_ref().expect("re-arm clear");
-        assert_eq!(pending.label, Some("clear"));
+        assert_eq!(pending.label.as_deref(), Some("clear"));
     }
     #[test]
     fn idle_images_only_double_esc_arms_clear() {
@@ -10538,7 +10845,7 @@ pub(crate) mod tests {
             "a drafted overlay prompt Esc must NOT back out, got {outcome:?}",
         );
         let pending = app.pending_action.as_ref().expect("clear arm");
-        assert_eq!(pending.label, Some("clear"));
+        assert_eq!(pending.label.as_deref(), Some("clear"));
     }
     /// A Bash/Remember/Feedback empty prompt keeps Esc as its mode-exit even in
     /// an overlay — the back-out is gated to `PromptInputMode::Normal`, so the
@@ -11382,7 +11689,7 @@ pub(crate) mod tests {
             matches!(pending.action, Action::DashboardOverlayStop),
             "pending action must be the overlay stop",
         );
-        assert_eq!(pending.label, Some("close this session"));
+        assert_eq!(pending.label.as_deref(), Some("close this session"));
         assert!(
             !pending.expired(),
             "the confirm window must still be live right after arming",

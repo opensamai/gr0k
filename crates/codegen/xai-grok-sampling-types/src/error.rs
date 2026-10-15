@@ -208,10 +208,7 @@ impl SamplingError {
         }
     }
 
-    /// The server rejected the request because the conversation history
-    /// contains `encrypted_content` from a different model family that the
-    /// current model cannot decrypt. Never retryable — the user must start
-    /// a new session.
+    /// The server rejected Responses reasoning encrypted by another model.
     pub fn is_encrypted_content_error(&self) -> bool {
         matches!(
             self,
@@ -221,6 +218,31 @@ impl SamplingError {
                 ..
             } if message.contains("encrypted_content")
         )
+    }
+
+    /// The provider rejected opaque continuation state from conversation
+    /// history. Besides Responses `encrypted_content`, cover Anthropic-style
+    /// thinking signatures and Responses item IDs. The sampler may safely retry
+    /// once after removing only model-bound state; portable transcript content
+    /// remains intact.
+    pub fn is_model_bound_history_error(&self) -> bool {
+        let SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let normalized = message.to_ascii_lowercase();
+        normalized.contains("encrypted_content")
+            || (normalized.contains("thinking") && normalized.contains("signature"))
+            || (normalized.contains("input[")
+                && normalized.contains(".id")
+                && normalized.contains("invalid"))
+            || (normalized.contains("item")
+                && normalized.contains("id")
+                && (normalized.contains("not found") || normalized.contains("does not exist")))
     }
 
     /// The API rejected the request because an inline image could not be
@@ -325,6 +347,12 @@ struct FlatErrorResponse {
     code: Option<String>,
 }
 
+/// FastAPI / ChatGPT Codex backend: `{"detail":"Stream must be set to true"}`.
+#[derive(Debug, Deserialize)]
+struct DetailErrorResponse {
+    detail: String,
+}
+
 /// Extract `(error_type, message)` from either error format.
 fn try_parse_error(data: &str) -> Option<(String, String)> {
     if let Ok(resp) = serde_json::from_str::<ErrorResponse>(data) {
@@ -340,6 +368,13 @@ fn try_parse_error(data: &str) -> Option<(String, String)> {
             flat.code.unwrap_or_else(|| "server_error".to_string()),
             flat.error,
         ));
+    }
+    // ChatGPT Codex backend (and some FastAPI gateways) return a bare detail string.
+    if let Ok(detail) = serde_json::from_str::<DetailErrorResponse>(data) {
+        let msg = detail.detail.trim();
+        if !msg.is_empty() {
+            return Some(("invalid_request".to_string(), msg.to_owned()));
+        }
     }
     None
 }
@@ -622,6 +657,14 @@ mod tests {
         assert_eq!(msg, "rate_limit_error: rate limit exceeded");
     }
 
+    /// ChatGPT Codex returns FastAPI-style `{"detail":"..."}` (not OpenAI envelopes).
+    #[test]
+    fn user_facing_parses_fastapi_detail_error() {
+        let bytes = br#"{"detail":"Stream must be set to true"}"#;
+        let msg = user_facing_api_error_message(StatusCode::BAD_REQUEST, bytes);
+        assert_eq!(msg, "invalid_request: Stream must be set to true");
+    }
+
     #[test]
     fn structured_error_message_is_length_capped() {
         let long_msg = "x".repeat(MAX_USER_ERROR_BODY_CHARS + 50);
@@ -753,7 +796,7 @@ mod tests {
         assert!(err.is_encrypted_content_error());
         assert!(
             !err.is_retryable(),
-            "encrypted_content errors must not be retried"
+            "encrypted_content errors must not enter generic transport retries"
         );
     }
 

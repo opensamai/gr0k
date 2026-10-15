@@ -227,6 +227,42 @@ impl SessionActor {
     pub(crate) fn invalidate_model_auth_memo(&self) {
         self.model_auth_memo.replace(None);
     }
+    /// Auth facts from the live models-manager catalog, which includes
+    /// platform `/models` live-synced entries (e.g. `ollama/glm-5.2`) that
+    /// the offline-config resolver in
+    /// [`crate::agent::config::resolve_model_auth_facts_and_provider`] cannot
+    /// see — a miss there classifies the model `NotByok` and activates the
+    /// xAI session-token gate for a third-party BYOK model. `None` when the
+    /// catalog is empty or the model is absent (caller falls back to the
+    /// offline resolver).
+    fn live_catalog_auth_facts(
+        &self,
+        model_id: &str,
+    ) -> Option<(
+        crate::agent::config::ModelAuthFacts,
+        Option<crate::auth::AuthProviderRef>,
+    )> {
+        use crate::agent::auth_method::ModelByok;
+        if model_id.is_empty() {
+            return None;
+        }
+        let models = self.models_manager.models();
+        if models.is_empty() {
+            return None;
+        }
+        let entry = crate::agent::config::find_model_by_id(&models, model_id)?;
+        let facts = crate::agent::config::ModelAuthFacts {
+            byok: if entry.has_own_credentials() {
+                ModelByok::Byok
+            } else {
+                ModelByok::NotByok
+            },
+            auth_scheme: entry.info().auth_scheme,
+            oauth_platform: crate::agent::config::oauth_platform_for_model(entry),
+        };
+        let provider = entry.effective_auth_provider().cloned();
+        Some((facts, provider))
+    }
     /// Reads and populates [`Self::model_auth_memo`]; a fresh `Unknown`
     /// falls back to the last definite entry (see the field's contract).
     fn model_auth_state(
@@ -244,8 +280,9 @@ impl SessionActor {
         {
             return (memo.facts, memo.provider.clone());
         }
-        let (fresh, provider) =
-            crate::agent::config::resolve_model_auth_facts_and_provider(model_id);
+        let (fresh, provider) = self.live_catalog_auth_facts(model_id).unwrap_or_else(|| {
+            crate::agent::config::resolve_model_auth_facts_and_provider(model_id)
+        });
         if fresh.byok == ModelByok::Unknown {
             if let Some(memo) = self.model_auth_memo.borrow().as_ref()
                 && memo.model_id == model_id
@@ -398,8 +435,8 @@ impl SessionActor {
     pub(super) async fn reconstruct_full_config(&self) -> SamplingConfig {
         #[allow(clippy::items_after_statements)]
         #[derive(Debug)]
-        struct TraceContextInjector;
-        impl xai_grok_sampler::HeaderInjector for TraceContextInjector {
+        struct SessionHeaderInjector;
+        impl xai_grok_sampler::HeaderInjector for SessionHeaderInjector {
             fn inject(&self, headers: &mut reqwest::header::HeaderMap) {
                 if let Some(tp) = xai_file_utils::trace_context::current_traceparent()
                     && let Ok(v) = reqwest::header::HeaderValue::from_str(&tp)
@@ -440,26 +477,59 @@ impl SessionActor {
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
+        let oauth_platform = model_facts
+            .oauth_platform
+            .or_else(|| crate::agent::config::oauth_platform_for_base_url(&cfg.base_url));
+        let oauth_origin = xai_grok_models::PlatformId::KimiCode.base_url_matches(&cfg.base_url)
+            || xai_grok_models::PlatformId::OpenAiCodex.base_url_matches(&cfg.base_url);
         let auth_method = self.auth_method_id.load();
         let gate =
             SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
-        let use_bearer_resolver = gate.active();
+        // A third-party BYOK platform endpoint must never carry the xAI
+        // session bearer: a live-only catalog entry (e.g. `ollama/glm-5.2`
+        // from the platform `/models` sync) is absent from the offline
+        // catalog the BYOK gate consults, so it can classify `NotByok` and
+        // activate the gate — the AuthManager resolver would then replace
+        // the stamped platform key with the xAI session JWT and the
+        // third-party host 401s (the false "recovery succeeded" loop).
+        let open_platform = crate::agent::config::open_platform_endpoint(&cfg.base_url);
+        let use_bearer_resolver = gate.active() && open_platform.is_none();
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
         if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
             let _ = am.auth().await;
         }
-        let api_key = if use_bearer_resolver {
-            self.auth_manager
-                .as_ref()
-                .and_then(|am| am.current_wire_valid().map(|a| a.key))
-        } else {
-            creds.api_key
-        };
         let auth_scheme = model_facts.auth_scheme;
+        // Capture before `cfg` fields are moved into `SamplingConfig`. Catalog
+        // identity wins; URL fallback above is accepted only when unambiguous.
+        let kimi_bearer_resolver: Option<xai_grok_sampler::SharedBearerResolver> =
+            (oauth_platform == Some(xai_grok_models::PlatformId::KimiCode)).then(|| {
+                std::sync::Arc::new(crate::auth::kimi::KimiCodeBearerResolver)
+                    as xai_grok_sampler::SharedBearerResolver
+            });
+        let codex_bearer_resolver: Option<xai_grok_sampler::SharedBearerResolver> =
+            (oauth_platform == Some(xai_grok_models::PlatformId::OpenAiCodex)).then(|| {
+                std::sync::Arc::new(crate::auth::openai_codex::OpenAiCodexBearerResolver)
+                    as xai_grok_sampler::SharedBearerResolver
+            });
+        let claude_bearer_resolver: Option<xai_grok_sampler::SharedBearerResolver> =
+            (oauth_platform == Some(xai_grok_models::PlatformId::AnthropicClaude)).then(|| {
+                std::sync::Arc::new(crate::auth::anthropic_claude::AnthropicClaudeBearerResolver)
+                    as xai_grok_sampler::SharedBearerResolver
+            });
+        let responses_codex_dialect =
+            oauth_platform == Some(xai_grok_models::PlatformId::OpenAiCodex);
+        let kimi_dialect = oauth_platform == Some(xai_grok_models::PlatformId::KimiCode)
+            || xai_grok_models::PlatformId::MoonshotCn.base_url_matches(&cfg.base_url)
+            || xai_grok_models::PlatformId::MoonshotAi.base_url_matches(&cfg.base_url);
         let mut extra_headers = cfg.extra_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
             creds.alpha_test_key.as_deref(),
+            &cfg.base_url,
+        );
+        crate::agent::config::align_oauth_headers_with_platform(
+            &mut extra_headers,
+            oauth_platform,
             &cfg.base_url,
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
@@ -486,6 +556,42 @@ impl SessionActor {
                 extra_headers.insert("x-compaction-at".to_string(), value.to_string());
             }
         }
+        // Platform OAuth (Kimi / OpenAI Codex) always wins over the xAI session
+        // resolver. `session_token_auth_gate` is true whenever the user is on
+        // cached_token/grok.com/oidc AND the model is NotByok — common for
+        // openai-codex/* when the catalog stamp is not yet memoized as Byok.
+        // Preferring AuthManager here previously sent the xAI OIDC JWT to
+        // chatgpt.com → 401 "Could not parse your authentication token" while
+        // recovery "succeeded" by refreshing the *wrong* token.
+        let (api_key, bearer_resolver) = if responses_codex_dialect {
+            // The resolver is authoritative and performs the sole auth lookup
+            // for each HTTP attempt, including the companion account header.
+            (None, codex_bearer_resolver)
+        } else if let Some(kimi) = kimi_bearer_resolver {
+            // Kimi access tokens are likewise resolved only when the request
+            // is built, avoiding an eager refresh followed by a second lookup.
+            (None, Some(kimi))
+        } else if let Some(claude) = claude_bearer_resolver {
+            // Anthropic Claude subscription bearer + `anthropic-beta` header are
+            // resolved per request (token TTL ~ short); never send xAI auth.
+            (None, Some(claude))
+        } else if oauth_origin {
+            // Both OAuth providers may share one user proxy. Without catalog
+            // identity, fail closed rather than send Kimi, Codex, or xAI auth
+            // to a route whose credential family is ambiguous.
+            (None, None)
+        } else if use_bearer_resolver {
+            (
+                creds.api_key,
+                self.auth_manager
+                    .as_ref()
+                    .map(|am| -> xai_grok_sampler::SharedBearerResolver {
+                        std::sync::Arc::new(AuthManagerBearerResolver(am.clone()))
+                    }),
+            )
+        } else {
+            (creds.api_key, None)
+        };
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -517,20 +623,14 @@ impl SessionActor {
                 .map(|a| a.user_id),
             origin_client: self.origin_client.clone(),
             attribution_callback: self.attribution_callback.clone(),
-            bearer_resolver: if use_bearer_resolver {
-                self.auth_manager
-                    .as_ref()
-                    .map(|am| -> xai_grok_sampler::SharedBearerResolver {
-                        std::sync::Arc::new(AuthManagerBearerResolver(am.clone()))
-                    })
-            } else {
-                None
-            },
+            bearer_resolver,
             supports_backend_search: self.supports_backend_search.get(),
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
-            header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+            header_injector: Some(std::sync::Arc::new(SessionHeaderInjector)),
+            responses_codex_dialect,
+            kimi_dialect,
         }
     }
     /// Install auto-mode permission classifier with a live LLM side-query
@@ -835,7 +935,7 @@ impl SessionActor {
                 return Ok(SamplerFailureRecovery::CompactAndResubmit);
             }
         }
-        let detailed_message = error.message.clone();
+        let mut detailed_message = error.message.clone();
         if matches!(error.kind, SamplingErrorKind::Api)
             && error.status_code == Some(400)
             && error.message.contains("encrypted_content")
@@ -927,7 +1027,156 @@ impl SessionActor {
                 })),
             );
         }
-        if auth_recovery_eligible
+        // Third-party OAuth platforms must never recover via xAI AuthManager —
+        // that refreshes the wrong credential and reports "recovery succeeded"
+        // while chatgpt.com/kimi still 401.
+        let failed_oauth_platform = self
+            .model_auth_facts(&failed_model_id)
+            .oauth_platform
+            .or_else(|| crate::agent::config::oauth_platform_for_base_url(&failed_base_url));
+        let is_openai_codex =
+            failed_oauth_platform == Some(xai_grok_models::PlatformId::OpenAiCodex);
+        let is_kimi_code = failed_oauth_platform == Some(xai_grok_models::PlatformId::KimiCode);
+        let is_anthropic_claude =
+            failed_oauth_platform == Some(xai_grok_models::PlatformId::AnthropicClaude);
+        let ambiguous_oauth_origin = failed_oauth_platform.is_none()
+            && (xai_grok_models::PlatformId::KimiCode.base_url_matches(&failed_base_url)
+                || xai_grok_models::PlatformId::OpenAiCodex.base_url_matches(&failed_base_url));
+        if (matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401))
+            && is_openai_codex
+        {
+            match crate::auth::openai_codex::force_refresh_openai_codex_auth().await {
+                Some(_) => {
+                    tracing::info!(
+                        session_id = % self.session_info.id.0,
+                        "auth recovery: sampler 401, openai-codex re-mint, retrying"
+                    );
+                    xai_grok_telemetry::unified_log::info(
+                        "auth recovery: sampler 401, openai-codex re-mint, retrying",
+                        Some(self.session_info.id.0.as_ref()),
+                        None,
+                    );
+                    self.prepare_sampler_for_turn().await;
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = % self.session_info.id.0,
+                        "auth recovery: sampler 401, openai-codex re-mint failed"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth recovery: sampler 401, openai-codex re-mint failed",
+                        Some(self.session_info.id.0.as_ref()),
+                        None,
+                    );
+                }
+            }
+        } else if (matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401))
+            && is_kimi_code
+        {
+            // Do not fall through to xAI AuthManager recovery (wrong credential).
+            // Force a Kimi token refresh mirroring the openai-codex path; only
+            // when that fails do we surface the 401 so the user can
+            // `/login kimi` rather than looping a false recovery.
+            match crate::auth::kimi::force_refresh_kimi_code_auth().await {
+                Some(_) => {
+                    tracing::info!(
+                        session_id = % self.session_info.id.0,
+                        "auth recovery: sampler 401, kimi-code re-mint, retrying"
+                    );
+                    xai_grok_telemetry::unified_log::info(
+                        "auth recovery: sampler 401, kimi-code re-mint, retrying",
+                        Some(self.session_info.id.0.as_ref()),
+                        None,
+                    );
+                    self.prepare_sampler_for_turn().await;
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = % self.session_info.id.0,
+                        "auth recovery: sampler 401, kimi-code re-mint failed"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth recovery: sampler 401, kimi-code re-mint failed",
+                        Some(self.session_info.id.0.as_ref()),
+                        None,
+                    );
+                }
+            }
+        } else if (matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401))
+            && is_anthropic_claude
+        {
+            // Mirror the Kimi/Codex path: force a Claude token refresh rather
+            // than falling through to xAI AuthManager (wrong credential).
+            match crate::auth::anthropic_claude::force_refresh_anthropic_claude_auth().await {
+                Some(_) => {
+                    tracing::info!(
+                        session_id = % self.session_info.id.0,
+                        "auth recovery: sampler 401, anthropic-claude re-mint, retrying"
+                    );
+                    xai_grok_telemetry::unified_log::info(
+                        "auth recovery: sampler 401, anthropic-claude re-mint, retrying",
+                        Some(self.session_info.id.0.as_ref()),
+                        None,
+                    );
+                    self.prepare_sampler_for_turn().await;
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = % self.session_info.id.0,
+                        "auth recovery: sampler 401, anthropic-claude re-mint failed"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "auth recovery: sampler 401, anthropic-claude re-mint failed",
+                        Some(self.session_info.id.0.as_ref()),
+                        None,
+                    );
+                }
+            }
+        } else if (matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401))
+            && ambiguous_oauth_origin
+        {
+            tracing::warn!(
+                session_id = % self.session_info.id.0,
+                "auth recovery: ambiguous OAuth proxy has no catalog platform; refusing credential refresh"
+            );
+            xai_grok_telemetry::unified_log::warn(
+                "auth recovery: ambiguous OAuth proxy; credential family unknown",
+                Some(self.session_info.id.0.as_ref()),
+                None,
+            );
+            detailed_message = format!(
+                "{detailed_message}\n\nThe OAuth proxy matches both Kimi Code and OpenAI Codex, but the selected catalog platform could not be recovered. Reselect the model and retry."
+            );
+        } else if (matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401))
+            && let Some(platform) = crate::agent::config::open_platform_endpoint(&failed_base_url)
+        {
+            // Same wrong-credential trap as Kimi/Codex: refreshing the xAI
+            // session cannot fix a third-party BYOK 401 — the retry re-sends
+            // a credential the platform must reject again, looping to the
+            // misleading "Auth recovery succeeded but ... 401" terminal
+            // error. Surface the 401 with the platform's setup hint so the
+            // user re-checks the platform key instead.
+            tracing::warn!(
+                session_id = % self.session_info.id.0,
+                platform = platform.as_str(),
+                "auth recovery: sampler 401 on open-platform endpoint — \
+                 not refreshable via xAI session"
+            );
+            xai_grok_telemetry::unified_log::warn(
+                "auth recovery: sampler 401 on open-platform endpoint — not refreshable via xAI session",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({ "platform" : platform.as_str() })),
+            );
+            detailed_message = format!(
+                "{detailed_message}\n\n\
+                 The request was rejected by {} — check the platform API key: {}.",
+                platform.display_name(),
+                platform.setup_hint()
+            );
+        } else if auth_recovery_eligible
             && crate::auth::devbox_login::is_devbox_environment()
             && let Some(ref am) = self.auth_manager
         {
@@ -954,8 +1203,7 @@ impl SessionActor {
                     );
                 }
             }
-        }
-        if auth_recovery_eligible && let Some(ref am) = self.auth_manager {
+        } else if auth_recovery_eligible && let Some(ref am) = self.auth_manager {
             if am
                 .try_recover_unauthorized(crate::auth::recovery::RecoverySource::Turn)
                 .await
@@ -1188,7 +1436,13 @@ impl SessionActor {
                 .await
                 .map(|c| (c.model, c.base_url))
                 .unwrap_or_default();
-            if self.auth_gate(&model_id, &base_url).active() {
+            // Never refresh-then-rewrite chat-state credentials with the xAI
+            // session token for a third-party BYOK platform endpoint: the
+            // stamped platform key is the correct signer, and the BYOK gate
+            // can misclassify live-only catalog models as `NotByok`.
+            if self.auth_gate(&model_id, &base_url).active()
+                && crate::agent::config::open_platform_endpoint(&base_url).is_none()
+            {
                 match am.get_valid_token().await {
                     Ok(key) => {
                         if creds.api_key.as_deref() != Some(&key) {

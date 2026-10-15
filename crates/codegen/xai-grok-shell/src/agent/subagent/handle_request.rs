@@ -122,6 +122,20 @@ pub(crate) async fn run_shell_child(
         .parent_session_info
         .as_ref()
         .map(|i| std::path::Path::new(&i.cwd));
+    let config_effort_pin = ctx
+        .subagent_effort_overrides
+        .get(&request.subagent_type)
+        .and_then(|raw| {
+            raw.parse()
+                .map_err(|err| {
+                    tracing::warn!(
+                        value = %raw,
+                        error = %err,
+                        "[subagents.effort] pin has an invalid value, ignoring"
+                    );
+                })
+                .ok()
+        });
     let mut effective_runtime = xai_grok_subagent_resolution::resolve_runtime_config(
         &request.subagent_type,
         &request.runtime_overrides,
@@ -129,6 +143,7 @@ pub(crate) async fn run_shell_child(
         &ctx.subagent_personas,
         cwd,
         &definition,
+        config_effort_pin,
     );
     let prompt = request.prompt.clone();
     if let Some(ref err) = effective_runtime.persona_error {
@@ -466,16 +481,18 @@ pub(crate) async fn run_shell_child(
             return child_run_output(failure_result(&request, &msg), completion_data, None);
         }
     }
-    if let Some(raw) = effective_runtime.reasoning_effort.as_deref()
+    if let Some(effort) = effective_runtime.reasoning_effort
         && ctx
             .models_manager
             .model_supports_reasoning_effort(effective_model_id.0.as_ref())
     {
-        match raw.parse::<ReasoningEffort>() {
+        // Fork's typed effort enum; strings align 1:1 with the sampler's
+        // canonical tokens (none..ultra), so parse is total.
+        match effort.as_str().parse::<ReasoningEffort>() {
             Ok(eff) => effective_sampling_config.reasoning_effort = Some(eff),
             Err(err) => {
                 tracing::warn!(
-                    value = raw,
+                    value = %effort,
                     error = %err,
                     "subagent reasoning_effort: parse failed, ignoring override"
                 )
@@ -581,7 +598,10 @@ pub(crate) async fn run_shell_child(
             None,
             None,
             None,
-            effective_runtime.reasoning_effort.as_deref(),
+            effective_runtime
+                .reasoning_effort
+                .as_ref()
+                .map(|e| e.as_str()),
             effective_runtime.role_name.as_deref(),
             request.parent_prompt_id.as_deref(),
             0,
@@ -598,7 +618,9 @@ pub(crate) async fn run_shell_child(
         upload_method: ctx.gcs_upload_method.clone(),
         model_id: Some(effective_model_id.0.to_string()),
         cwd: Some(child_session_info.cwd.clone()),
-        reasoning_effort: effective_runtime.reasoning_effort.clone(),
+        reasoning_effort: effective_runtime
+            .reasoning_effort
+            .map(|e| e.as_str().to_string()),
         role_name: effective_runtime.role_name.clone(),
         parent_prompt_id: request.parent_prompt_id.clone(),
         auth_manager: ctx.auth_manager.clone(),
@@ -629,6 +651,7 @@ pub(crate) async fn run_shell_child(
             role: effective_runtime.role_name.clone(),
             model: Some(effective_model_id.0.to_string()),
             resumed_from: request.resume_from.clone(),
+            budget: SubagentExecutionBudget::resolve(&definition, ctx.parent_max_turns).wire(),
             workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
         },
         ctx.parent_cmd_tx.as_ref(),
@@ -641,7 +664,9 @@ pub(crate) async fn run_shell_child(
         cwd: None,
         isolation_mode: None,
         capability_mode: None,
-        reasoning_effort: effective_runtime.reasoning_effort.clone(),
+        reasoning_effort: effective_runtime
+            .reasoning_effort
+            .map(|e| e.as_str().to_string()),
         role_name: effective_runtime.role_name.clone(),
         parent_prompt_id: request.parent_prompt_id.clone(),
         depth: 0,
@@ -1295,6 +1320,7 @@ pub(crate) async fn run_shell_child(
                         success: false,
                         cancelled: true,
                         error: Some(reason),
+                        termination_reason: Some("cancelled".to_string()),
                         output: if final_text.is_empty() {
                             std::sync::Arc::from(format!(
                                 "Subagent '{}' ({}) was cancelled. {} tool calls, {} turns.",
@@ -1325,6 +1351,7 @@ pub(crate) async fn run_shell_child(
                     success: false,
                     cancelled: true,
                     error: Some(format!("max turns reached (limit: {limit})")),
+                    termination_reason: Some("max_turns".to_string()),
                     output: if final_text.is_empty() {
                         std::sync::Arc::from(format!(
                             "Subagent '{}' ({}) hit max-turns limit ({limit}). {} tool calls, {} turns.",

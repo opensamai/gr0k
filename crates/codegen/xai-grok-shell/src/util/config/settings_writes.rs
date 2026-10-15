@@ -265,6 +265,12 @@ pub async fn set_voice_stt_language(value: String) -> Result<()> {
     update_config(|cfg| cfg.ui.voice_stt_language = Some(value)).await
 }
 
+/// Persist `[ui].language` via `update_config`. Value is one of the canonical
+/// UI-language strings `auto` | `en` | `zh-CN` (`auto` follows the OS locale).
+pub async fn set_language(value: String) -> Result<()> {
+    update_config(|cfg| cfg.ui.language = Some(value)).await
+}
+
 /// Persist `[ui].voice_keybind_enabled` via `update_config`. When `false` the
 /// Ctrl+Space / F8 voice chord is ignored (`/voice` still works).
 pub async fn set_voice_keybind_enabled(value: bool) -> Result<()> {

@@ -13,6 +13,8 @@
 //! - `x.ai/internal/reload_skills`          skills file watcher fan-out
 //! - `x.ai/internal/reload_models`          model list hot-reload from config.toml
 //! - `x.ai/internal/reload_models_cache`    model catalog hot-reload from disk cache
+//! - `x.ai/internal/reload_subagent_models` subagent model-pin hot-reload
+//! - `x.ai/internal/set_platform_api_key`   persist a BYOK platform key + restamp
 //! - `x.ai/internal/auth_cleared`           auth hot-clear cleanup
 //! - `x.ai/plugins/reload`                  rebuild shared plugin registry
 //! - `x.ai/commands/list`                   list slash commands
@@ -48,6 +50,8 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         "x.ai/internal/reload_workflows" => handle_reload_workflows(agent),
         "x.ai/internal/reload_models" => handle_reload_models(agent),
         "x.ai/internal/reload_models_cache" => handle_reload_models_cache(agent),
+        "x.ai/internal/reload_subagent_models" => handle_reload_subagent_models(agent),
+        "x.ai/internal/set_platform_api_key" => handle_set_platform_api_key(agent, args),
         "x.ai/internal/auth_cleared" => handle_auth_cleared(agent),
         "x.ai/plugins/reload" => handle_plugins_reload(agent).await,
         "x.ai/commands/list" => handle_commands_list(agent, args).await,
@@ -606,6 +610,121 @@ fn handle_reload_models_cache(agent: &MvpAgent) -> ExtResult {
     ExtMethodResult::success(serde_json::json!({ "reloaded": true }))
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+}
+
+// internal/reload_subagent_models
+
+/// Re-resolve `[subagents.models]` pins from config.toml. Called by the
+/// config hot-reload watcher when the pin table changes — typically an edit
+/// from the TUI `/agents` modal (`m` on an agent).
+///
+/// Only the pin map is refreshed: `subagents_enabled` honors CLI/env intent
+/// from startup, and `subagent_toggle` is baked into the built toolset (a
+/// live swap would require an agent rebuild). The next subagent spawn reads
+/// `subagent_model_overrides` when building its `SubagentSpawnContext`, so
+/// new pins apply without restarting the session.
+fn handle_reload_subagent_models(agent: &MvpAgent) -> ExtResult {
+    let disk_config = crate::config::load_effective_config()
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+    // `cli_flag` only gates `enabled` (which we deliberately do not touch);
+    // `models` is parsed straight from the `[subagents]` table.
+    let resolved = crate::config::SubagentsConfig::resolve(false, &disk_config);
+    let count = resolved.models.len();
+    agent.cfg.borrow_mut().subagent_model_overrides = resolved.models;
+    agent.cfg.borrow_mut().subagent_effort_overrides = resolved.effort;
+    ExtMethodResult::success(serde_json::json!({ "reloaded": true, "pins": count }))
+        .to_ext_response()
+        .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+}
+
+// internal/set_platform_api_key
+
+/// Persist a third-party platform API key (from TUI `/providers`) and restamp
+/// the model catalog so locked models unlock without a restart.
+///
+/// OAuth platforms (Kimi Code) are rejected — use `/login kimi` instead.
+/// Empty `apiKey` clears the stored key.
+fn handle_set_platform_api_key(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SetPlatformApiKeyRequest {
+        platform: String,
+        #[serde(default)]
+        api_key: String,
+        /// Self-hosted gateway root for BYOK platforms (Nexus). Optional.
+        #[serde(default)]
+        base_url: Option<String>,
+    }
+
+    let req: SetPlatformApiKeyRequest = parse_params(args)?;
+    let platform_id = xai_grok_models::PlatformId::parse(req.platform.trim()).ok_or_else(|| {
+        acp::Error::invalid_params().data(format!(
+            "unknown platform '{}'; run /providers for the list",
+            req.platform.trim()
+        ))
+    })?;
+    if platform_id.uses_oauth() {
+        let login = match platform_id {
+            xai_grok_models::PlatformId::OpenAiCodex => "/login openai",
+            _ => "/login kimi",
+        };
+        return Err(acp::Error::invalid_params().data(format!(
+            "{} uses OAuth — run {login} instead of pasting an API key",
+            platform_id.display_name()
+        )));
+    }
+
+    let home = xai_grok_config::grok_home();
+    crate::auth::store_platform_api_key(
+        &home,
+        platform_id.as_str(),
+        &req.api_key,
+        req.base_url.as_deref(),
+    )
+    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+
+    // Re-stamp catalog + live-fetch so models unlock immediately.
+    agent.models_manager.restamp_platform_credentials();
+    agent.sync_process_static_api_key(None);
+
+    let prefix = format!("{}/", platform_id.as_str());
+    let unlocked = agent
+        .models_manager
+        .models()
+        .iter()
+        .filter(|(id, entry)| {
+            id.starts_with(&prefix) && entry.info.supported_in_api && entry.has_own_credentials()
+        })
+        .count();
+    let cleared = req.api_key.trim().is_empty();
+    // Env vars still win over auth.json — surface names (never values) so the
+    // TUI can warn after a "logout" that models may stay unlocked.
+    let env_still_active: Vec<&str> = platform_id
+        .api_key_env_names()
+        .iter()
+        .copied()
+        .filter(|name| {
+            std::env::var(name)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .collect();
+    tracing::info!(
+        platform = platform_id.as_str(),
+        unlocked,
+        cleared,
+        env_still_active = ?env_still_active,
+        "platform API key updated via /providers"
+    );
+    ExtMethodResult::success(serde_json::json!({
+        "platform": platform_id.as_str(),
+        "displayName": platform_id.display_name(),
+        "cleared": cleared,
+        "modelsUnlocked": unlocked,
+        "envStillActive": env_still_active,
+    }))
+    .to_ext_response()
+    .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
 
 fn handle_auth_cleared(agent: &MvpAgent) -> ExtResult {

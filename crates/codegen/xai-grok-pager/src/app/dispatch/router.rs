@@ -1,7 +1,8 @@
 //! Top-level action router: maps actions and action results to handlers.
 use super::auth::{
-    dispatch_cancel_login, dispatch_login, dispatch_logout, dispatch_submit_auth_code,
-    dispatch_switch_account,
+    dispatch_cancel_login, dispatch_login, dispatch_login_anthropic_claude, dispatch_login_kimi,
+    dispatch_login_openai_codex, dispatch_logout, dispatch_set_platform_api_key,
+    dispatch_submit_auth_code, dispatch_switch_account,
 };
 use super::billing::dispatch_open_supergrok_url;
 use super::ctx::{
@@ -28,6 +29,11 @@ use super::import_claude::{
 };
 use super::interject::dispatch_interject;
 use super::jump::{dispatch_jump_dismiss, dispatch_jump_picker_select, dispatch_jump_show_picker};
+#[cfg(feature = "codex-live")]
+use super::live::{
+    dispatch_live_delegation_submit, dispatch_live_set_muted, dispatch_live_stop,
+    dispatch_live_toggle, dispatch_live_toggle_mute,
+};
 use super::modes::{
     dispatch_cycle_mode, dispatch_enter_plan_mode, dispatch_show_plan, dispatch_toggle_yolo,
     set_permission_mode, set_plan_mode, set_yolo_mode,
@@ -81,8 +87,8 @@ use super::settings::setters::{
     set_contextual_hint_ssh_wrap, set_contextual_hint_undo, set_contextual_hint_word_select,
     set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
     set_fork_secondary_model, set_group_tool_verbs, set_hunk_tracker_mode, set_invert_scroll,
-    set_keep_text_selection, set_max_thoughts_width, set_multiline_mode, set_page_flip_on_send,
-    set_prompt_suggestions, set_remember_tool_approvals, set_render_mermaid,
+    set_keep_text_selection, set_language, set_max_thoughts_width, set_multiline_mode,
+    set_page_flip_on_send, set_prompt_suggestions, set_remember_tool_approvals, set_render_mermaid,
     set_respect_manual_folds, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
     set_show_thinking_blocks, set_show_tips, set_simple_mode, set_theme, set_timeline,
     set_timestamps, set_vim_mode, set_voice_capture_mode, set_voice_keybind_enabled,
@@ -136,6 +142,55 @@ pub(super) fn dispatch_copy_auth_url(
         generation: app.auth_clipboard_feedback_generation,
     }]
 }
+
+/// Cycle the session model among `[models].enabled_models` (or all usable models).
+fn dispatch_cycle_scoped_model(app: &mut AppView, reverse: bool) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    let patterns = crate::scoped_models::enabled_patterns();
+    let list = crate::scoped_models::cycle_candidates(&agent.session.models, &patterns);
+    if list.is_empty() {
+        agent.show_toast(
+            "No models to cycle — configure credentials or /scoped-models",
+        );
+        return vec![];
+    }
+    let current = agent.session.models.current.clone();
+    let Some(model_id) = crate::scoped_models::adjacent_in_cycle(&list, current.as_ref(), reverse)
+    else {
+        let name = list
+            .first()
+            .and_then(|id| agent.session.models.available.get(id))
+            .map(|i| i.name.as_str())
+            .unwrap_or("current");
+        agent.show_toast(&format!("Only one scoped model: {name}"));
+        return vec![];
+    };
+    let label = agent
+        .session
+        .models
+        .available
+        .get(&model_id)
+        .map(|i| i.name.clone())
+        .unwrap_or_else(|| model_id.0.to_string());
+    agent.show_toast(&format!("Model → {label}"));
+    let Some(session_id) = agent.session.session_id.clone() else {
+        agent.session.deferred_model_switch = Some((model_id, None));
+        return vec![];
+    };
+    agent.session.model_switch_pending = true;
+    vec![Effect::SwitchModel {
+        agent_id: id,
+        session_id,
+        model_id,
+        effort: None,
+        prev_model_id: None,
+    }]
+}
 /// Dispatch an action: mutate state, return effects to execute.
 ///
 /// The returned `Vec<Effect>` may be empty (pure state mutation) or contain
@@ -153,6 +208,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             if let Some(tx) = &app.voice_cmd_tx {
                 let _ = tx.try_send(xai_grok_voice::VoiceCommand::Shutdown);
             }
+            #[cfg(feature = "codex-live")]
+            super::live::stop_live_on_teardown(app);
             let mut effects = unregister_all_active_sessions(app);
             effects.push(Effect::Quit);
             effects
@@ -194,7 +251,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         }
         Action::NewSession => dispatch_new_session(app),
         Action::ChooseNewSessionMode => open_new_session_question(app),
-        Action::ExitSession | Action::ExitSessionConfirmed => dispatch_exit_session(app),
+        Action::ExitSession | Action::ExitSessionConfirmed => {
+            #[cfg(feature = "codex-live")]
+            super::live::stop_live_on_teardown(app);
+            dispatch_exit_session(app)
+        }
         Action::NewWorktreeSession {
             load_session_id,
             label,
@@ -207,6 +268,38 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ImportClaudeSettings => dispatch_import_claude(app),
         Action::ImportClaudeConfirm => dispatch_import_claude_confirm(app),
         Action::ImportClaudeCancel => dispatch_import_claude_cancel(app),
+        Action::OpenChanges => {
+            let ActiveView::Agent(agent_id) = app.active_view else {
+                return vec![];
+            };
+            let Some(agent) = app.agents.get(&agent_id) else {
+                return vec![];
+            };
+            let Some(session_id) = agent.session.session_id.clone() else {
+                return vec![];
+            };
+            vec![Effect::FetchChanges {
+                agent_id,
+                session_id,
+                post_action: false,
+            }]
+        }
+        Action::ChangesAction(kind) => {
+            let ActiveView::Agent(agent_id) = app.active_view else {
+                return vec![];
+            };
+            let Some(agent) = app.agents.get(&agent_id) else {
+                return vec![];
+            };
+            let Some(session_id) = agent.session.session_id.clone() else {
+                return vec![];
+            };
+            vec![Effect::ChangesAction {
+                agent_id,
+                session_id,
+                kind,
+            }]
+        }
         Action::DismissClaudeImport => dispatch_dismiss_claude_import(app),
         Action::LoadSession(session_id, session_cwd, chat_kind) => {
             dispatch_load_session(app, session_id, session_cwd, chat_kind)
@@ -335,6 +428,22 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::EnableVoiceMode => dispatch_enable_voice_mode(app, true),
         Action::VoiceToggle => dispatch_voice_toggle(app),
         Action::VoiceStop => dispatch_voice_stop(app),
+        #[cfg(feature = "codex-live")]
+        Action::LiveToggle => dispatch_live_toggle(app),
+        #[cfg(feature = "codex-live")]
+        Action::LiveStop => dispatch_live_stop(app),
+        #[cfg(feature = "codex-live")]
+        Action::LiveToggleMute => dispatch_live_toggle_mute(app),
+        #[cfg(feature = "codex-live")]
+        Action::LiveSetMuted(muted) => dispatch_live_set_muted(app, muted),
+        #[cfg(feature = "codex-live")]
+        Action::LiveDelegationSubmit {
+            agent_id,
+            text,
+            delegation_id,
+            generation,
+            draft,
+        } => dispatch_live_delegation_submit(app, agent_id, text, delegation_id, generation, draft),
         Action::SendBashCommand(cmd) => dispatch_send_bash_command(app, cmd),
         Action::ShowUndoTip => dispatch_show_undo_tip(app),
         Action::ShowPlanNudge => dispatch_show_plan_nudge(app),
@@ -849,7 +958,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 enabled,
             }]
         }
-        Action::NextModel => vec![],
+        Action::NextModel => dispatch_cycle_scoped_model(app, false),
+        Action::PrevModel => dispatch_cycle_scoped_model(app, true),
         Action::SwitchModel { model_id, effort } => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
@@ -974,6 +1084,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetDefaultSelectedPermission(s) => set_default_selected_permission(app, s),
         Action::SetHunkTrackerMode(s) => set_hunk_tracker_mode(app, s),
         Action::SetScreenMode(s) => set_screen_mode(app, s),
+        Action::SetLanguage(s) => set_language(app, s),
         Action::SetVoiceKeybindEnabled(v) => set_voice_keybind_enabled(app, v),
         Action::SetVoiceCaptureMode(s) => set_voice_capture_mode(app, s),
         Action::SetVoiceSttLanguage(s) => set_voice_stt_language(app, s),
@@ -999,6 +1110,11 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetAutoDarkTheme(v) => set_auto_dark_theme(app, v),
         Action::SetAutoLightTheme(v) => set_auto_light_theme(app, v),
         Action::SetDefaultModel(v) => set_default_model(app, v),
+        Action::SetPlatformApiKey {
+            platform,
+            api_key,
+            base_url,
+        } => dispatch_set_platform_api_key(app, platform, api_key, base_url),
         Action::ClearDefaultModel => clear_default_model(app),
         Action::SetForkSecondaryModel(v) => set_fork_secondary_model(app, v),
         Action::ClearForkSecondaryModel => clear_fork_secondary_model(app),
@@ -1073,6 +1189,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             vec![]
         }
         Action::Login => dispatch_login(app),
+        Action::LoginKimi => dispatch_login_kimi(app),
+        Action::LoginOpenAiCodex => dispatch_login_openai_codex(app),
+        Action::LoginAnthropicClaude => dispatch_login_anthropic_claude(app),
         Action::CancelLogin => dispatch_cancel_login(app),
         Action::SubmitAuthCode(code) => dispatch_submit_auth_code(app, code),
         Action::CopyAuthUrl => {

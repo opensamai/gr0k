@@ -21,9 +21,9 @@ pub struct TaskToolInput {
     pub description: String,
 
     /// Name of the subagent type to launch. Built-in types: "general-purpose",
-    /// "explore", "plan". Additional user-defined types may also be available.
+    /// "explore", "plan", "oracle", "xdotcom". Additional user-defined types may also be available.
     #[schemars(
-        description = "Name of the subagent type to launch. Built-in types: \"general-purpose\", \"explore\", \"plan\". Additional user-defined types may also be available."
+        description = "Name of the subagent type to launch. Built-in types: \"general-purpose\", \"explore\", \"plan\", \"oracle\", \"xdotcom\". Additional user-defined types may also be available."
     )]
     #[serde(default = "default_subagent_type")]
     pub subagent_type: String,
@@ -176,6 +176,68 @@ impl SubagentCapabilityMode {
             Self::ReadWrite => "read-write",
             Self::Execute => "execute",
             Self::All => "all",
+        }
+    }
+}
+
+/// Typed reasoning effort used by subagent role/persona/default resolution.
+///
+/// This lives in the common tool-types crate so the task runtime and resolver
+/// can share it without introducing the `xai-grok-tools` ↔ sampling-types
+/// dependency cycle. The shell converts it exhaustively to its sampling enum at
+/// the final model boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl SubagentReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+impl std::fmt::Display for SubagentReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SubagentReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
+            _ => Err(format!(
+                "invalid subagent reasoning effort {value:?}; expected one of: \
+                 none, minimal, low, medium, high, xhigh, max, ultra"
+            )),
         }
     }
 }
@@ -803,9 +865,127 @@ pub const PLAN_SUBAGENT: BuiltinSubagent = BuiltinSubagent {
     prompt_template: PLAN_PROMPT,
 };
 
+/// Prompt body for the **oracle** subagent.
+///
+/// A read-only deep-analysis advisor the working agent consults when it is
+/// stuck or facing a hard problem. Returns analysis plus a concrete
+/// recommendation; the working agent keeps ownership of every edit.
+pub const ORACLE_PROMPT: &str = "\
+You are the Oracle — a read-only advisor the working agent consults when it is stuck, unsure, or facing a problem that needs deeper analysis.
+
+Your only job: understand the problem, analyze it deeply, and hand back a clear recommendation. The working agent stays in charge of all edits.
+
+=== READ-ONLY MODE ===
+\
+You have NO file editing tools and NO shell. Do not create, modify, or delete files.\
+${%- if tools.by_kind.read %} \
+Inspect the codebase yourself with ${{ tools.by_kind.read }}, ${{ tools.by_kind.list }}, and ${{ tools.by_kind.search }} whenever you need evidence — do not take the caller's summary on faith when the code may disagree.\
+${%- endif %}
+
+Strengths:
+- Root-causing bugs, failing tests, and confusing behavior from symptoms
+- Untangling complex control flow, architecture, and dependency questions
+- Comparing approaches and naming the trade-offs that matter
+
+Guidelines:
+- The caller's description is a starting point, not ground truth — verify it against the code.
+- Work hypothesis-first: inspect only evidence that can change the recommendation, then stop investigating.
+- Prefer a correct, specific answer over an exhaustive inventory. Never keep searching merely to appear thorough.
+- If the premise looks wrong, say so directly and explain why.
+- Stay read-only. Give the working agent exact verification commands or tests to run; do not claim you ran them.
+
+## Required Output
+
+Use these headings, in order:
+
+### Findings
+The key diagnosis or decision, with important findings ordered by impact.
+
+### Evidence
+Concrete file paths, functions, and observed behavior supporting the findings. Distinguish verified facts from assumptions.
+
+### Alternatives
+Viable alternatives and the trade-offs that would change the choice. Write `None material` when there is no meaningful alternative.
+
+### Risks and Unknowns
+Residual risks, missing evidence, and what could falsify the recommendation.
+
+### Verification Handoff
+Exact tests, commands, or checks the working agent should run after acting on the advice. These are instructions, not claims that you executed them.
+
+### Confidence
+`High`, `Medium`, or `Low`, followed by one sentence explaining why.
+
+End your response with:
+
+### Recommendation
+The exact next steps the working agent should take, in order — file paths, functions, and specifics it can act on without re-analyzing.
+
+Workspace boundary:
+- Your default analysis scope is the workspace in <user_info>. Stay within it unless asked otherwise.";
+
+/// The **oracle** built-in subagent.
+pub const ORACLE_SUBAGENT: BuiltinSubagent = BuiltinSubagent {
+    name: "oracle",
+    description: "Deep-analysis advisor — consult when stuck, debugging a complex issue, or weighing approaches.",
+    tools_template: "Read-only \u{2014} has access to: \
+         ${{ tools.by_kind.read }}, ${{ tools.by_kind.list }}, \
+         ${{ tools.by_kind.search }}. Makes no edits; returns a recommendation.",
+    prompt_template: ORACLE_PROMPT,
+};
+
+/// Prompt body for the **xdotcom** subagent.
+///
+/// An X.com (Twitter) content and engagement specialist with full tool access.
+pub const XDOTCOM_PROMPT: &str = "\
+You are an X.com (Twitter) content and engagement specialist. You help with drafting, optimizing, \
+and managing X/Twitter presence.
+
+Strengths:
+- Drafting and optimizing posts, threads, and replies for maximum engagement
+- Analyzing X/Twitter trends, hashtags, and conversation patterns
+- Researching topics and finding relevant content to share
+- Managing X/Twitter content strategy and scheduling
+- Understanding X.com platform dynamics, algorithm, and best practices
+
+Guidelines:\
+${%- if tools.by_kind.web_search and tools.by_kind.web_fetch %}
+- Use ${{ tools.by_kind.web_search }} and ${{ tools.by_kind.web_fetch }} to research trends, \
+news, and relevant context before creating content.\
+${%- endif %}
+${%- if tools.by_kind.search and tools.by_kind.list %}
+- Use ${{ tools.by_kind.search }} or ${{ tools.by_kind.list }} to find existing content and \
+reference materials in the workspace.\
+${%- endif %}
+${%- if tools.by_kind.edit %}
+- Create and edit files to store drafts, content calendars, and research notes.\
+${%- endif %}
+- Always consider the audience, tone, and platform context when crafting content.
+- Optimize for readability: short paragraphs, clear hooks, and compelling calls to action.
+- Respect character limits and X.com's content policies.
+
+Workspace boundary:
+- Default scope is the workspace in <user_info>. Stay within it unless told otherwise.";
+
+/// The **xdotcom** built-in subagent.
+pub const XDOTCOM_SUBAGENT: BuiltinSubagent = BuiltinSubagent {
+    name: "xdotcom",
+    description: "X.com (Twitter) content and engagement specialist \u{2014} draft posts, analyze trends, research topics.",
+    tools_template: "Has access to all tools: \
+         ${{ tools.by_kind.execute }}, ${{ tools.by_kind.read }}, ${{ tools.by_kind.edit }}, \
+         ${{ tools.by_kind.list }}, ${{ tools.by_kind.search }}, ${{ tools.by_kind.web_search }}, \
+         and ${{ tools.by_kind.plan }}.",
+    prompt_template: XDOTCOM_PROMPT,
+};
+
 /// The built-in subagent types advertised to the model, in display order.
-pub const BUILTIN_SUBAGENTS: [BuiltinSubagent; 3] =
-    [GENERAL_PURPOSE_SUBAGENT, EXPLORE_SUBAGENT, PLAN_SUBAGENT];
+pub const BUILTIN_SUBAGENTS: [BuiltinSubagent; 5] = [
+    GENERAL_PURPOSE_SUBAGENT,
+    EXPLORE_SUBAGENT,
+    PLAN_SUBAGENT,
+    ORACLE_SUBAGENT,
+    XDOTCOM_SUBAGENT,
+];
 
 /// Look up a built-in subagent by its `subagent_type` name
 /// (e.g. `"explore"`), or `None` for user-defined / unknown types.
@@ -858,6 +1038,20 @@ pub fn build_task_description(subagents: &[SubagentDescriptor], naming: &TaskToo
         isolation_param,
     } = *naming;
 
+    // Oracle guidance is only meaningful when the roster actually ships an
+    // `oracle` agent (design-oracle.md Layer A + user-named compliance).
+    let oracle_section = if subagents.iter().any(|s| s.name == "oracle") {
+        format!(
+            "\n\n\
+             Consulting the oracle:\n\
+             - The **oracle** is a read-only deep-analysis advisor. Consult it when the same failure persists across your own repeated fix attempts, when the root cause is unclear, when weighing architecture or risky-change trade-offs, before large refactors or deletions, or when the user asks you to rethink, double-check, or review your approach — don't keep grinding alone on a problem that needs deeper analysis.\n\
+             - If the user explicitly asks for the oracle (e.g. \"use oracle\", \"ask the oracle\", \"spawn oracle on ...\"), you MUST spawn it with {subagent_type_param}=\"oracle\" right away instead of answering alone.\n\
+             - The oracle makes no edits: execute its Recommendation yourself, then run the checks from its Verification Handoff."
+        )
+    } else {
+        String::new()
+    };
+
     let out = format!(
         "Start a subagent that works on a task independently and reports back.\n\n\
          Agent types:\n\n\
@@ -866,7 +1060,8 @@ pub fn build_task_description(subagents: &[SubagentDescriptor], naming: &TaskToo
          - When the agent is done, it returns a single message with its agent ID. Use that ID to resume the agent later for follow-up work.\n\
          - {run_in_background_param}: Returns immediately with a subagent_id. Use {background_retrieval_tool} to retrieve results. This is set to true by default.\n\
          - Subagents receive a compacted version of project instructions (AGENTS.md). If the task requires detailed conventions (e.g., build rules, testing patterns), include the relevant rules directly in the prompt.\n\
-         - When using the {task_tool} tool, you must specify a {subagent_type_param} parameter to select which agent type to use.\n\n\
+         - Brief the subagent like a colleague who just walked into the room: state the goal, what you've already tried, and hand over exact file paths and line numbers — don't delegate understanding. Once a subagent owns a scope, let it finish; don't redo its searches in parallel.\n\
+         - When using the {task_tool} tool, you must specify a {subagent_type_param} parameter to select which agent type to use.{oracle_section}\n\n\
          Resuming a previous agent (resume_from):\n\
          - Use {resume_from_param} to continue a previously completed subagent's conversation. Pass the subagent_id returned by a prior {task_tool} call. A resumed agent keeps its full transcript and tool state, so you only need to describe what changed since the last run — don't re-explain the original task.\n\
          - The resumed agent must use the same subagent_type as the source.\n\n\
@@ -1063,6 +1258,29 @@ pub fn build_wait_tasks_description(naming: &WaitTasksToolNaming) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn subagent_reasoning_effort_parses_and_serializes_canonical_values() {
+        for (token, expected) in [
+            ("none", SubagentReasoningEffort::None),
+            ("minimal", SubagentReasoningEffort::Minimal),
+            ("low", SubagentReasoningEffort::Low),
+            ("medium", SubagentReasoningEffort::Medium),
+            ("high", SubagentReasoningEffort::High),
+            ("xhigh", SubagentReasoningEffort::Xhigh),
+            ("max", SubagentReasoningEffort::Max),
+            ("ultra", SubagentReasoningEffort::Ultra),
+        ] {
+            assert_eq!(token.parse(), Ok(expected));
+            assert_eq!(expected.as_str(), token);
+            assert_eq!(serde_json::to_value(expected).unwrap(), token);
+            assert_eq!(
+                serde_json::from_value::<SubagentReasoningEffort>(token.into()).unwrap(),
+                expected
+            );
+        }
+        assert!("highest".parse::<SubagentReasoningEffort>().is_err());
+    }
+
     fn result_with_status(status: &str) -> TaskOutputOutput {
         TaskOutputOutput::Result(TaskOutputResult {
             task_id: "t".into(),
@@ -1225,7 +1443,7 @@ mod tests {
     fn builtin_subagent_catalog_names_and_descriptor_conversion() {
         assert_eq!(
             BUILTIN_SUBAGENTS.map(|b| b.name),
-            ["general-purpose", "explore", "plan"]
+            ["general-purpose", "explore", "plan", "oracle", "xdotcom"]
         );
 
         let desc = EXPLORE_SUBAGENT.to_descriptor(&plain_tool_naming());
@@ -1241,6 +1459,57 @@ mod tests {
         // Descriptions must be single-spaced (line-continuation whitespace is
         // stripped), so they read as one clean paragraph in the tool listing.
         assert!(!GENERAL_PURPOSE_SUBAGENT.description.contains("  "));
+    }
+
+    #[test]
+    fn oracle_prompt_has_structured_analysis_and_verification_contract() {
+        let headings = [
+            "### Findings",
+            "### Evidence",
+            "### Alternatives",
+            "### Risks and Unknowns",
+            "### Verification Handoff",
+            "### Confidence",
+            "### Recommendation",
+        ];
+        let mut previous = 0;
+        for heading in headings {
+            let index = ORACLE_PROMPT
+                .find(heading)
+                .unwrap_or_else(|| panic!("missing Oracle heading: {heading}"));
+            assert!(index >= previous, "Oracle headings must remain ordered");
+            previous = index;
+        }
+        assert!(ORACLE_PROMPT.contains("do not claim you ran them"));
+        assert!(ORACLE_PROMPT.contains("Never keep searching merely to appear thorough"));
+        assert!(ORACLE_PROMPT.rfind("### Recommendation").is_some());
+    }
+
+    #[test]
+    fn task_description_includes_oracle_guidance_only_when_rostered() {
+        let descriptor_naming = plain_tool_naming();
+        let naming = literal_naming();
+        let roster: Vec<SubagentDescriptor> = BUILTIN_SUBAGENTS
+            .iter()
+            .map(|b| b.to_descriptor(&descriptor_naming))
+            .collect();
+        let desc = build_task_description(&roster, &naming);
+        assert!(desc.contains("Consulting the oracle:"), "{desc}");
+        // User-named compliance: the parent must spawn, not answer alone.
+        assert!(desc.contains("you MUST spawn it"), "{desc}");
+        // Layer-A self-awareness triggers.
+        assert!(desc.contains("same failure persists"), "{desc}");
+        assert!(desc.contains("review your approach"), "{desc}");
+        assert!(desc.contains("Verification Handoff"), "{desc}");
+        // Briefing craft (phistory absorption): no delegated understanding.
+        assert!(desc.contains("don't delegate understanding"), "{desc}");
+
+        // Without an oracle in the roster the section must disappear (other
+        // products sharing this builder may not ship one).
+        let no_oracle: Vec<SubagentDescriptor> =
+            roster.into_iter().filter(|d| d.name != "oracle").collect();
+        let desc = build_task_description(&no_oracle, &naming);
+        assert!(!desc.contains("Consulting the oracle:"), "{desc}");
     }
 
     #[test]

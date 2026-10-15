@@ -102,6 +102,23 @@ Switch models. Accepts a model ID or display name (case-insensitive), and for re
 /model Reasoning X high
 ```
 
+A normal switch keeps the portable transcript (user messages, visible assistant answers, and local tool results). Provider-specific reasoning signatures and native backend-tool continuation state are replayed only to the model that produced them. If a provider still rejects stale continuation state, Grok Build automatically retries once with the portable transcript and shows that recovery in the retry status.
+
+You do not need to compact before every switch. Before the next model call, Grok Build checks the transcript against the target model's context window and can auto-compact when required. When the existing context is already about 85% of the target window, the TUI adds a capacity warning; run `/compact <what to preserve>` first only when you want to guide the summary yourself.
+
+### `/scoped-models`
+
+Manage the **scoped shortlist** used by **Alt+]** / **Alt+[** model cycling (Pi-style). Soft list only — full picker stays `/model` and Ctrl+M. Persists to `[models].enabled_models`. Aliases: `/scoped`, `/enabled-models`.
+
+```
+/scoped-models
+/scoped-models add grok-*
+/scoped-models set grok-4.5 openrouter/anthropic/*
+/scoped-models clear
+```
+
+See [Models, Providers, Scoped Selection](29-models-providers-and-scoped-selection.md).
+
 ### `/effort <level>`
 
 Set reasoning effort on the **current** model without reselecting it. Levels are `low`, `medium`, `high`, and `xhigh`, and it only applies when the active model supports reasoning effort.
@@ -142,6 +159,14 @@ Toggle vim-style scrollback keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, and so on)
 ### `/minimal` and `/fullscreen`
 
 Reopen the current session in the other render mode. `/minimal` (offered while you're in fullscreen) switches to the experimental scrollback-native mode; `/fullscreen` (offered while you're in minimal; alias `/full`) switches back to the standard alt-screen TUI. Both relaunch the pager on the same conversation for this session only — they don't touch `config.toml`, and the relaunch banner reminds you how to switch back. The `--minimal` / `--fullscreen` CLI flags are session-scoped the same way. To make plain `grok` open in a given mode by default, use `/settings` → **Default screen mode** or set `[ui] screen_mode`.
+
+### `/voice`
+
+Toggle microphone dictation into the prompt composer. This remains speech-to-text only; it does not play spoken responses.
+
+### `/live`
+
+Start or stop an **experimental** full-duplex Codex voice conversation. Press Space to mute and Esc or Ctrl+C to stop, or click the mute/stop controls in the Live footer. The Live assistant can delegate coding work to the current agent and speak the result. It requires `grok login --openai`, regardless of the current coding model. `/live` and `/voice` are mutually exclusive. See [OpenAI Codex — Experimental Live voice](28-openai-codex.md#experimental-live-voice).
 
 ### `/plan`
 
@@ -381,9 +406,27 @@ Create, edit, and delete personas. A subagent can apply a persona to shape how i
 
 Log in or re-authenticate without leaving the session.
 
+```text
+/login                 # default interactive method (often Grok / SpaceXAI)
+/login openai          # ChatGPT Codex OAuth (also: codex, openai-codex, chatgpt)
+/login kimi            # Kimi Code device OAuth
+```
+
+On Hyper, first launch does **not** force Grok OAuth — use `/login` when you choose. See [Authentication](02-authentication.md) and [OpenAI Codex](28-openai-codex.md).
+
+### `/providers`
+
+List, set, or clear BYOK platform API keys (OpenRouter, Anthropic, OpenAI API, Ollama, …):
+
+```text
+/providers
+/providers openrouter sk-or-...
+/providers clear anthropic
+```
+
 ### `/logout`
 
-Log out and return to the login screen.
+Log out and return to the login screen. Use flags / subcommands for third-party scopes (`--openai`, `--kimi`, `--all`, or `/logout provider <platform>`).
 
 ### `/usage`
 

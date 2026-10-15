@@ -13,6 +13,24 @@ pub(super) const LEGACY_SCOPE: &str = "https://accounts.x.ai/sign-in";
 /// auth.json scope key for plain API key auth (desktop login, `grok login --api-key`).
 pub const API_KEY_SCOPE: &str = "xai::api_key";
 
+/// auth.json scope key for the Kimi Code subscription OAuth session.
+pub const KIMI_CODE_OAUTH_SCOPE: &str = "oauth/kimi-code";
+
+/// auth.json scope key for the OpenAI Codex (ChatGPT) subscription OAuth session.
+pub const OPENAI_CODEX_OAUTH_SCOPE: &str = "oauth/openai-codex";
+
+/// auth.json scope key for the Anthropic Claude (Pro/Max) subscription OAuth session.
+pub const ANTHROPIC_CLAUDE_OAUTH_SCOPE: &str = "oauth/anthropic-claude";
+
+/// Prefix for third-party platform API keys stored via `/providers` (e.g.
+/// `platform/zai`, `platform/openai`). One scope per platform id.
+pub const PLATFORM_API_KEY_SCOPE_PREFIX: &str = "platform/";
+
+/// Scope key for a registry platform's UI-pasted API key.
+pub fn platform_api_key_scope(platform: &str) -> String {
+    format!("{PLATFORM_API_KEY_SCOPE_PREFIX}{platform}")
+}
+
 const BLOCKED_REASON_NO_LOGS: &str = "BLOCKED_REASON_NO_LOGS";
 const BLOCKED_REASON_NO_LOGS_MODERATED: &str = "BLOCKED_REASON_NO_LOGS_MODERATED";
 
@@ -37,6 +55,16 @@ pub enum AuthMode {
     External,
     /// Plain API key (e.g. from grok-desktop login or `grok login --api-key`)
     ApiKey,
+    /// Kimi Code subscription (device OAuth). Stored under
+    /// [`crate::auth::kimi::KIMI_CODE_OAUTH_SCOPE`]; not an xAI session.
+    KimiCode,
+    /// OpenAI Codex subscription (ChatGPT OAuth). Stored under
+    /// [`crate::auth::openai_codex::OPENAI_CODEX_OAUTH_SCOPE`]; not an xAI session.
+    OpenAiCodex,
+    /// Anthropic Claude subscription (Pro/Max OAuth). Stored under
+    /// [`ANTHROPIC_CLAUDE_OAUTH_SCOPE`]; not an xAI session. Inference uses a
+    /// Bearer token + `anthropic-beta: oauth-2025-04-20` against Anthropic Messages.
+    AnthropicClaude,
 }
 
 /// Wire value of `principal_type` for team OAuth principals (capitalized by
@@ -104,6 +132,18 @@ pub struct GrokAuth {
     /// OIDC client_id used to obtain this token (needed for refresh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_client_id: Option<String>,
+
+    /// Provider-side account id (OpenAI Codex: `chatgpt_account_id` from the
+    /// access-token JWT). Sent back as the `chatgpt-account-id` header on
+    /// every ChatGPT backend request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+
+    /// Per-account gateway base URL for BYOK platforms whose endpoint is
+    /// self-hosted (Nexus). Set by `/providers <platform> <key> [base_url]`.
+    /// The bare gateway root; per-backend bases are derived at request time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_base_url: Option<String>,
 }
 
 impl std::fmt::Debug for GrokAuth {
@@ -146,7 +186,11 @@ impl GrokAuth {
                 .oidc_issuer
                 .as_deref()
                 .is_some_and(is_xai_oauth2_issuer),
-            AuthMode::ApiKey | AuthMode::WebLogin => false,
+            AuthMode::ApiKey
+            | AuthMode::WebLogin
+            | AuthMode::KimiCode
+            | AuthMode::OpenAiCodex
+            | AuthMode::AnthropicClaude => false,
         }
     }
 
@@ -165,7 +209,13 @@ impl GrokAuth {
         match self.auth_mode {
             AuthMode::WebLogin | AuthMode::Oidc => true,
             AuthMode::External => self.is_xai_auth(),
-            AuthMode::ApiKey => false,
+            // Kimi Code / Codex / Claude are third-party sessions for their own
+            // models only; they must not unlock xAI `supported_in_api: false`
+            // catalog entries.
+            AuthMode::ApiKey
+            | AuthMode::KimiCode
+            | AuthMode::OpenAiCodex
+            | AuthMode::AnthropicClaude => false,
         }
     }
 
@@ -203,6 +253,7 @@ impl GrokAuth {
         self.user_blocked_reason = prev.user_blocked_reason.clone();
         self.team_blocked_reasons = prev.team_blocked_reasons.clone();
         self.coding_data_retention_opt_out = prev.coding_data_retention_opt_out;
+        self.account_id = prev.account_id.clone();
     }
 }
 
@@ -233,6 +284,8 @@ impl Default for GrokAuth {
             expires_at: None,
             oidc_issuer: None,
             oidc_client_id: None,
+            account_id: None,
+            platform_base_url: None,
         }
     }
 }
@@ -386,6 +439,8 @@ mod tests {
             expires_at: None,
             oidc_issuer: None,
             oidc_client_id: None,
+            account_id: None,
+            platform_base_url: None,
         }
     }
 

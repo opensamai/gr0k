@@ -488,6 +488,8 @@ async fn build_auth(
         expires_at: tokens.expires_in.map(|s| now + Duration::seconds(s)),
         oidc_issuer: Some(issuer.to_owned()),
         oidc_client_id: Some(client_id.to_owned()),
+        account_id: None,
+        platform_base_url: None,
     };
 
     auth_manager.enrich_auth_inline(&mut auth).await;
@@ -597,7 +599,7 @@ pub(crate) mod tests {
     /// jsonwebtoken needs a process-level CryptoProvider; tests that encode
     /// JWTs can't rely on another test having installed it first.
     fn ensure_crypto_provider() {
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
     }
 
     #[test]

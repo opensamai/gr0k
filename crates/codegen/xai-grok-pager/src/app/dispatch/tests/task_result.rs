@@ -1040,6 +1040,84 @@ fn switch_model_complete_success_updates_model_and_pushes_message() {
 }
 
 #[test]
+fn switch_model_complete_warns_when_context_nears_target_window() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_id = acp::ModelId::new(std::sync::Arc::from("small-model"));
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.current = Some(acp::ModelId::new("old-model"));
+    agent.session.models.available.insert(
+        model_id.clone(),
+        acp::ModelInfo::new(model_id.clone(), "Small Model".to_string()).meta(
+            serde_json::json!({ "totalContextTokens": 100_000 })
+                .as_object()
+                .cloned(),
+        ),
+    );
+    agent.context_state = Some(xai_grok_shell::session::ContextInfo::from_notification(
+        90_000, 200_000,
+    ));
+    agent.session.model_switch_pending = true;
+    let initial_scrollback = agent.scrollback.len();
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_id.clone(),
+            effort: None,
+            result: Ok(()),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    let agent = &app.agents[&id];
+    assert_eq!(agent.scrollback.len(), initial_scrollback + 2);
+    let RenderBlock::System(hint) = &agent.scrollback.last().unwrap().block else {
+        panic!("expected model-switch context hint");
+    };
+    assert!(hint.text.contains("90%"));
+    assert!(hint.text.contains("`/compact`"));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::PersistPreferredModel { model_id: persisted, .. }]
+            if persisted == &model_id
+    ));
+}
+
+#[test]
+fn switch_model_complete_never_persists_codex_as_grok_default() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_id = acp::ModelId::new(std::sync::Arc::from("codex:gpt-5.5"));
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.models.available.insert(
+        model_id.clone(),
+        acp::ModelInfo::new(model_id.clone(), "Codex - GPT-5.5".to_string()),
+    );
+    agent.session.model_switch_pending = true;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SwitchModelComplete {
+            agent_id: id,
+            model_id: model_id.clone(),
+            effort: None,
+            result: Ok(()),
+            prev_model_id: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(app.agents[&id].session.models.current, Some(model_id));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistPreferredModel { .. })),
+        "a completed Codex switch must not persist codex:* into xAI config"
+    );
+}
+
+#[test]
 fn switch_model_complete_skips_message_and_persist_when_unchanged() {
     let mut app = test_app_with_agent();
     let id = AgentId(0);
@@ -2180,6 +2258,7 @@ fn verify_check_failure_promotes_pending_gate() {
 /// must never promote a deferred gate: only the deferral's own
 /// generation-scoped check or timeout may (a superseded or unrelated check
 /// failing is not evidence about the current verification).
+#[cfg(not(feature = "community-build"))]
 #[test]
 fn check_subscription_complete_failure_leaves_pending_gate_untouched() {
     let mut app = test_app();

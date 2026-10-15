@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use xai_grok_sampling_types::{
-    ConversationRequest, ConversationResponse, EmptyResponseContext, SamplingError,
-    error::Result as SamplingResult,
+    ConversationItem, ConversationRequest, ConversationResponse, EmptyResponseContext,
+    ReasoningModelIdentity, SamplingError, error::Result as SamplingResult,
 };
 
 use crate::client::{ApiBackend, SamplingClient};
@@ -372,6 +372,30 @@ async fn apply_retry_decision(
                 false
             }
         }
+        RetryDecision::RetryWithModelBoundStateStrip => {
+            let stripped = request.strip_model_bound_state();
+            if stripped == 0 {
+                // The classifier matched but the request contains no removable
+                // continuation state. Repeating the same payload cannot help.
+                emit_failed(event_tx, request_id, err);
+                send_completion(completion_tx, Err(clone_error(err)));
+                return false;
+            }
+            *retry_count += 1;
+            tracing::warn!(
+                stripped,
+                model = %config.model,
+                "model-bound history rejected; retrying with portable transcript"
+            );
+            emit_retrying(
+                event_tx,
+                request_id,
+                *retry_count,
+                max_retries.max(*retry_count),
+                err,
+            );
+            true
+        }
         RetryDecision::RetryWithImageStrip => {
             let stripped = request.strip_images();
             if stripped == 0 {
@@ -472,7 +496,7 @@ async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -
 #[allow(clippy::too_many_arguments)]
 async fn run_one_attempt(
     client: &SamplingClient,
-    request: ConversationRequest,
+    mut request: ConversationRequest,
     request_id: RequestId,
     idle_timeout: Duration,
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
@@ -480,6 +504,11 @@ async fn run_one_attempt(
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     output_observed: Arc<AtomicBool>,
 ) -> AttemptOutcome {
+    if let Err(error) = client.apply_conversation_defaults(&mut request) {
+        return AttemptOutcome::InitFailed { error };
+    }
+    let reasoning_model_identity = request.reasoning_model_identity.clone();
+
     match client.api_backend() {
         ApiBackend::ChatCompletions => {
             let (raw, metadata) = match client.conversation_stream(request).await {
@@ -494,6 +523,7 @@ async fn run_one_attempt(
                 event_tx,
                 cancel_token,
                 captured,
+                reasoning_model_identity,
                 None,
                 output_observed,
             )
@@ -525,6 +555,7 @@ async fn run_one_attempt(
                 event_tx,
                 cancel_token,
                 captured,
+                reasoning_model_identity,
                 doom_check,
                 output_observed,
             )
@@ -543,6 +574,7 @@ async fn run_one_attempt(
                 event_tx,
                 cancel_token,
                 captured,
+                reasoning_model_identity,
                 None,
                 output_observed,
             )
@@ -593,6 +625,7 @@ async fn drive_l2(
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     cancel_token: &CancellationToken,
     captured: ErrorCell,
+    reasoning_model_identity: Option<ReasoningModelIdentity>,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     output_observed: Arc<AtomicBool>,
 ) -> AttemptOutcome {
@@ -604,7 +637,12 @@ async fn drive_l2(
                 return AttemptOutcome::Cancelled;
             }
             next = l2.next() => match next {
-                Some(SamplingEvent::Completed { response, metrics, .. }) => {
+                Some(SamplingEvent::Completed { mut response, metrics, .. }) => {
+                    for item in &mut response.items {
+                        if let ConversationItem::Assistant(assistant) = item {
+                            assistant.reasoning_model_identity = reasoning_model_identity.clone();
+                        }
+                    }
                     output_observed.store(true, Ordering::Relaxed);
                     // Doom outranks the truncation/empty classes: a confident
                     // loop poisons the attempt whatever else it looks like.
@@ -797,12 +835,18 @@ fn emit_retrying(
     err: &SamplingError,
 ) {
     let info = SamplingErrorInfo::from(err);
+    let reason = if err.is_model_bound_history_error() {
+        "Model-specific reasoning history was incompatible; retrying with portable context."
+            .to_string()
+    } else {
+        err.to_string()
+    };
     let _ = event_tx.send(SamplingEvent::Retrying {
         request_id: request_id.clone(),
         attempt,
         max_retries,
         kind: info.kind,
-        reason: err.to_string(),
+        reason,
         doom_loop_triggers: info.doom_loop_triggers,
         doom_loop_aborted_at_chunk: info.doom_loop_aborted_at_chunk,
     });
@@ -996,6 +1040,86 @@ mod tests {
             Some(SamplingEvent::Failed { .. })
         ));
         assert!(completion_rx.await.expect("completion sent").is_err());
+    }
+
+    #[tokio::test]
+    async fn model_bound_recovery_strips_state_once_and_surfaces_portable_retry() {
+        use reqwest::StatusCode;
+        use xai_grok_sampling_types::{ConversationItem, synthesized_reasoning_item};
+
+        let cancel_token = CancellationToken::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (completion_tx, _completion_rx) = oneshot::channel();
+        let mut completion_tx = Some(completion_tx);
+        let mut retry_count = 0;
+        let mut request = ConversationRequest::from_items(vec![
+            ConversationItem::user("question"),
+            ConversationItem::Reasoning(synthesized_reasoning_item("private state")),
+            ConversationItem::assistant_with_model("portable answer", "old-model"),
+        ]);
+        let config = SamplerConfig {
+            base_url: "http://localhost".into(),
+            model: "new-model".into(),
+            ..Default::default()
+        };
+        let mut client = SamplingClient::new(config.clone()).expect("test client");
+        let error = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "Could not decrypt the provided encrypted_content".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: Some(false),
+        };
+
+        let should_continue = apply_retry_decision(
+            &error,
+            &mut retry_count,
+            0,
+            &RetryPolicy::default(),
+            &event_tx,
+            &RequestId::from("model-bound-recovery"),
+            &mut request,
+            &mut client,
+            &config,
+            &cancel_token,
+            &mut completion_tx,
+        )
+        .await;
+
+        assert!(
+            should_continue,
+            "portable recovery gets one retry even when transport retries are disabled"
+        );
+        assert_eq!(retry_count, 1);
+        assert!(request.items.iter().all(|item| !matches!(
+            item,
+            ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_)
+        )));
+        assert!(request.items.iter().any(|item| matches!(
+            item,
+            ConversationItem::Assistant(assistant)
+                if assistant.content.as_ref() == "portable answer"
+        )));
+        match event_rx.recv().await {
+            Some(SamplingEvent::Retrying {
+                attempt,
+                max_retries,
+                reason,
+                ..
+            }) => {
+                assert_eq!(attempt, 1);
+                assert_eq!(max_retries, 1);
+                assert_eq!(
+                    reason,
+                    "Model-specific reasoning history was incompatible; retrying with portable context."
+                );
+            }
+            other => panic!("expected portable-context retry event, got {other:?}"),
+        }
+        assert!(
+            completion_tx.is_some(),
+            "retry must not complete the request"
+        );
     }
 
     #[tokio::test]

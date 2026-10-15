@@ -30,11 +30,18 @@ impl crate::auth::refresh::TokenRefresher for AlwaysSucceedRefresher {
 /// `(tempdir, manager)` with an expired OIDC token loaded so
 /// `unauthorized_recovery()` actually dispatches to the refresher.
 /// Tempdir must outlive the manager (auth.json path).
+///
+/// Use the env-independent test constructor: temporarily unsetting
+/// `GROK_AUTH` / `GROK_AUTH_PATH` here would clobber another parallel test's
+/// fixture and could make it read the developer's real credential file.
 fn auth_manager_with_refresher(
     refresher: Arc<dyn crate::auth::refresh::TokenRefresher>,
 ) -> (tempfile::TempDir, Arc<AuthManager>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let am = Arc::new(AuthManager::new_test_isolated(
+        dir.path(),
+        GrokComConfig::default(),
+    ));
     am.hot_swap(GrokAuth {
         key: "initial-test-key".into(),
         auth_mode: AuthMode::Oidc,
@@ -119,9 +126,15 @@ async fn make_actor_with_method_and_credentials(
 
 /// `(tempdir, manager)` holding a valid OIDC token (so `get_valid_token()` is a
 /// cache hit). The tempdir must outlive the manager (auth.json path).
+///
+/// See [`auth_manager_with_refresher`] for why this bypasses process-global
+/// auth environment variables.
 fn auth_manager_with_valid_token(key: &str) -> (tempfile::TempDir, Arc<AuthManager>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    let am = Arc::new(AuthManager::new_test_isolated(
+        dir.path(),
+        GrokComConfig::default(),
+    ));
     am.hot_swap(GrokAuth {
         key: key.into(),
         auth_mode: AuthMode::Oidc,
@@ -327,8 +340,21 @@ async fn pre_flight_refreshes_hard_expired_session_token() {
 /// Hard-expired + failed refresh: do not fall through to JWT/config.toml;
 /// strip the chat-state seed so default headers cannot carry a dead AT.
 #[tokio::test(flavor = "current_thread")]
-#[serial_test::serial(attribution_emit_count)]
+#[serial_test::serial]
 async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
+    // Unset BYOK platform API-key env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+    // …): `model_auth_facts` consults the live catalog, whose built-in
+    // platform entries carry `env_key` for the platform's API-key name. A
+    // developer shell with one of these set flips the model's BYOK status to
+    // `Byok`, deactivating the `SessionTokenAuthGate` and steering
+    // `refresh_token_if_expired` away from `get_valid_token` (the path that
+    // invokes the refresher this test asserts against). Without this guard
+    // the pre-flight never calls the refresher and `call_count` stays at 0.
+    //
+    // `#[serial]` (default group) so this env mutation is ordered against the
+    // cli_models / enterprise_byok / mvp_agent / config tests that set
+    // GROK_AUTH / GROK_AUTH_PATH and would otherwise race this test's reads.
+    let _byok = xai_grok_test_support::unset_all_byok_platform_api_key_envs();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -373,6 +399,58 @@ async fn pre_flight_hard_expired_refresh_failure_skips_jwt_fallthrough() {
             assert!(
                 am.permanent_failure().is_none(),
                 "transient refresh failure must not poison permanent_failure"
+            );
+        })
+        .await;
+}
+
+/// Regression: per-turn pre-flight refresh must not fire for a third-party
+/// BYOK platform endpoint even when the BYOK gate misclassifies the model as
+/// `NotByok` (live-only catalog entries are invisible to the offline lookup).
+/// Otherwise the stamped platform key in chat-state credentials is replaced
+/// by the xAI session token before the sampler even builds its config.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn pre_flight_refresh_skips_open_platform_endpoint() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let called = Arc::new(AtomicBool::new(false));
+            let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
+                Arc::new(AlwaysSucceedRefresher {
+                    called: called.clone(),
+                });
+            let (_dir, am) = auth_manager_with_refresher(refresher);
+            // Session-based method (cached_token) — the shape that activates
+            // the session gate for a `NotByok` classification.
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::ApiKey,
+                "ollama-platform-key".to_string(),
+            )
+            .await;
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.base_url = "https://ollama.com/v1".into();
+                cfg.model = "ollama-live-only-model-not-in-offline-catalog".into();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+
+            actor.refresh_token_if_expired().await;
+
+            assert!(
+                !called.load(Ordering::SeqCst),
+                "pre-flight session refresh must NOT fire for an open-platform endpoint"
+            );
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_credentials()
+                    .await
+                    .api_key
+                    .as_deref(),
+                Some("ollama-platform-key"),
+                "stamped platform key must not be overwritten by the session token"
             );
         })
         .await;
@@ -749,6 +827,7 @@ fn session_token_auth_gate_truth_table() {
 /// Pre-fix, the gate read `auth_type` and skipped recovery here, 401'ing every
 /// turn until restart.
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn sampler_401_session_method_with_stale_api_key_auth_type_still_recovers() {
     let local = tokio::task::LocalSet::new();
     local
@@ -783,6 +862,7 @@ async fn sampler_401_session_method_with_stale_api_key_auth_type_still_recovers(
 
 /// Same regression via the `oidc` method id (the other session-based variant).
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn sampler_401_oidc_method_with_stale_api_key_auth_type_still_recovers() {
     let local = tokio::task::LocalSet::new();
     local
@@ -810,6 +890,259 @@ async fn sampler_401_oidc_method_with_stale_api_key_auth_type_still_recovers() {
             assert!(
                 called.load(Ordering::SeqCst),
                 "the OIDC refresher must be invoked"
+            );
+        })
+        .await;
+}
+
+/// Regression: when the active model routes to the ChatGPT Codex backend,
+/// `reconstruct_full_config` must wire the OpenAI Codex bearer resolver even
+/// if the ACP session method is still `cached_token` / OIDC. Preferring the
+/// xAI AuthManager resolver previously sent the session JWT to
+/// `chatgpt.com/backend-api/codex/responses` → 401 "Could not parse your
+/// authentication token" with a false "auth recovery succeeded" loop.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn reconstruct_full_config_prefers_codex_resolver_over_session_auth_manager() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let auth_path = dir.path().join("auth.json");
+            let _guard =
+                xai_grok_test_support::EnvGuard::set("GROK_AUTH_PATH", auth_path.to_str().unwrap());
+            // Minimal valid Codex JWT payload with chatgpt_account_id claim.
+            use base64::Engine as _;
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-test"}}"#);
+            let access = format!("hdr.{payload}.sig");
+            let auth = crate::auth::GrokAuth {
+                key: access.clone(),
+                auth_mode: crate::auth::AuthMode::OpenAiCodex,
+                account_id: Some("acct-test".into()),
+                refresh_token: Some("rt".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                ..crate::auth::GrokAuth::test_default()
+            };
+            crate::auth::store_openai_codex_auth(dir.path(), &auth).unwrap();
+
+            let (_am_dir, am) = auth_manager_with_valid_token("xai-session-jwt");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::SessionToken,
+                "xai-session-jwt".to_string(),
+            )
+            .await;
+
+            // Point the session sampling config at the Codex backend.
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.base_url = "https://chatgpt.com/backend-api/codex".into();
+                cfg.model = "gpt-5.6-sol".into();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+
+            let cfg = actor.reconstruct_full_config().await;
+            assert!(
+                cfg.bearer_resolver.is_some(),
+                "openai-codex base_url must install a live bearer resolver"
+            );
+            assert!(
+                cfg.api_key.is_none(),
+                "resolver-backed Codex auth must not stamp an eager access token"
+            );
+            // The live resolver must surface the Codex bearer (not AuthManager).
+            // Keep this as a boolean assertion so a parallel-test regression
+            // can never print a developer credential into the test log.
+            let live = cfg
+                .bearer_resolver
+                .as_ref()
+                .and_then(|r| r.current_bearer());
+            assert!(
+                live.as_deref() == Some(access.as_str()),
+                "live resolver returned the wrong credential source"
+            );
+            assert!(
+                cfg.responses_codex_dialect,
+                "Codex dialect flag must be set for the chatgpt backend"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn reconstruct_full_config_uses_catalog_platform_on_shared_oauth_proxy() {
+    let proxy = "https://oauth-proxy.example.test/v1";
+    let _kimi_base =
+        xai_grok_test_support::EnvGuard::set(xai_grok_models::KIMI_CODE_BASE_URL_ENV, proxy);
+    let _codex_base = xai_grok_test_support::EnvGuard::set("GROK_OPENAI_CODEX_BASE_URL", proxy);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for (platform, model, resolver_name) in [
+                (
+                    xai_grok_models::PlatformId::KimiCode,
+                    "kimi-for-coding",
+                    "KimiCodeBearerResolver",
+                ),
+                (
+                    xai_grok_models::PlatformId::OpenAiCodex,
+                    "gpt-5.1-codex",
+                    "OpenAiCodexBearerResolver",
+                ),
+            ] {
+                let (actor, _rx) = make_actor_with_method_and_credentials(
+                    None,
+                    "cached_token",
+                    xai_chat_state::AuthType::SessionToken,
+                    "stale-catalog-token".to_string(),
+                )
+                .await;
+                if let Some(mut sampling) = actor.chat_state_handle.get_sampling_config().await {
+                    sampling.base_url = proxy.to_string();
+                    sampling.model = model.to_string();
+                    actor.chat_state_handle.update_sampling_config(sampling);
+                }
+                actor
+                    .model_auth_memo
+                    .replace(Some(crate::session::acp_session::ModelAuthMemo {
+                        model_id: model.to_string(),
+                        facts: crate::agent::config::ModelAuthFacts {
+                            byok: crate::agent::auth_method::ModelByok::NotByok,
+                            auth_scheme: Default::default(),
+                            oauth_platform: Some(platform),
+                        },
+                        provider: None,
+                    }));
+
+                let config = actor.reconstruct_full_config().await;
+                let resolver = config
+                    .bearer_resolver
+                    .as_ref()
+                    .expect("catalog OAuth platform must install its live resolver");
+                assert!(format!("{resolver:?}").contains(resolver_name));
+                assert!(config.api_key.is_none());
+                assert_eq!(
+                    config.responses_codex_dialect,
+                    platform == xai_grok_models::PlatformId::OpenAiCodex
+                );
+                assert_eq!(
+                    config.kimi_dialect,
+                    platform == xai_grok_models::PlatformId::KimiCode
+                );
+                if platform == xai_grok_models::PlatformId::KimiCode {
+                    assert!(!config.extra_headers.contains_key("OpenAI-Beta"));
+                    assert!(!config.extra_headers.contains_key("originator"));
+                } else {
+                    assert!(config.extra_headers.contains_key("OpenAI-Beta"));
+                    assert!(config.extra_headers.contains_key("originator"));
+                    assert!(!config.extra_headers.contains_key("anthropic-version"));
+                    assert!(!config.extra_headers.contains_key("X-Msh-Device-Id"));
+                }
+            }
+        })
+        .await;
+}
+
+/// Regression: a live-only open-platform model (e.g. `ollama/glm-5.2` from
+/// the platform `/models` sync) is absent from the offline catalog the BYOK
+/// gate consults, so it classifies `NotByok` and the session gate activates.
+/// `reconstruct_full_config` must still keep the xAI session bearer resolver
+/// OFF the third-party endpoint — the stamped platform key in chat-state
+/// credentials is the correct signer. Previously the AuthManager resolver
+/// replaced it and the request went out with the xAI session JWT →
+/// `ollama.com` 401 → false "auth recovery succeeded" loop.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn reconstruct_full_config_no_session_resolver_for_open_platform_endpoint() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let auth_path = dir.path().join("auth.json");
+            let _auth_guard =
+                xai_grok_test_support::EnvGuard::set("GROK_AUTH_PATH", auth_path.to_str().unwrap());
+
+            let (_am_dir, am) = auth_manager_with_valid_token("xai-session-jwt");
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::ApiKey,
+                "ollama-platform-key".to_string(),
+            )
+            .await;
+
+            // Point the session sampling config at the open-platform endpoint.
+            // The slug is deliberately absent from every offline catalog (a
+            // stand-in for live-only entries like `ollama/glm-5.2`), so the
+            // BYOK gate classifies `NotByok` regardless of the dev box's env
+            // — no env mutation needed, which would race parallel tests.
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.base_url = "https://ollama.com/v1".into();
+                cfg.model = "ollama-live-only-model-not-in-offline-catalog".into();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+
+            let cfg = actor.reconstruct_full_config().await;
+            assert!(
+                cfg.bearer_resolver.is_none(),
+                "open-platform endpoint must not wire the xAI session bearer resolver"
+            );
+            assert_eq!(
+                cfg.api_key.as_deref(),
+                Some("ollama-platform-key"),
+                "must sign with the stamped platform key, not the xAI session JWT"
+            );
+        })
+        .await;
+}
+
+/// Regression: a 401 from an open-platform endpoint must NOT run the xAI
+/// session-token recovery. The refresher "succeeds" on the wrong credential
+/// and the retry re-sends it, looping to the misleading "Auth recovery
+/// succeeded but inference request was still rejected (401)" terminal error.
+/// The 401 surfaces directly with the platform's setup hint instead.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn sampler_401_on_open_platform_endpoint_skips_session_recovery() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let called = Arc::new(AtomicBool::new(false));
+            let refresher: Arc<dyn crate::auth::refresh::TokenRefresher> =
+                Arc::new(AlwaysSucceedRefresher {
+                    called: called.clone(),
+                });
+            let (_dir, am) = auth_manager_with_refresher(refresher);
+            let (actor, _rx) = make_actor_with_method_and_credentials(
+                Some(am),
+                "cached_token",
+                xai_chat_state::AuthType::ApiKey,
+                "ollama-platform-key".to_string(),
+            )
+            .await;
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.base_url = "https://ollama.com/v1".into();
+                cfg.model = "ollama-live-only-model-not-in-offline-catalog".into();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+
+            let result = actor.handle_sampling_failure(auth_error()).await;
+
+            let Err(err) = result else {
+                panic!(
+                    "open-platform 401 must surface as a terminal error, not xAI session recovery"
+                );
+            };
+            assert!(
+                !called.load(Ordering::SeqCst),
+                "xAI session refresher must not run for a third-party BYOK endpoint"
+            );
+            let rendered = format!("{err:?}");
+            assert!(
+                rendered.contains("Ollama Cloud"),
+                "terminal error should name the platform setup hint, got: {rendered}"
             );
         })
         .await;
@@ -990,6 +1323,7 @@ async fn model_auth_memo_serves_cached_status_and_keys_on_model() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        oauth_platform: None,
                     },
                     provider: None,
                 }));
@@ -1034,6 +1368,7 @@ async fn reconstruct_full_config_no_bearer_resolver_for_byok_model_on_session_me
                     facts: ModelAuthFacts {
                         byok: ModelByok::Byok,
                         auth_scheme: Default::default(),
+                        oauth_platform: None,
                     },
                     provider: None,
                 }));
@@ -1082,6 +1417,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                     facts: ModelAuthFacts {
                         byok: ModelByok::NotByok,
                         auth_scheme: Default::default(),
+                        oauth_platform: None,
                     },
                     provider: None,
                 }));
@@ -1118,6 +1454,8 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                responses_codex_dialect: false,
+                kimi_dialect: false,
             };
             let _ = actor
                 .handle_set_session_model(cfg, false, false, true, 85)
@@ -1150,6 +1488,7 @@ async fn seed_provider_memo(actor: &Arc<SessionActor>, provider: crate::auth::Au
             facts: crate::agent::config::ModelAuthFacts {
                 byok: crate::agent::auth_method::ModelByok::Byok,
                 auth_scheme: Default::default(),
+                oauth_platform: None,
             },
             provider: Some(provider),
         }));
@@ -1211,6 +1550,8 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                responses_codex_dialect: false,
+                kimi_dialect: false,
             };
             let _ = actor
                 .handle_set_session_model(cfg, false, false, true, 85)

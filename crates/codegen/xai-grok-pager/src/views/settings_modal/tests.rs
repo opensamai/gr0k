@@ -632,6 +632,9 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // SHELL-owned render_mermaid (Appearance,
             // declared after the theme enums).
             "render_mermaid",
+            // SHELL-owned language (Appearance, declared right after
+            // render_mermaid; live-applied via rust_i18n).
+            "language",
             // Int in Appearance category.
             "max_thoughts_width",
             // SHELL-owned show_thinking_blocks (Appearance; live cache).
@@ -2628,6 +2631,7 @@ fn picker_renders_choices_in_order() {
 /// low-contrast theme compatibility (parity with `cancel_turn_panel`).
 #[test]
 fn picker_highlights_current_choice() {
+    let _theme = crate::test_util::pin_theme();
     let mut s = picker_test_state();
     // Focus the second choice (index 1).
     s.transition_to_picking_enum("test_enum", 1, SettingValue::Enum("first"), true);
@@ -6692,6 +6696,18 @@ fn max_thoughts_width_preview_title_styling_distinguishes_from_content() {
         // Resolved via `Theme::current()` rather than a constructor
         // because `theme::oscura` is a private module.
         crate::theme::ThemeKind::OscuraMidnight => crate::theme::Theme::current(),
+        crate::theme::ThemeKind::Everforest => crate::theme::Theme::everforest(),
+        crate::theme::ThemeKind::Nord => crate::theme::Theme::nord(),
+        crate::theme::ThemeKind::Dracula => crate::theme::Theme::dracula(),
+        crate::theme::ThemeKind::Gruvbox => crate::theme::Theme::gruvbox(),
+        crate::theme::ThemeKind::CatppuccinMocha => crate::theme::Theme::catppuccin_mocha(),
+        crate::theme::ThemeKind::SolarizedDark => crate::theme::Theme::solarized_dark(),
+        crate::theme::ThemeKind::DeepOcean => crate::theme::Theme::deep_ocean(),
+        crate::theme::ThemeKind::Ember => crate::theme::Theme::ember(),
+        crate::theme::ThemeKind::MidnightOled => crate::theme::Theme::midnight_oled(),
+        crate::theme::ThemeKind::SolarizedLight => crate::theme::Theme::solarized_light(),
+        crate::theme::ThemeKind::CatppuccinLatte => crate::theme::Theme::catppuccin_latte(),
+        crate::theme::ThemeKind::Paper => crate::theme::Theme::paper(),
         crate::theme::ThemeKind::Auto => crate::theme::Theme::groknight(),
     };
     assert_ne!(

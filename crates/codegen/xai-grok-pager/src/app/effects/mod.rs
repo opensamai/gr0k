@@ -62,6 +62,22 @@ pub(crate) fn execute(
             ulog::info("pager quit", None, None);
             return (true, meta);
         }
+        Effect::FetchChanges {
+            agent_id,
+            session_id,
+            post_action,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move { fetch_changes(agent_id, session_id, tx, post_action).await });
+        }
+        Effect::ChangesAction {
+            agent_id,
+            session_id,
+            kind,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move { send_changes_action(agent_id, session_id, kind, tx).await });
+        }
         Effect::SetWorkingDir { path } => {
             if let Err(e) = std::env::set_current_dir(&path) {
                 tracing::warn!(error = %e, "project picker: failed to set_current_dir");
@@ -1517,6 +1533,75 @@ pub(crate) fn execute(
                             .map_err(|e| sanitize_user_error(&e.to_string())),
                     }
                 });
+        }
+        Effect::SetPlatformApiKey {
+            platform,
+            api_key,
+            base_url,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let platform_for_err = platform.clone();
+                let mut params = serde_json::json!({
+                    "platform": platform,
+                    "apiKey": api_key,
+                });
+                // Only send baseUrl when present so the shell keeps env/default.
+                if let Some(base) = base_url {
+                    params["baseUrl"] = serde_json::Value::String(base);
+                }
+                let req = acp::ExtRequest::new(
+                    "x.ai/internal/set_platform_api_key",
+                    serde_json::value::to_raw_value(&params)
+                        .expect("serialize set_platform_api_key params")
+                        .into(),
+                );
+                match acp_send(req, &tx).await {
+                    Ok(resp) => {
+                        let value: serde_json::Value =
+                            serde_json::from_str(resp.0.get()).unwrap_or_default();
+                        // ExtMethodResult wraps under "result" when using that envelope;
+                        // also accept a flat object for resilience.
+                        let body = value.get("result").cloned().unwrap_or(value);
+                        let cleared = body
+                            .get("cleared")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let models_unlocked = body
+                            .get("modelsUnlocked")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let env_still_active = body
+                            .get("envStillActive")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let platform = body
+                            .get("platform")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or(platform_for_err);
+                        TaskResult::SetPlatformApiKeyComplete {
+                            platform,
+                            cleared,
+                            models_unlocked,
+                            env_still_active,
+                            error: None,
+                        }
+                    }
+                    Err(e) => TaskResult::SetPlatformApiKeyComplete {
+                        platform: platform_for_err,
+                        cleared: false,
+                        models_unlocked: 0,
+                        env_still_active: Vec::new(),
+                        error: Some(sanitize_user_error(&e.to_string())),
+                    },
+                }
+            });
         }
         Effect::FetchPromptHistory { agent_id, cwd, session_id } => {
             let tx = acp_tx.clone();

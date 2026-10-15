@@ -85,7 +85,9 @@ pub(super) fn prompt_style(
         accent_color_override: input_mode.accent_color(theme),
         border_color_override: None,
         prefix_override: input_mode.prefix_override(theme),
-        placeholder_override: input_mode.placeholder_override(multiline),
+        placeholder_override: input_mode
+            .placeholder_override(multiline)
+            .map(std::borrow::Cow::Borrowed),
         show_accent_line: false,
         show_borders: false,
         title: None,
@@ -697,10 +699,10 @@ fn minimal_pending_hint(
     if pending.expired() {
         return None;
     }
-    let label = pending.label?;
-    Some(format!(
-        "press {} again to {label}",
-        pending.shortcut.display()
+    let label = pending.label.as_deref()?;
+    Some(xai_grok_pager::i18n::press_again_hint(
+        &pending.shortcut.display(),
+        label,
     ))
 }
 /// Render the one-line double-press confirmation hint under the prompt, in the
@@ -1051,7 +1053,7 @@ mod tests {
         let expired = Some(PendingAction::with_ttl(
             Action::Quit,
             shortcut,
-            Some("quit"),
+            Some(std::borrow::Cow::Borrowed("quit")),
             std::time::Duration::ZERO,
         ));
         assert!(minimal_pending_hint(&expired).is_none());

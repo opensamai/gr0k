@@ -404,6 +404,7 @@ pub(crate) mod chat_rebuild {
                 content: std::sync::Arc::<str>::from(std::mem::take(&mut self.agent_text)),
                 tool_calls: std::mem::take(&mut self.agent_tool_calls),
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             });
@@ -3586,6 +3587,8 @@ mod tests {
                 child_session_id: "ca".into(),
                 status: "cancelled".into(),
                 error: Some("interrupted by process restart".into()),
+                termination_reason: Some("process_restart".into()),
+                usage: None,
                 tool_calls: 0,
                 turns: 0,
                 duration_ms: 0,

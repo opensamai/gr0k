@@ -2,17 +2,23 @@
 
 Grok connects to custom model endpoints for alternative providers, self-hosted models, and overriding built-in settings. This guide explains how to select models, configure endpoints, and integrate third-party providers.
 
+For the **built-in multi-platform catalog**, provider gaps vs Pi, and Pi-style **scoped models** (shortlist + cycle), see [Models, Providers, and Scoped Selection](29-models-providers-and-scoped-selection.md).
+
 ---
 
 ## Default Models
 
-By default, Grok uses models hosted by SpaceXAI, and new sessions start with `grok-4.5`. Default models require no configuration. Authenticate with `grok login` or an API key, then start a session.
+By default, Grok uses models hosted by SpaceXAI, and new sessions start with `grok-4.5`. Default models require no configuration. Authenticate with `hyper login` / an API key / another provider, then start a session.
 
 List all available models:
 
 ```bash
+hyper models
+# or
 grok models
 ```
+
+Many third-party rows only appear after you set a platform key (`/providers …`) or env var, or complete `/login openai` / `/login kimi`.
 
 ---
 
@@ -233,9 +239,30 @@ api_backend = "responses"
 env_key = "OPENAI_API_KEY"
 ```
 
-### Ollama (Local Models)
+### Ollama (Local / Cloud)
 
-Run models locally with [Ollama](https://ollama.ai):
+Run models via [Ollama](https://ollama.ai) — either the cloud service or a local instance.
+
+**Built-in platform (cloud):** Ollama is available as a built-in platform (id: `ollama`),
+defaulting to the Ollama Cloud API at `https://ollama.com/v1`.
+Set `OLLAMA_API_KEY` (or `GROK_OLLAMA_API_KEY`) in your environment:
+
+```bash
+export OLLAMA_API_KEY=your-key
+```
+
+Then select models via `/model ollama/<model-name>`. Once the key resolves,
+the **full Ollama Cloud roster is live-synced** from `GET /v1/models` — the
+offline catalog entries are only a pre-key fallback (shown dimmed in the
+/model picker's All view until then).
+
+**Local override:** Set `GROK_OLLAMA_BASE_URL` to point at your local instance:
+
+```bash
+export GROK_OLLAMA_BASE_URL=http://localhost:11434/v1
+```
+
+**Custom model (alternative):** You can also configure Ollama manually:
 
 ```toml
 [model.ollama-codellama]
@@ -255,6 +282,13 @@ base_url = "https://api.together.xyz/v1"
 name = "Mixtral 8x7B"
 env_key = "TOGETHER_API_KEY"
 ```
+
+### Moonshot / Kimi (built-in platforms)
+
+Moonshot open platforms are first-class: catalog keys like
+`moonshot-cn/kimi-k2-turbo-preview`, env vars `GROK_MOONSHOT_*_API_KEY`, and
+`[platforms.moonshot-cn]` / `[platforms.moonshot-ai]` in config.toml. See
+[Moonshot Providers](25-moonshot-providers.md) for the full guide.
 
 ### Local OpenAI-Compatible Server
 

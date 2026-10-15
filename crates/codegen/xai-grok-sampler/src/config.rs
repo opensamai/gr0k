@@ -131,6 +131,23 @@ pub struct SamplerConfig {
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
+
+    /// ChatGPT Codex backend dialect for Responses API requests. When true
+    /// the client (a) moves the system prompt from `input` items into the
+    /// top-level `instructions` field, (b) stamps `prompt_cache_key` from
+    /// the session id for cache affinity, and (c) defaults `text.verbosity`
+    /// to `low` — mirroring official Pi `openai-codex-responses.ts`.
+    /// `store: false` and `include: ["reasoning.encrypted_content"]` are
+    /// already unconditional sampler defaults.
+    #[serde(default)]
+    pub responses_codex_dialect: bool,
+
+    /// When true, apply Moonshot/Kimi request shaping (`thinking` object,
+    /// fixed-sampling strip, etc.). Must only be set for direct Moonshot /
+    /// Kimi Code platforms — not for Ollama/OpenRouter/Together/Fireworks
+    /// entries that happen to share the same bare model slug.
+    #[serde(default)]
+    pub kimi_dialect: bool,
 }
 
 impl Default for SamplerConfig {
@@ -167,6 +184,34 @@ impl Default for SamplerConfig {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            responses_codex_dialect: false,
+            kimi_dialect: false,
+        }
+    }
+}
+
+/// One authoritative per-request auth resolution.
+///
+/// `headers` are inserted after `remove_headers` are cleared, allowing an
+/// OAuth resolver to atomically align provider-specific headers with the
+/// bearer it just refreshed. This avoids a second credential lookup and also
+/// removes stale construction-time headers when live resolution fails.
+#[derive(Debug, Clone, Default)]
+pub struct BearerResolution {
+    /// Current live token, or `None` when auth cannot be resolved.
+    pub bearer: Option<String>,
+    /// Companion headers derived from the exact same credential.
+    pub headers: reqwest::header::HeaderMap,
+    /// Construction-time headers that must be cleared before applying `headers`.
+    pub remove_headers: Vec<reqwest::header::HeaderName>,
+}
+
+impl BearerResolution {
+    /// Build a token-only resolution for providers without companion headers.
+    pub fn from_bearer(bearer: Option<String>) -> Self {
+        Self {
+            bearer,
+            ..Self::default()
         }
     }
 }
@@ -174,6 +219,12 @@ impl Default for SamplerConfig {
 /// Cheap sync read of the current bearer for [`SamplerConfig::bearer_resolver`].
 pub trait BearerResolver: Send + Sync + std::fmt::Debug {
     fn current_bearer(&self) -> Option<String>;
+
+    /// Resolve the bearer and any provider-specific companion headers once.
+    /// Implementors that only provide a token inherit the legacy behavior.
+    fn resolve_bearer(&self) -> BearerResolution {
+        BearerResolution::from_bearer(self.current_bearer())
+    }
 }
 
 pub type SharedBearerResolver = std::sync::Arc<dyn BearerResolver>;

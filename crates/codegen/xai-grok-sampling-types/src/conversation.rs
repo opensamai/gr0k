@@ -10,13 +10,14 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::rs;
 use crate::tool_overrides::{ToolOverrides, WebSearchOptions, XSearchOptions, drop_empty};
 use crate::types::{
-    ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage, FinishReason,
-    ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition, TraceContext,
-    Usage,
+    ApiBackend, ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage,
+    FinishReason, ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition,
+    TraceContext, Usage,
 };
 
 // ============================================================================
@@ -233,6 +234,44 @@ pub struct UserItem {
     pub prompt_index: Option<usize>,
 }
 
+/// Stable outbound identity for opaque provider continuation state.
+///
+/// The server may echo a canonical snapshot name that differs from the model
+/// token sent by the client. Persist the submitted model plus API shape and a
+/// SHA-256 fingerprint of the effective endpoint, so later turns can verify
+/// exact routing provenance without writing credential-bearing URLs to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningModelIdentity {
+    model: String,
+    api_backend: ApiBackend,
+    endpoint_sha256: String,
+}
+
+impl ReasoningModelIdentity {
+    /// Build an identity while hashing (rather than persisting) the endpoint.
+    pub fn new(model: impl Into<String>, api_backend: ApiBackend, base_url: &str) -> Self {
+        let normalized_base = base_url.trim().trim_end_matches('/');
+        let endpoint_sha256 = format!("{:x}", Sha256::digest(normalized_base.as_bytes()));
+        Self {
+            model: model.into(),
+            api_backend,
+            endpoint_sha256,
+        }
+    }
+}
+
+/// Treat malformed or future-version provenance as absent so a downgrade can
+/// still recover the assistant's portable text and tool calls.
+fn deserialize_reasoning_model_identity_lossy<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReasoningModelIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 /// Assistant response with tool calls.
 ///
 /// Reasoning items, when present, sit beside this item as
@@ -249,9 +288,17 @@ pub struct AssistantItem {
     /// Tool calls made by the assistant (client must execute these locally)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
-    /// The model that generated this response
+    /// The model that generated this response (the server's raw echo).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Outbound model/backend/endpoint identity that produced any preceding
+    /// opaque reasoning siblings. Missing on legacy and synthetic history.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_reasoning_model_identity_lossy"
+    )]
+    pub reasoning_model_identity: Option<ReasoningModelIdentity>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -560,6 +607,10 @@ pub struct ConversationRequest {
     pub tool_choice: Option<ConversationToolChoice>,
     /// Model to use (if not using client default)
     pub model: Option<String>,
+    /// Exact outbound routing identity used to decide whether persisted opaque
+    /// reasoning is safe to replay. This field is internal and never serialized
+    /// into provider request bodies.
+    pub reasoning_model_identity: Option<ReasoningModelIdentity>,
     /// Sampling temperature
     pub temperature: Option<f32>,
     /// Maximum output tokens
@@ -581,8 +632,37 @@ pub struct ConversationRequest {
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     /// JSON Schema for structured output (strict mode).
     pub json_schema: Option<serde_json::Value>,
-    /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
+    /// When `Some(true)`, apply Moonshot/Kimi request shaping. When
+    /// `Some(false)`, never reshape (e.g. Ollama/OpenRouter same-slug models).
+    /// When `None` (default), fall back to bare-model-name detection so unit
+    /// tests of Kimi shaping keep working without a dialect flag.
+    /// Production sets this from [`SamplerConfig::kimi_dialect`].
+    pub kimi_dialect: Option<bool>,
+    /// Sticky routing key for prompt-cache reuse (OpenAI Responses + Chat
+    /// Completions `prompt_cache_key`). Prefer session id; clamped to 64 chars
+    /// on the wire.
     pub prompt_cache_key: Option<String>,
+    /// OpenAI Responses only: `"24h"` / `"long"` or `"in_memory"` / `"short"`.
+    /// Never sent on Codex dialect (rejected by ChatGPT backend). Not used for
+    /// Anthropic Messages — Hyper does not extend Claude-style `cache_control`.
+    pub prompt_cache_retention: Option<String>,
+}
+
+/// OpenAI caps prompt-cache keys at 64 characters (Pi `clampOpenAIPromptCacheKey`).
+pub fn clamp_prompt_cache_key(key: &str) -> String {
+    const PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
+    key.chars().take(PROMPT_CACHE_KEY_MAX_CHARS).collect()
+}
+
+/// Parse OpenAI Responses `prompt_cache_retention` from config / env strings.
+pub fn parse_prompt_cache_retention(raw: &str) -> Option<rs::PromptCacheRetention> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "24h" | "long" | "24" | "hours24" => Some(rs::PromptCacheRetention::Hours24),
+        "in_memory" | "in-memory" | "short" | "5m" | "default" => {
+            Some(rs::PromptCacheRetention::InMemory)
+        }
+        _ => None,
+    }
 }
 
 impl ConversationRequest {
@@ -616,6 +696,21 @@ impl ConversationRequest {
             }
         }
         stripped
+    }
+
+    /// Remove provider/model-bound continuation state while retaining portable
+    /// user, assistant, and local tool history. Used for a single recovery
+    /// attempt when a provider rejects stale reasoning/signature/native-tool
+    /// items after a model switch.
+    pub fn strip_model_bound_state(&mut self) -> usize {
+        let before = self.items.len();
+        self.items.retain(|item| {
+            !matches!(
+                item,
+                ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_)
+            )
+        });
+        before.saturating_sub(self.items.len())
     }
 }
 
@@ -1147,6 +1242,7 @@ impl ConversationItem {
             content: Arc::<str>::from(content.into()),
             tool_calls: Vec::new(),
             model_id: None,
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })
@@ -1162,6 +1258,7 @@ impl ConversationItem {
             content: Arc::<str>::from(content.into()),
             tool_calls: Vec::new(),
             model_id: Some(model_id.into()),
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })
@@ -1173,6 +1270,7 @@ impl ConversationItem {
             content: Arc::<str>::from(""),
             tool_calls,
             model_id: None,
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })
@@ -1357,9 +1455,11 @@ pub fn reasoning_item_text(r: &rs::ReasoningItem) -> String {
 /// the sibling-`Reasoning` data model.
 ///
 /// `id` is left empty because none of the synthesizing paths carry a
-/// stable upstream id; `encrypted_content` is `None` because the only
-/// source of `encrypted_content` is the Responses API itself (which
-/// hits the typed-`OutputItem::Reasoning` path, not this helper).
+/// stable upstream id. Empty-ID reasoning remains available for display and
+/// Chat Completions folding, but is omitted when a later model switch builds a
+/// Responses request (Responses/Codex rejects `input[i].id == ""`).
+/// `encrypted_content` is `None` because the only source of Responses-native
+/// encrypted content hits the typed `OutputItem::Reasoning` path instead.
 pub fn synthesized_reasoning_item(text: impl Into<String>) -> rs::ReasoningItem {
     rs::ReasoningItem {
         id: String::new(),
@@ -1599,6 +1699,12 @@ impl AssistantItem {
         self.model_id = Some(model_id.into());
         self
     }
+
+    /// Attach the outbound route identity that produced sibling reasoning.
+    pub fn with_reasoning_model_identity(mut self, identity: ReasoningModelIdentity) -> Self {
+        self.reasoning_model_identity = Some(identity);
+        self
+    }
 }
 
 impl ConversationItem {
@@ -1606,6 +1712,15 @@ impl ConversationItem {
     pub fn with_model_id(mut self, model_id: impl Into<String>) -> Self {
         if let Self::Assistant(ref mut a) = self {
             a.model_id = Some(model_id.into());
+        }
+        self
+    }
+
+    /// Set the outbound reasoning identity on an assistant item. No-op for
+    /// other item variants.
+    pub fn with_reasoning_model_identity(mut self, identity: ReasoningModelIdentity) -> Self {
+        if let Self::Assistant(ref mut assistant) = self {
+            assistant.reasoning_model_identity = Some(identity);
         }
         self
     }
@@ -1684,6 +1799,7 @@ impl From<ChatRequestMessage> for ConversationItem {
                     content: Arc::<str>::from(content),
                     tool_calls,
                     model_id,
+                    reasoning_model_identity: None,
                     model_fingerprint: None,
                     reasoning_effort: None,
                 })
@@ -1917,15 +2033,37 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
 /// turn (there is intentionally no public single-item conversion, since a
 /// lone `Reasoning` item has no chat-completions equivalent).
 pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRequestMessage> {
+    conversation_to_chat_messages_for_route(items, None, None)
+}
+
+/// Route-aware Chat Completions conversion used by production requests.
+/// `reasoning_content` is provider-owned continuation state: retain it for
+/// same-route turns, but never carry it across a model, backend, or endpoint
+/// switch. The assistant's visible text and tool history remain portable.
+fn conversation_to_chat_messages_for_route(
+    items: Vec<ConversationItem>,
+    target_identity: Option<&ReasoningModelIdentity>,
+    target_model: Option<&str>,
+) -> Vec<ChatRequestMessage> {
+    let reasoning_is_replayable: Vec<bool> = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            !matches!(item, ConversationItem::Reasoning(_))
+                || opaque_item_matches_target_route(&items, index, target_identity, target_model)
+        })
+        .collect();
     let mut out: Vec<ChatRequestMessage> = Vec::with_capacity(items.len());
     let mut pending_reasoning: Vec<String> = Vec::new();
 
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
         match item {
             ConversationItem::Reasoning(r) => {
-                let text = reasoning_item_text(&r);
-                if !text.is_empty() {
-                    pending_reasoning.push(text);
+                if reasoning_is_replayable[index] {
+                    let text = reasoning_item_text(&r);
+                    if !text.is_empty() {
+                        pending_reasoning.push(text);
+                    }
                 }
             }
             ConversationItem::Assistant(_) => {
@@ -1941,9 +2079,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
                 // assistant in the canonical `[Reasoning, BackendToolCall,
                 // Assistant]` turn ordering. Emit its synthetic assistant
                 // message but keep `pending_reasoning` intact so it still
-                // folds onto the following assistant — matching the Responses
-                // API path, which preserves reasoning across backend tool
-                // calls.
+                // folds onto the following assistant.
                 out.push(conversation_item_to_chat_message(item));
             }
             other => {
@@ -1992,6 +2128,7 @@ impl From<ChatResponseMessage> for ConversationItem {
             content: Arc::<str>::from(content),
             tool_calls,
             model_id: None,
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })
@@ -2107,6 +2244,7 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
         content: Arc::<str>::from(content),
         tool_calls,
         model_id: Some(model_id),
+        reasoning_model_identity: None,
         model_fingerprint,
         reasoning_effort,
     }));
@@ -2122,10 +2260,15 @@ const STRUCTURED_OUTPUT_SCHEMA_NAME: &str = "structured_output";
 
 impl From<ConversationRequest> for ChatCompletionRequest {
     fn from(req: ConversationRequest) -> Self {
-        // Uses the reasoning-aware helper so `Reasoning` siblings collapse
-        // into `reasoning_content` on the following assistant rather than
-        // being emitted as empty assistant messages.
-        let messages: Vec<ChatRequestMessage> = conversation_to_chat_messages(req.items);
+        // Uses the route-aware helper so native `reasoning_content` remains
+        // available on same-route turns but is stripped on a route switch.
+        let target_model = req.model.clone();
+        let target_identity = req.reasoning_model_identity.clone();
+        let messages: Vec<ChatRequestMessage> = conversation_to_chat_messages_for_route(
+            req.items,
+            target_identity.as_ref(),
+            target_model.as_deref(),
+        );
 
         let tools_is_empty = req.tools.is_empty();
         let tools: Option<Vec<ToolDefinition>> = if tools_is_empty {
@@ -2161,8 +2304,24 @@ impl From<ConversationRequest> for ChatCompletionRequest {
                 },
             });
 
-        ChatCompletionRequest {
-            model: req.model,
+        let prompt_cache_key = req
+            .prompt_cache_key
+            .as_deref()
+            .map(clamp_prompt_cache_key)
+            .or_else(|| {
+                req.x_grok_session_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(clamp_prompt_cache_key)
+            })
+            .or_else(|| {
+                req.x_grok_conv_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(clamp_prompt_cache_key)
+            });
+        let mut chat = ChatCompletionRequest {
+            model: req.model.clone(),
             messages,
             temperature: req.temperature,
             max_tokens: req.max_output_tokens,
@@ -2170,11 +2329,13 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             frequency_penalty: None,
             presence_penalty: None,
             user: None,
+            prompt_cache_key,
             tools,
             tool_choice,
             search_parameters: None,
             response_format,
             reasoning_effort: req.reasoning_effort,
+            thinking: None,
             x_grok_conv_id: req.x_grok_conv_id,
             x_grok_req_id: req.x_grok_req_id,
             x_grok_session_id: req.x_grok_session_id,
@@ -2183,6 +2344,103 @@ impl From<ConversationRequest> for ChatCompletionRequest {
             x_grok_deployment_id: req.x_grok_deployment_id,
             x_grok_user_id: req.x_grok_user_id,
             trace: None,
+        };
+        apply_kimi_chat_request_rules(&mut chat, req.reasoning_effort, req.kimi_dialect);
+        chat
+    }
+}
+
+/// Shape chat-completions body for Moonshot / Kimi Code models.
+///
+/// Docs: platform.kimi.ai Thinking Mode + K2.7 Code parameter differences.
+/// - K3: keep/set `reasoning_effort`; do not send K2 `thinking`.
+/// - K2.7-code (+ highspeed): omit temperature/top_p/penalties (fixed server-
+///   side); omit `thinking` (always on); clamp max_tokens default.
+/// - K2.6: map effort→`thinking.type`; prefer `keep: "all"` when tools present
+///   so multi-step tool loops preserve reasoning.
+/// - K2.5: `thinking.type` only.
+fn apply_kimi_chat_request_rules(
+    chat: &mut ChatCompletionRequest,
+    effort: Option<crate::ReasoningEffort>,
+    kimi_dialect: Option<bool>,
+) {
+    // Explicit false: never reshape (cross-provider same-slug models).
+    if kimi_dialect == Some(false) {
+        return;
+    }
+    let Some(model) = chat.model.as_deref() else {
+        return;
+    };
+    let Some(profile) = xai_grok_models::kimi_request_profile(model) else {
+        return;
+    };
+
+    use xai_grok_models::{KIMI_DEFAULT_MAX_TOKENS, KimiRequestProfile, kimi_sampling_is_fixed};
+
+    if chat.max_tokens.is_none() {
+        chat.max_tokens = Some(KIMI_DEFAULT_MAX_TOKENS);
+    }
+
+    if kimi_sampling_is_fixed(profile) {
+        // Kimi rejects non-default sampling for these models — omit entirely.
+        chat.temperature = None;
+        chat.top_p = None;
+        chat.frequency_penalty = None;
+        chat.presence_penalty = None;
+    }
+
+    // tool_choice: only auto/none are safe on thinking coding models.
+    if matches!(
+        profile,
+        KimiRequestProfile::K27Code | KimiRequestProfile::K26 | KimiRequestProfile::LegacyCoding
+    ) {
+        if let Some(crate::ToolChoice::Preset(mode)) = chat.tool_choice.as_ref()
+            && mode != "auto"
+            && mode != "none"
+        {
+            chat.tool_choice = Some(crate::ToolChoice::auto());
+        } else if matches!(chat.tool_choice, Some(crate::ToolChoice::Function { .. })) {
+            chat.tool_choice = Some(crate::ToolChoice::auto());
+        }
+    }
+
+    match profile {
+        KimiRequestProfile::K3 => {
+            // K3 always thinks; open platform documents reasoning_effort=max.
+            // Keep caller effort when set; default max so the field is present.
+            if chat.reasoning_effort.is_none() {
+                chat.reasoning_effort = Some(crate::ReasoningEffort::Xhigh);
+            }
+            chat.thinking = None;
+        }
+        KimiRequestProfile::K27Code | KimiRequestProfile::LegacyCoding => {
+            // Always-on thinking; server ignores / errors on thinking object.
+            chat.thinking = None;
+            // K2.7 does not take reasoning_effort.
+            if matches!(profile, KimiRequestProfile::K27Code) {
+                chat.reasoning_effort = None;
+            }
+        }
+        KimiRequestProfile::K26 => {
+            let thinking_off = matches!(effort, Some(crate::ReasoningEffort::None));
+            chat.thinking = Some(if thinking_off {
+                crate::KimiThinkingParam::disabled()
+            } else if chat.tools.as_ref().is_some_and(|t| !t.is_empty()) {
+                // Multi-step tool loops need preserved reasoning content.
+                crate::KimiThinkingParam::enabled_keep_all()
+            } else {
+                crate::KimiThinkingParam::enabled()
+            });
+            chat.reasoning_effort = None;
+        }
+        KimiRequestProfile::K25 => {
+            let thinking_off = matches!(effort, Some(crate::ReasoningEffort::None));
+            chat.thinking = Some(if thinking_off {
+                crate::KimiThinkingParam::disabled()
+            } else {
+                crate::KimiThinkingParam::enabled()
+            });
+            chat.reasoning_effort = None;
         }
     }
 }
@@ -2235,8 +2493,26 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             parallel_tool_calls: None,
             previous_response_id: None,
             prompt: None,
-            prompt_cache_key: req.prompt_cache_key.clone(),
-            prompt_cache_retention: None,
+            prompt_cache_key: req
+                .prompt_cache_key
+                .as_deref()
+                .map(clamp_prompt_cache_key)
+                .or_else(|| {
+                    req.x_grok_session_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(clamp_prompt_cache_key)
+                })
+                .or_else(|| {
+                    req.x_grok_conv_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(clamp_prompt_cache_key)
+                }),
+            prompt_cache_retention: req
+                .prompt_cache_retention
+                .as_deref()
+                .and_then(parse_prompt_cache_retention),
             reasoning: Some(rs::Reasoning {
                 effort: req.reasoning_effort.map(|e| e.to_responses_api()),
                 summary: Some(rs::ReasoningSummary::Concise),
@@ -2259,16 +2535,32 @@ impl From<&ConversationRequest> for rs::CreateResponse {
 
 /// Build the [`rs::InputParam`] for a Responses API request.
 ///
-/// Conversion is a straight 1:1 map: each [`ConversationItem`] becomes its
-/// natural Responses-API input shape via [`conversation_item_to_input_items`].
-/// Reasoning items are top-level siblings (not bundled into the assistant),
-/// so they appear inline in the same order the model originally emitted —
-/// which is what lets the server-side prefix KV-cache hit on repeat turns.
+/// Each [`ConversationItem`] becomes its natural Responses-API input shape via
+/// [`conversation_item_to_input_items`]. Replayable reasoning items are
+/// top-level siblings (not bundled into the assistant), so they appear inline
+/// in the same order the model emitted — which is what lets the server-side
+/// prefix KV-cache hit on repeat turns.
+///
+/// Reasoning and native backend-tool items are model-bound opaque state, not
+/// portable conversation text. Synthetic reasoning from Messages or Chat
+/// Completions has no valid Responses item ID, while encrypted Responses state
+/// can only be replayed to the model that produced the following assistant
+/// turn. Invalid items and items owned by another model are omitted; the
+/// visible assistant message still carries the portable cross-model context.
 fn build_responses_input(req: &ConversationRequest) -> rs::InputParam {
+    let target_model = req.model.as_deref();
+    let target_identity = req.reasoning_model_identity.as_ref();
     let items: Vec<rs::InputItem> = req
         .items
         .iter()
-        .flat_map(conversation_item_to_input_items)
+        .enumerate()
+        .filter(|(index, item)| {
+            !matches!(
+                item,
+                ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_)
+            ) || opaque_item_matches_target_route(&req.items, *index, target_identity, target_model)
+        })
+        .flat_map(|(_, item)| conversation_item_to_input_items(item))
         .collect();
     rs::InputParam::Items(items)
 }
@@ -2307,7 +2599,89 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
     }
 }
 
-/// Convert a ConversationItem to Responses API InputItem(s)
+/// Responses item IDs accepted by OpenAI/Codex contain only ASCII letters,
+/// digits, underscores, or dashes. An empty ID marks reasoning synthesized by
+/// a non-Responses backend; replaying it produces `Invalid input[i].id`.
+fn valid_responses_item_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Treat a dated provider snapshot as the corresponding undated model alias.
+///
+/// The comparison is intentionally narrow: encrypted reasoning is opaque and
+/// replaying it to a genuinely different model is worse than dropping it. We
+/// therefore accept only exact equality or a trailing `-YYYY-MM-DD` on the
+/// server-echoed source; the requested target is never broadened. Arbitrary
+/// prefixes (for example `gpt-4` vs `gpt-4o`) never match.
+fn model_ids_match_for_replay(source: &str, target: &str) -> bool {
+    source == target || strip_model_snapshot_date(source) == Some(target)
+}
+
+fn strip_model_snapshot_date(model: &str) -> Option<&str> {
+    const SUFFIX_LEN: usize = "-YYYY-MM-DD".len();
+    let split = model.len().checked_sub(SUFFIX_LEN)?;
+    let suffix = model.as_bytes().get(split..)?;
+    let is_date = suffix.first() == Some(&b'-')
+        && suffix.get(5) == Some(&b'-')
+        && suffix.get(8) == Some(&b'-')
+        && suffix
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 0 | 5 | 8) || byte.is_ascii_digit());
+    is_date
+        .then(|| &model[..split])
+        .filter(|base| !base.is_empty())
+}
+
+/// Return whether model-bound provider continuation state belongs to the
+/// target route.
+///
+/// `Reasoning` and native backend-tool calls have no provenance field of their
+/// own. They sit before the `Assistant` they belong to, so the following
+/// assistant owns their route identity. New production history must match that
+/// identity byte-for-byte. Legacy history without a route stamp falls back to
+/// the conservative server-model comparison above. A user/system/tool-result
+/// boundary makes the item orphaned.
+fn opaque_item_matches_target_route(
+    items: &[ConversationItem],
+    opaque_index: usize,
+    target_identity: Option<&ReasoningModelIdentity>,
+    target_model: Option<&str>,
+) -> bool {
+    if target_identity.is_none() && target_model.is_none() {
+        return true;
+    }
+    let Some(tail) = items.get(opaque_index.saturating_add(1)..) else {
+        return false;
+    };
+
+    for item in tail {
+        match item {
+            ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_) => {}
+            ConversationItem::Assistant(assistant) => {
+                if let Some(source_identity) = assistant.reasoning_model_identity.as_ref()
+                    && let Some(target_identity) = target_identity
+                {
+                    return source_identity == target_identity;
+                }
+                return assistant.model_id.as_deref().zip(target_model).is_some_and(
+                    |(source_model, target_model)| {
+                        model_ids_match_for_replay(source_model, target_model)
+                    },
+                );
+            }
+            ConversationItem::System(_)
+            | ConversationItem::User(_)
+            | ConversationItem::ToolResult(_) => return false,
+        }
+    }
+    false
+}
+
+/// Convert a ConversationItem to Responses API InputItem(s).
 fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputItem> {
     match item {
         ConversationItem::System(s) => {
@@ -2327,10 +2701,16 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
             })]
         }
         ConversationItem::Reasoning(r) => {
-            // Reasoning items round-trip back to the Responses API in their
-            // native typed form. `status` is output-only (the API rejects it
-            // on input), so strip it before emission; everything else
-            // (summary, content, encrypted_content, id) passes through.
+            // Only reasoning with a wire-valid Responses item ID can be
+            // replayed. Messages and Chat Completions synthesize this shared
+            // item with an empty ID; Codex rejects it before reading the next
+            // user turn.
+            if !valid_responses_item_id(&r.id) {
+                return Vec::new();
+            }
+
+            // `status` is output-only (the API rejects it on input); preserve
+            // every other field for byte-stable native Responses continuity.
             let mut r = r.clone();
             r.status = None;
             vec![rs::InputItem::Item(rs::Item::Reasoning(r))]
@@ -2547,6 +2927,12 @@ impl ConversationRequest {
     /// Set the model
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Set the non-wire routing identity used for safe reasoning replay.
+    pub fn with_reasoning_model_identity(mut self, identity: ReasoningModelIdentity) -> Self {
+        self.reasoning_model_identity = Some(identity);
         self
     }
 
@@ -3163,8 +3549,9 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         }
     };
 
-    // Process all conversation items
-    for item in &req.items {
+    // Process all conversation items. Native thinking/signature blocks are
+    // replayed only to the model that produced their assistant turn.
+    for (index, item) in req.items.iter().enumerate() {
         match item {
             ConversationItem::System(s) => {
                 flush_assistant(&mut pending_assistant, &mut messages);
@@ -3258,23 +3645,32 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     cache_control: None,
                 });
             }
-            // Reasoning sibling — emit as Anthropic `thinking` block on the
-            // pending assistant turn. `tco_*` encrypted blobs only set
-            // `signature`; real model reasoning sets `thinking`.
+            // Messages thinking is opaque continuation state. A valid replay
+            // needs same-model provenance and normally a provider signature;
+            // only profiles that explicitly allow empty signatures retain one.
             ConversationItem::Reasoning(r) => {
-                flush_tool_results(&mut pending_tool_results, &mut messages);
-                let thinking = reasoning_item_text(r);
-                let signature = r
-                    .encrypted_content
-                    .as_deref()
-                    .map(str::to_owned)
-                    .unwrap_or_default();
-                if !thinking.is_empty() || !signature.is_empty() {
-                    pending_assistant.push(ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    });
+                if !opaque_item_matches_target_route(
+                    &req.items,
+                    index,
+                    req.reasoning_model_identity.as_ref(),
+                    req.model.as_deref(),
+                ) {
+                    continue;
                 }
+                let signature = r.encrypted_content.as_deref().unwrap_or_default();
+                let allows_empty_signature = req
+                    .model
+                    .as_deref()
+                    .and_then(xai_grok_models::kimi_request_profile)
+                    .is_some_and(xai_grok_models::kimi_allow_empty_thinking_signature);
+                if signature.is_empty() && !allows_empty_signature {
+                    continue;
+                }
+                flush_tool_results(&mut pending_tool_results, &mut messages);
+                pending_assistant.push(ContentBlock::Thinking {
+                    thinking: reasoning_item_text(r),
+                    signature: signature.to_owned(),
+                });
             }
         }
     }
@@ -3342,6 +3738,7 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         });
 
     // thinking is driven by reasoning_effort only, not by json_schema.
+    // Kimi Code (Pi forceAdaptiveThinking) may override defaults below.
     let thinking = effort
         .as_ref()
         .map(|_| crate::messages::ThinkingConfig::Adaptive {
@@ -3354,7 +3751,7 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         None
     };
 
-    MessagesRequest {
+    let mut msgs = MessagesRequest {
         model: req.model.clone().unwrap_or_default(),
         messages,
         max_tokens: req.max_output_tokens.unwrap_or(0),
@@ -3369,6 +3766,137 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
         thinking,
         output_config,
         metadata: None,
+    };
+    apply_kimi_messages_request_rules(&mut msgs, req.reasoning_effort, req.kimi_dialect);
+    msgs
+}
+
+/// Shape Anthropic Messages body for Kimi Code / coding models (Pi alignment).
+///
+/// Official Pi `kimi-coding` models set `compat.forceAdaptiveThinking: true`:
+/// - `thinking: { type: "adaptive", display: "summarized" }`
+/// - `output_config.effort` from the thinking-level map (no `budget_tokens`)
+/// - temperature omitted while thinking is enabled
+///
+/// Profile defaults when `reasoning_effort` is unset:
+/// - K3 → effort `max` (Pi `thinkingLevelMap.max`, open-platform docs)
+/// - K2.7 / HighSpeed / legacy coding → effort `high` (Pi `mapThinkingLevelToEffort` default)
+///
+/// Explicit `ReasoningEffort::None` omits thinking (Pi `thinkingEnabled: false`;
+/// K3's map marks `off: null` so we do not send `type: disabled`).
+///
+/// Empty thinking signatures: K3 / legacy coding allow `signature: ""` (Pi
+/// `allowEmptySignature`); other coding models convert empty-sig thinking to
+/// plain text so Anthropic-compatible APIs accept multi-turn replay.
+fn apply_kimi_messages_request_rules(
+    msgs: &mut crate::messages::MessagesRequest,
+    effort: Option<crate::ReasoningEffort>,
+    kimi_dialect: Option<bool>,
+) {
+    use crate::messages::{
+        ContentBlock, MessageContent, OutputConfig, ThinkingConfig, ThinkingDisplay,
+        ToolChoiceParam,
+    };
+    use xai_grok_models::{
+        KIMI_DEFAULT_MAX_TOKENS, KimiRequestProfile, kimi_allow_empty_thinking_signature,
+        kimi_force_adaptive_thinking, kimi_request_profile, kimi_sampling_is_fixed,
+    };
+
+    if kimi_dialect == Some(false) {
+        return;
+    }
+
+    let Some(profile) = kimi_request_profile(&msgs.model) else {
+        return;
+    };
+    if !kimi_force_adaptive_thinking(profile) {
+        // K2.5/K2.6 open-platform stay on Chat Completions; no Messages shaping.
+        return;
+    }
+
+    if msgs.max_tokens == 0 {
+        msgs.max_tokens = KIMI_DEFAULT_MAX_TOKENS;
+    }
+
+    // Map effort → wire token (Pi streamSimple + mapThinkingLevelToEffort).
+    let wire_effort: Option<&'static str> = match effort {
+        Some(crate::ReasoningEffort::None) => None,
+        // Pi maps minimal → low for adaptive models.
+        Some(crate::ReasoningEffort::Minimal) => Some("low"),
+        Some(crate::ReasoningEffort::Low) => Some("low"),
+        Some(crate::ReasoningEffort::Medium) => Some("medium"),
+        Some(crate::ReasoningEffort::High) => Some("high"),
+        // K3 thinkingLevelMap: max → "max"; Xhigh is Grok's id for max/xhigh.
+        Some(crate::ReasoningEffort::Xhigh)
+        | Some(crate::ReasoningEffort::Max)
+        | Some(crate::ReasoningEffort::Ultra) => Some("max"),
+        None => match profile {
+            KimiRequestProfile::K3 => Some("max"),
+            KimiRequestProfile::K27Code | KimiRequestProfile::LegacyCoding => Some("high"),
+            KimiRequestProfile::K25 | KimiRequestProfile::K26 => None,
+        },
+    };
+
+    if let Some(e) = wire_effort {
+        msgs.thinking = Some(ThinkingConfig::Adaptive {
+            display: Some(ThinkingDisplay::Summarized),
+        });
+        let format = msgs.output_config.as_ref().and_then(|c| c.format.clone());
+        msgs.output_config = Some(OutputConfig {
+            effort: Some(e.to_string()),
+            format,
+        });
+        // Pi: temperature is incompatible with thinking.
+        msgs.temperature = None;
+        if kimi_sampling_is_fixed(profile) {
+            msgs.top_p = None;
+        }
+    } else {
+        // Explicit off / unmapped: do not send adaptive thinking.
+        msgs.thinking = None;
+        if let Some(cfg) = msgs.output_config.as_mut() {
+            cfg.effort = None;
+            if cfg.format.is_none() {
+                msgs.output_config = None;
+            }
+        }
+    }
+
+    // Coding models: only auto/none tool_choice is safe with adaptive thinking.
+    if matches!(
+        profile,
+        KimiRequestProfile::K27Code | KimiRequestProfile::LegacyCoding
+    ) {
+        match msgs.tool_choice.as_ref() {
+            Some(ToolChoiceParam::Any) | Some(ToolChoiceParam::Tool { .. }) => {
+                msgs.tool_choice = Some(ToolChoiceParam::Auto);
+            }
+            _ => {}
+        }
+    }
+
+    // Pi allowEmptySignature: keep thinking with signature "".
+    // Otherwise convert empty-signature thinking blocks to text.
+    if !kimi_allow_empty_thinking_signature(profile) {
+        for message in &mut msgs.messages {
+            let MessageContent::Blocks(blocks) = &mut message.content else {
+                continue;
+            };
+            for block in blocks.iter_mut() {
+                if let ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } = block
+                    && signature.trim().is_empty()
+                    && !thinking.trim().is_empty()
+                {
+                    *block = ContentBlock::Text {
+                        text: std::mem::take(thinking),
+                        cache_control: None,
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -3413,6 +3941,7 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
             content: Arc::<str>::from(content),
             tool_calls,
             model_id: Some(resp.model),
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })
@@ -3567,6 +4096,45 @@ mod tests {
         // Forward-compat: an unknown wire string decodes to `Unknown`.
         let unknown: PriorTurnInterrupt = serde_json::from_str("\"some_future_cause\"").unwrap();
         assert_eq!(unknown, PriorTurnInterrupt::Unknown);
+    }
+
+    #[test]
+    fn clamp_prompt_cache_key_caps_at_64_chars() {
+        let long = "a".repeat(80);
+        assert_eq!(clamp_prompt_cache_key(&long).chars().count(), 64);
+        assert_eq!(clamp_prompt_cache_key("short"), "short");
+    }
+
+    #[test]
+    fn parse_prompt_cache_retention_openai_aliases() {
+        assert_eq!(
+            parse_prompt_cache_retention("24h"),
+            Some(rs::PromptCacheRetention::Hours24)
+        );
+        assert_eq!(
+            parse_prompt_cache_retention("long"),
+            Some(rs::PromptCacheRetention::Hours24)
+        );
+        assert_eq!(
+            parse_prompt_cache_retention("in_memory"),
+            Some(rs::PromptCacheRetention::InMemory)
+        );
+        assert_eq!(
+            parse_prompt_cache_retention("short"),
+            Some(rs::PromptCacheRetention::InMemory)
+        );
+        assert_eq!(parse_prompt_cache_retention("nope"), None);
+    }
+
+    #[test]
+    fn chat_and_responses_carry_prompt_cache_key() {
+        let mut req = ConversationRequest::from_items(vec![ConversationItem::user("hi")]);
+        req.prompt_cache_key = Some("sess-1".into());
+        req.x_grok_session_id = Some("ignored-when-key-set".into());
+        let chat: ChatCompletionRequest = req.clone().into();
+        assert_eq!(chat.prompt_cache_key.as_deref(), Some("sess-1"));
+        let responses: rs::CreateResponse = (&req).into();
+        assert_eq!(responses.prompt_cache_key.as_deref(), Some("sess-1"));
     }
 
     #[test]
@@ -4319,6 +4887,7 @@ mod tests {
                 arguments: r#"{"path": "/test.txt"}"#.into(),
             }],
             model_id: Some("grok-3".to_string()),
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         };
@@ -4774,6 +5343,7 @@ mod tests {
             content: "The answer is 42.".into(),
             tool_calls: vec![],
             model_id: Some("grok-3".to_string()),
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         });
@@ -4806,12 +5376,14 @@ mod tests {
                 content: "The answer is 4.".into(),
                 tool_calls: vec![],
                 model_id: Some("grok-3".to_string()),
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
             // New user message
             ConversationItem::user("Now what is 3+3?"),
-        ]);
+        ])
+        .with_model("grok-3");
 
         let responses_req: rs::CreateResponse = (&req).into();
 
@@ -4856,7 +5428,7 @@ mod tests {
         let req = ConversationRequest::from_items(vec![
             ConversationItem::user("Hello"),
             ConversationItem::Reasoning(rs::ReasoningItem {
-                id: String::new(),
+                id: "tco_hidden_1".to_string(),
                 summary: vec![],
                 content: None,
                 encrypted_content: Some("enc_hidden_thoughts".to_string()),
@@ -4866,6 +5438,7 @@ mod tests {
                 content: "Hi!".into(),
                 tool_calls: vec![],
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -4898,6 +5471,639 @@ mod tests {
 
         // Summary should be empty
         assert!(reasoning.summary.is_empty());
+    }
+
+    #[test]
+    fn responses_input_filters_invalid_reasoning_ids_after_backend_switch() {
+        fn reasoning(id: &str) -> ConversationItem {
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: id.to_string(),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("provider-specific-signature".to_string()),
+                status: None,
+            })
+        }
+
+        let mut history = vec![
+            ConversationItem::user("question for a Messages model"),
+            ConversationItem::Reasoning(synthesized_reasoning_item("messages thinking")),
+        ];
+        history.extend(
+            [
+                "invalid id",
+                "invalid.id",
+                "invalid/id",
+                "invalid:id",
+                "无效",
+            ]
+            .into_iter()
+            .map(reasoning),
+        );
+        history.extend([
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: "rs_abc-123".to_string(),
+                summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                    text: "preserved summary".to_string(),
+                })],
+                content: Some(vec![rs::ReasoningTextContent {
+                    text: "preserved content".to_string(),
+                }]),
+                encrypted_content: Some("preserved-rs-encrypted".to_string()),
+                status: Some(rs::OutputStatus::Completed),
+            }),
+            reasoning("tco_abc_123"),
+            ConversationItem::assistant("answer preserved across providers"),
+            ConversationItem::user("next question for Codex"),
+        ]);
+
+        let responses_req: rs::CreateResponse = (&ConversationRequest::from_items(history)).into();
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+        let reasoning_items: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                rs::InputItem::Item(rs::Item::Reasoning(reasoning)) => Some(reasoning),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            reasoning_items
+                .iter()
+                .map(|reasoning| reasoning.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rs_abc-123", "tco_abc_123"]
+        );
+        assert_eq!(reasoning_items[0].status, None, "status is output-only");
+        assert_eq!(
+            reasoning_items[0].encrypted_content.as_deref(),
+            Some("preserved-rs-encrypted")
+        );
+        assert_eq!(reasoning_items[0].summary.len(), 1);
+        assert_eq!(
+            reasoning_items[0].content.as_ref().unwrap()[0].text,
+            "preserved content"
+        );
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                    role: rs::Role::Assistant,
+                    content: rs::EasyInputContent::Text(text),
+                    ..
+                }) if text == "answer preserved across providers"
+            )
+        }));
+    }
+
+    #[test]
+    fn responses_input_drops_valid_encrypted_reasoning_from_previous_model() {
+        // Regression from a real Codex -> Grok switch. Both providers use the
+        // Responses API and Codex emits a syntactically valid `rs_*` ID, but
+        // Grok cannot decrypt Codex's opaque encrypted_content. The ID syntax
+        // check alone therefore cannot make a cross-model replay safe.
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::user("question for Codex"),
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: "rs_02525dd4246acc36016a605d3".to_string(),
+                summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                    text: "Codex reasoning summary".to_string(),
+                })],
+                content: None,
+                encrypted_content: Some("codex-encrypted-content".to_string()),
+                status: Some(rs::OutputStatus::Completed),
+            }),
+            ConversationItem::assistant_with_model("Codex answer", "gpt-5.6-sol"),
+            ConversationItem::user("next question for Grok"),
+        ])
+        .with_model("grok-4.5");
+
+        let responses_req: rs::CreateResponse = (&req).into();
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, rs::InputItem::Item(rs::Item::Reasoning(_)))),
+            "valid-but-foreign encrypted reasoning must not be replayed to the new model"
+        );
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                    role: rs::Role::Assistant,
+                    content: rs::EasyInputContent::Text(text),
+                    ..
+                }) if text == "Codex answer"
+            )
+        }));
+    }
+
+    fn model_bound_history(source_model: &str) -> Vec<ConversationItem> {
+        let web_search: rs::WebSearchToolCall = serde_json::from_value(serde_json::json!({
+            "action": {"type": "search", "query": "opaque state"},
+            "id": "ws_model_bound",
+            "status": "completed"
+        }))
+        .expect("valid web search fixture");
+        vec![
+            ConversationItem::user("question for source model"),
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: "rs_model_bound".to_string(),
+                summary: vec![rs::SummaryPart::SummaryText(rs::SummaryTextContent {
+                    text: "private continuation".to_string(),
+                })],
+                content: None,
+                encrypted_content: Some("provider-signature".to_string()),
+                status: Some(rs::OutputStatus::Completed),
+            }),
+            ConversationItem::BackendToolCall(BackendToolCallItem {
+                kind: BackendToolKind::WebSearch(web_search),
+            }),
+            ConversationItem::assistant_with_model("portable answer", source_model),
+            ConversationItem::user("question for target model"),
+        ]
+    }
+
+    fn model_bound_history_for_route(
+        model: &str,
+        identity: ReasoningModelIdentity,
+    ) -> Vec<ConversationItem> {
+        let mut history = model_bound_history(model);
+        let assistant = history
+            .iter_mut()
+            .find_map(|item| match item {
+                ConversationItem::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .expect("fixture has an assistant owner");
+        assistant.reasoning_model_identity = Some(identity);
+        history
+    }
+
+    #[test]
+    fn model_switch_compatibility_matrix_strips_foreign_opaque_state() {
+        let source_model = "source-model";
+        let target_model = "target-model";
+
+        let chat: ChatCompletionRequest =
+            ConversationRequest::from_items(model_bound_history(source_model))
+                .with_model(target_model)
+                .into();
+        let historical_assistant = chat
+            .messages
+            .iter()
+            .find(|message| message.model_id.as_deref() == Some(source_model))
+            .expect("portable Chat assistant retained");
+        assert!(historical_assistant.reasoning_content.is_none());
+
+        let responses_req: rs::CreateResponse =
+            (&ConversationRequest::from_items(model_bound_history(source_model))
+                .with_model(target_model))
+                .into();
+        let rs::InputParam::Items(response_items) = responses_req.input else {
+            panic!("expected Responses items");
+        };
+        assert!(!response_items.iter().any(|item| matches!(
+            item,
+            rs::InputItem::Item(rs::Item::Reasoning(_))
+                | rs::InputItem::Item(rs::Item::WebSearchCall(_))
+        )));
+        assert!(response_items.iter().any(|item| matches!(
+            item,
+            rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                role: rs::Role::Assistant,
+                content: rs::EasyInputContent::Text(text),
+                ..
+            }) if text == "portable answer"
+        )));
+
+        let messages = build_messages_request(
+            &ConversationRequest::from_items(model_bound_history(source_model))
+                .with_model(target_model),
+        );
+        assert!(messages.messages.iter().all(|message| {
+            match &message.content {
+                crate::messages::MessageContent::Text(_) => true,
+                crate::messages::MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .all(|block| !matches!(block, crate::messages::ContentBlock::Thinking { .. })),
+            }
+        }));
+        assert!(
+            messages
+                .messages
+                .iter()
+                .any(|message| match &message.content {
+                    crate::messages::MessageContent::Text(text) => text == "portable answer",
+                    crate::messages::MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            crate::messages::ContentBlock::Text { text, .. }
+                                if text == "portable answer"
+                        )
+                    }),
+                })
+        );
+    }
+
+    #[test]
+    fn same_model_compatibility_matrix_preserves_native_continuation_state() {
+        let model = "same-model";
+
+        let chat: ChatCompletionRequest =
+            ConversationRequest::from_items(model_bound_history(model))
+                .with_model(model)
+                .into();
+        let historical_assistant = chat
+            .messages
+            .iter()
+            .find(|message| message.model_id.as_deref() == Some(model))
+            .expect("same-model Chat assistant retained");
+        assert_eq!(
+            historical_assistant.reasoning_content.as_deref(),
+            Some("private continuation")
+        );
+
+        let responses_req: rs::CreateResponse =
+            (&ConversationRequest::from_items(model_bound_history(model)).with_model(model)).into();
+        let rs::InputParam::Items(response_items) = responses_req.input else {
+            panic!("expected Responses items");
+        };
+        assert!(
+            response_items
+                .iter()
+                .any(|item| matches!(item, rs::InputItem::Item(rs::Item::Reasoning(_))))
+        );
+        assert!(
+            response_items
+                .iter()
+                .any(|item| matches!(item, rs::InputItem::Item(rs::Item::WebSearchCall(_))))
+        );
+
+        let messages = build_messages_request(
+            &ConversationRequest::from_items(model_bound_history(model)).with_model(model),
+        );
+        assert!(
+            messages
+                .messages
+                .iter()
+                .any(|message| match &message.content {
+                    crate::messages::MessageContent::Text(_) => false,
+                    crate::messages::MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            crate::messages::ContentBlock::Thinking { signature, .. }
+                                if signature == "provider-signature"
+                        )
+                    }),
+                })
+        );
+    }
+
+    #[test]
+    fn legacy_chat_and_messages_allow_same_model_route_fallback() {
+        let model = "same-model";
+        let chat: ChatCompletionRequest =
+            ConversationRequest::from_items(model_bound_history(model))
+                .with_model(model)
+                .with_reasoning_model_identity(ReasoningModelIdentity::new(
+                    model,
+                    ApiBackend::ChatCompletions,
+                    "https://chat.example/v1",
+                ))
+                .into();
+        let historical_assistant = chat
+            .messages
+            .iter()
+            .find(|message| message.model_id.as_deref() == Some(model))
+            .expect("portable Chat assistant retained");
+        assert_eq!(
+            historical_assistant.reasoning_content.as_deref(),
+            Some("private continuation")
+        );
+
+        let messages = build_messages_request(
+            &ConversationRequest::from_items(model_bound_history(model))
+                .with_model(model)
+                .with_reasoning_model_identity(ReasoningModelIdentity::new(
+                    model,
+                    ApiBackend::Messages,
+                    "https://messages.example/v1",
+                )),
+        );
+        assert!(
+            messages
+                .messages
+                .iter()
+                .any(|message| match &message.content {
+                    crate::messages::MessageContent::Text(_) => false,
+                    crate::messages::MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
+                        matches!(block, crate::messages::ContentBlock::Thinking { signature, .. }
+                    if signature == "provider-signature")
+                    }),
+                })
+        );
+    }
+
+    #[test]
+    fn chat_completions_drops_reasoning_when_backend_route_changes() {
+        let model = "same-model";
+        let endpoint = "https://shared-proxy.example/v1";
+        let history = model_bound_history_for_route(
+            model,
+            ReasoningModelIdentity::new(model, ApiBackend::Messages, endpoint),
+        );
+        let chat: ChatCompletionRequest = ConversationRequest::from_items(history)
+            .with_model(model)
+            .with_reasoning_model_identity(ReasoningModelIdentity::new(
+                model,
+                ApiBackend::ChatCompletions,
+                endpoint,
+            ))
+            .into();
+
+        let historical_assistant = chat
+            .messages
+            .iter()
+            .find(|message| message.model_id.as_deref() == Some(model))
+            .expect("portable Chat assistant retained");
+        assert!(
+            historical_assistant.reasoning_content.is_none(),
+            "same-slug reasoning from another API backend must fail closed"
+        );
+    }
+
+    #[test]
+    fn messages_drops_thinking_when_endpoint_route_changes() {
+        let model = "same-model";
+        let history = model_bound_history_for_route(
+            model,
+            ReasoningModelIdentity::new(
+                model,
+                ApiBackend::Messages,
+                "https://provider-a.example/v1",
+            ),
+        );
+        let messages = build_messages_request(
+            &ConversationRequest::from_items(history)
+                .with_model(model)
+                .with_reasoning_model_identity(ReasoningModelIdentity::new(
+                    model,
+                    ApiBackend::Messages,
+                    "https://provider-b.example/v1",
+                )),
+        );
+
+        assert!(messages.messages.iter().all(|message| {
+            match &message.content {
+                crate::messages::MessageContent::Text(_) => true,
+                crate::messages::MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .all(|block| !matches!(block, crate::messages::ContentBlock::Thinking { .. })),
+            }
+        }));
+    }
+
+    #[test]
+    fn strip_model_bound_state_keeps_portable_transcript() {
+        let mut req = ConversationRequest::from_items(model_bound_history("source-model"));
+        assert_eq!(req.strip_model_bound_state(), 2);
+        assert!(req.items.iter().all(|item| !matches!(
+            item,
+            ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_)
+        )));
+        assert!(req.items.iter().any(|item| matches!(
+            item,
+            ConversationItem::Assistant(assistant) if assistant.content.as_ref() == "portable answer"
+        )));
+    }
+
+    #[test]
+    fn responses_model_identity_accepts_only_exact_or_dated_aliases() {
+        assert!(model_ids_match_for_replay("gpt-4o", "gpt-4o"));
+        assert!(model_ids_match_for_replay("gpt-4o-2024-08-06", "gpt-4o"));
+        assert!(!model_ids_match_for_replay("gpt-4o", "gpt-4o-2024-08-06"));
+        assert!(!model_ids_match_for_replay(
+            "gpt-4o-2024-08-06",
+            "gpt-4o-2024-11-20"
+        ));
+        assert!(!model_ids_match_for_replay("gpt-4o-mini", "gpt-4o"));
+        assert!(!model_ids_match_for_replay(
+            "gpt-4o-release-08-06",
+            "gpt-4o"
+        ));
+
+        let openai = ReasoningModelIdentity::new(
+            "gpt-4o",
+            ApiBackend::Responses,
+            "https://api.openai.com/v1/",
+        );
+        assert_eq!(
+            openai,
+            ReasoningModelIdentity::new(
+                "gpt-4o",
+                ApiBackend::Responses,
+                "https://api.openai.com/v1",
+            ),
+            "cosmetic trailing slashes must not change route identity"
+        );
+        assert_ne!(
+            openai,
+            ReasoningModelIdentity::new(
+                "gpt-4o",
+                ApiBackend::Responses,
+                "https://openrouter.ai/api/v1",
+            ),
+            "the same bare slug on another endpoint is not the same reasoning route"
+        );
+        let persisted = serde_json::to_string(&openai).unwrap();
+        assert!(
+            !persisted.contains("api.openai.com"),
+            "persisted provenance must not expose endpoint URLs"
+        );
+    }
+
+    #[test]
+    fn assistant_unknown_reasoning_backend_preserves_portable_content() {
+        let mut value = serde_json::to_value(ConversationItem::assistant_with_model(
+            "portable answer",
+            "future-model",
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().insert(
+            "reasoning_model_identity".to_string(),
+            serde_json::json!({
+                "model": "future-model",
+                "api_backend": "future_backend",
+                "endpoint_sha256": "future-digest"
+            }),
+        );
+
+        let restored: ConversationItem = serde_json::from_value(value).unwrap();
+        let ConversationItem::Assistant(assistant) = restored else {
+            panic!("assistant row must survive unknown provenance");
+        };
+        assert_eq!(assistant.content.as_ref(), "portable answer");
+        assert_eq!(assistant.model_id.as_deref(), Some("future-model"));
+        assert!(assistant.reasoning_model_identity.is_none());
+    }
+
+    #[test]
+    fn responses_input_keeps_reasoning_for_dated_model_alias() {
+        let identity = ReasoningModelIdentity::new(
+            "gpt-4o",
+            ApiBackend::Responses,
+            "https://api.openai.com/v1",
+        );
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: "rs_same_model_snapshot".to_string(),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("same-model-encrypted-content".to_string()),
+                status: Some(rs::OutputStatus::Completed),
+            }),
+            ConversationItem::assistant_with_model("answer", "gpt-4o-2024-08-06")
+                .with_reasoning_model_identity(identity.clone()),
+            ConversationItem::user("follow-up"),
+        ])
+        .with_model("gpt-4o")
+        .with_reasoning_model_identity(identity);
+
+        let responses_req: rs::CreateResponse = (&req).into();
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, rs::InputItem::Item(rs::Item::Reasoning(_)))),
+            "a dated response snapshot must match its undated request alias"
+        );
+    }
+
+    #[test]
+    fn responses_input_drops_reasoning_when_outbound_identity_changes() {
+        let source_identity = ReasoningModelIdentity::new(
+            "gpt-4o-2024-08-06",
+            ApiBackend::Responses,
+            "https://api.openai.com/v1",
+        );
+        let target_identity = ReasoningModelIdentity::new(
+            "gpt-4o",
+            ApiBackend::Responses,
+            "https://api.openai.com/v1",
+        );
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: "rs_explicit_snapshot".to_string(),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("snapshot-encrypted-content".to_string()),
+                status: Some(rs::OutputStatus::Completed),
+            }),
+            ConversationItem::assistant_with_model("answer", "gpt-4o-2024-08-06")
+                .with_reasoning_model_identity(source_identity),
+            ConversationItem::user("follow-up"),
+        ])
+        .with_model("gpt-4o")
+        .with_reasoning_model_identity(target_identity);
+
+        let responses_req: rs::CreateResponse = (&req).into();
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, rs::InputItem::Item(rs::Item::Reasoning(_)))),
+            "explicit snapshot -> moving alias must fail closed despite the echoed name matching"
+        );
+    }
+
+    #[test]
+    fn responses_input_drops_all_opaque_siblings_when_route_changes() {
+        let source_identity = ReasoningModelIdentity::new(
+            "same-model",
+            ApiBackend::Responses,
+            "https://proxy-a.example/v1",
+        );
+        let target_identity = ReasoningModelIdentity::new(
+            "same-model",
+            ApiBackend::Responses,
+            "https://proxy-b.example/v1",
+        );
+        let mut history = model_bound_history("same-model");
+        let assistant = history
+            .iter_mut()
+            .find_map(|item| match item {
+                ConversationItem::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .expect("fixture has an assistant owner");
+        assistant.reasoning_model_identity = Some(source_identity);
+
+        let req = ConversationRequest::from_items(history)
+            .with_model("same-model")
+            .with_reasoning_model_identity(target_identity);
+        let responses_req: rs::CreateResponse = (&req).into();
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+
+        assert!(
+            !items.iter().any(|item| matches!(
+                item,
+                rs::InputItem::Item(rs::Item::Reasoning(_))
+                    | rs::InputItem::Item(rs::Item::WebSearchCall(_))
+            )),
+            "reasoning and native backend-tool state must both fail closed across endpoints"
+        );
+        assert!(items.iter().any(|item| matches!(
+            item,
+            rs::InputItem::EasyMessage(rs::EasyInputMessage {
+                role: rs::Role::Assistant,
+                content: rs::EasyInputContent::Text(text),
+                ..
+            }) if text == "portable answer"
+        )));
+    }
+
+    #[test]
+    fn responses_input_keeps_legacy_reasoning_for_matching_model_fallback() {
+        let req = ConversationRequest::from_items(vec![
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: "rs_legacy_no_route".to_string(),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("legacy-encrypted-content".to_string()),
+                status: Some(rs::OutputStatus::Completed),
+            }),
+            ConversationItem::assistant_with_model("answer", "gpt-4o"),
+            ConversationItem::user("follow-up"),
+        ])
+        .with_model("gpt-4o")
+        .with_reasoning_model_identity(ReasoningModelIdentity::new(
+            "gpt-4o",
+            ApiBackend::Responses,
+            "https://api.openai.com/v1",
+        ));
+
+        let responses_req: rs::CreateResponse = (&req).into();
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, rs::InputItem::Item(rs::Item::Reasoning(_)))),
+            "legacy same-model history must remain replayable after provenance is introduced"
+        );
     }
 
     #[test]
@@ -5366,6 +6572,247 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k27_highspeed_omits_fixed_sampling_and_thinking() {
+        let req = ConversationRequest {
+            model: Some("kimi-k2.7-code-highspeed".into()),
+            temperature: Some(0.3),
+            top_p: Some(0.5),
+            max_output_tokens: None,
+            reasoning_effort: Some(crate::ReasoningEffort::High),
+            ..ConversationRequest::default()
+        };
+        let chat: ChatCompletionRequest = req.into();
+        assert_eq!(chat.max_tokens, Some(32_768));
+        assert!(chat.temperature.is_none(), "fixed sampling must omit temp");
+        assert!(chat.top_p.is_none());
+        assert!(chat.thinking.is_none(), "K2.7 must not send thinking");
+        assert!(
+            chat.reasoning_effort.is_none(),
+            "K2.7 has no reasoning_effort"
+        );
+        let json = serde_json::to_value(&chat).unwrap();
+        assert!(json.get("thinking").is_none());
+        assert!(json.get("temperature").is_none());
+    }
+
+    #[test]
+    fn kimi_k26_maps_effort_to_thinking_param() {
+        let req = ConversationRequest {
+            model: Some("kimi-k2.6".into()),
+            reasoning_effort: Some(crate::ReasoningEffort::None),
+            ..ConversationRequest::default()
+        };
+        let chat: ChatCompletionRequest = req.into();
+        let thinking = chat.thinking.expect("thinking present");
+        assert_eq!(thinking.type_, "disabled");
+        assert!(thinking.keep.is_none());
+
+        let req_on = ConversationRequest {
+            model: Some("kimi-k2.6".into()),
+            tools: vec![ToolSpec {
+                name: "bash".into(),
+                description: Some("x".into()),
+                parameters: serde_json::json!({}),
+            }],
+            reasoning_effort: Some(crate::ReasoningEffort::High),
+            ..ConversationRequest::default()
+        };
+        let chat_on: ChatCompletionRequest = req_on.into();
+        let t = chat_on.thinking.expect("thinking");
+        assert_eq!(t.type_, "enabled");
+        assert_eq!(t.keep.as_deref(), Some("all"));
+        assert!(chat_on.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn kimi_shaping_skipped_when_dialect_false() {
+        // Same bare slug as Moonshot, but dialect=false (Ollama/OpenRouter path).
+        let req = ConversationRequest {
+            model: Some("kimi-k2.6".into()),
+            reasoning_effort: Some(crate::ReasoningEffort::High),
+            temperature: Some(0.3),
+            kimi_dialect: Some(false),
+            ..ConversationRequest::default()
+        };
+        let chat: ChatCompletionRequest = req.into();
+        assert_eq!(chat.reasoning_effort, Some(crate::ReasoningEffort::High));
+        assert!(chat.thinking.is_none(), "must not inject Moonshot thinking");
+        assert_eq!(chat.temperature, Some(0.3));
+    }
+
+    #[test]
+    fn kimi_k3_defaults_reasoning_effort_max() {
+        let req = ConversationRequest {
+            model: Some("kimi-k3".into()),
+            ..ConversationRequest::default()
+        };
+        let chat: ChatCompletionRequest = req.into();
+        assert_eq!(chat.reasoning_effort, Some(crate::ReasoningEffort::Xhigh));
+        assert!(chat.thinking.is_none());
+        let json = serde_json::to_value(&chat).unwrap();
+        assert_eq!(
+            json.pointer("/reasoning_effort").and_then(|v| v.as_str()),
+            Some("max")
+        );
+    }
+
+    /// Pi forceAdaptiveThinking for Kimi Coding: adaptive + effort, no budget.
+    /// Mirrors packages/ai test anthropic-force-adaptive-thinking.test.ts.
+    #[test]
+    fn kimi_code_messages_force_adaptive_thinking_pi_aligned() {
+        // k2p7 + medium → adaptive + effort medium (Pi table).
+        let req = ConversationRequest {
+            model: Some("kimi-code/k2p7".into()),
+            items: vec![ConversationItem::user("Hello")],
+            reasoning_effort: Some(crate::ReasoningEffort::Medium),
+            temperature: Some(0.4),
+            ..Default::default()
+        };
+        let msgs = build_messages_request(&req);
+        let json = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            json.pointer("/thinking/display").and_then(|v| v.as_str()),
+            Some("summarized")
+        );
+        assert_eq!(
+            json.pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("medium")
+        );
+        assert!(
+            json.get("temperature").is_none()
+                || json.pointer("/temperature").is_some_and(|v| v.is_null()),
+            "temperature omitted with thinking; got {json:#}"
+        );
+        assert!(
+            json.pointer("/thinking/budget_tokens").is_none(),
+            "adaptive path must not send budget_tokens"
+        );
+
+        // k3 + max → adaptive + effort max.
+        let req = ConversationRequest {
+            model: Some("k3".into()),
+            items: vec![ConversationItem::user("Hello")],
+            reasoning_effort: Some(crate::ReasoningEffort::Xhigh),
+            ..Default::default()
+        };
+        let msgs = build_messages_request(&req);
+        let json = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            json.pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("max")
+        );
+
+        // highspeed + medium.
+        let req = ConversationRequest {
+            model: Some("kimi-for-coding-highspeed".into()),
+            items: vec![ConversationItem::user("Hello")],
+            reasoning_effort: Some(crate::ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let msgs = build_messages_request(&req);
+        let json = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            json.pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn kimi_code_messages_defaults_effort_when_unset() {
+        // K3 defaults to max when effort unset.
+        let req = ConversationRequest {
+            model: Some("kimi-code/k3".into()),
+            items: vec![ConversationItem::user("ping")],
+            max_output_tokens: None,
+            ..Default::default()
+        };
+        let msgs = build_messages_request(&req);
+        let json = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            json.pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("max")
+        );
+        assert_eq!(msgs.max_tokens, 32_768);
+
+        // k2p7 defaults to high (Pi mapThinkingLevelToEffort default).
+        let req = ConversationRequest {
+            model: Some("k2p7".into()),
+            items: vec![ConversationItem::user("ping")],
+            ..Default::default()
+        };
+        let msgs = build_messages_request(&req);
+        let json = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(
+            json.pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn kimi_code_messages_explicit_none_omits_thinking() {
+        let req = ConversationRequest {
+            model: Some("k2p7".into()),
+            items: vec![ConversationItem::user("ping")],
+            reasoning_effort: Some(crate::ReasoningEffort::None),
+            ..Default::default()
+        };
+        let msgs = build_messages_request(&req);
+        let json = serde_json::to_value(&msgs).unwrap();
+        assert!(
+            json.get("thinking").is_none()
+                || json.pointer("/thinking").is_some_and(|v| v.is_null()),
+            "explicit None must omit thinking; got {json:#}"
+        );
+        assert!(
+            json.pointer("/output_config/effort").is_none(),
+            "explicit None must omit effort"
+        );
+    }
+
+    #[test]
+    fn kimi_code_messages_maps_minimal_to_low() {
+        let req = ConversationRequest {
+            model: Some("kimi-code/k2p7".into()),
+            items: vec![ConversationItem::user("ping")],
+            reasoning_effort: Some(crate::ReasoningEffort::Minimal),
+            ..Default::default()
+        };
+        let msgs = build_messages_request(&req);
+        let json = serde_json::to_value(&msgs).unwrap();
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("adaptive")
+        );
+        assert_eq!(
+            json.pointer("/output_config/effort")
+                .and_then(|v| v.as_str()),
+            Some("low"),
+            "Pi mapThinkingLevelToEffort: minimal → low"
+        );
+    }
+
+    #[test]
     fn test_chat_completion_request_carries_reasoning_effort_top_level() {
         for (variant, expected) in [
             (crate::ReasoningEffort::None, "none"),
@@ -5373,8 +6820,10 @@ mod tests {
             (crate::ReasoningEffort::Low, "low"),
             (crate::ReasoningEffort::Medium, "medium"),
             (crate::ReasoningEffort::High, "high"),
-            (crate::ReasoningEffort::Xhigh, "xhigh"),
+            // Chat Completions wire maps Xhigh → "max" (Kimi K3 / OpenAI alias).
+            (crate::ReasoningEffort::Xhigh, "max"),
             (crate::ReasoningEffort::Max, "max"),
+            (crate::ReasoningEffort::Ultra, "max"),
         ] {
             let req = ConversationRequest::from_items(vec![ConversationItem::user("hi")])
                 .with_model("test");
@@ -5507,6 +6956,7 @@ mod tests {
             content: "Here is the answer.".into(),
             tool_calls: vec![],
             model_id: Some("messages-compatible-model".into()),
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         });
@@ -5703,6 +7153,7 @@ mod tests {
                 content: "I'll look at the code.".into(),
                 tool_calls: vec![],
                 model_id: Some("messages-compatible-model".into()),
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -5715,6 +7166,7 @@ mod tests {
                     arguments: r#"{"path":"src/main.rs"}"#.into(),
                 }],
                 model_id: Some("messages-compatible-model".into()),
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -5723,6 +7175,7 @@ mod tests {
                 content: "I see the issue.".into(),
                 tool_calls: vec![],
                 model_id: Some("messages-compatible-model".into()),
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -5735,6 +7188,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 model_id: Some("messages-compatible-model".into()),
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -6470,6 +7924,7 @@ mod tests {
                 },
             ],
             model_id: None,
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })];
@@ -6536,6 +7991,7 @@ mod tests {
                 content: format!("I edited {worktree}/src/main.rs").into(),
                 tool_calls: vec![],
                 model_id: Some("grok-3".to_string()),
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -6593,6 +8049,7 @@ mod tests {
                     ).into(),
                 }],
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -6644,6 +8101,7 @@ mod tests {
                     arguments: format!(r#"{{"target_file":"{root}/src/main.rs"}}"#).into(),
                 }],
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -6752,6 +8210,7 @@ mod tests {
                 arguments: r#"{"command":"echo hello"}"#.into(),
             }],
             model_id: None,
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })];
@@ -6867,6 +8326,7 @@ mod tests {
                 content: String::new().into(),
                 tool_calls: vec![],
                 model_id: Some("test-model".to_string()),
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             })],
@@ -6888,6 +8348,7 @@ mod tests {
                 content: "Here is my answer.".into(),
                 tool_calls: vec![],
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             })],
@@ -6913,6 +8374,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             })],
@@ -7110,6 +8572,7 @@ mod tests {
             content: "Hello".into(),
             tool_calls: vec![],
             model_id: None,
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }
@@ -7199,6 +8662,7 @@ mod tests {
                 })
                 .collect(),
             model_id: None,
+            reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
         })
@@ -7901,6 +9365,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),
@@ -8435,6 +9900,7 @@ mod tests {
                     content: String::new().into(),
                     tool_calls: Vec::new(),
                     model_id: None,
+                    reasoning_model_identity: None,
                     model_fingerprint: None,
                     reasoning_effort: None,
                 }),
@@ -9668,6 +11134,7 @@ mod tests {
                     arguments: Arc::<str>::from("{}"),
                 }],
                 model_id: None,
+                reasoning_model_identity: None,
                 model_fingerprint: None,
                 reasoning_effort: None,
             }),

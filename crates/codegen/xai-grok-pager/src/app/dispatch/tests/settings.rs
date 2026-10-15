@@ -1,5 +1,6 @@
 //! Tests for settings setters, toggles, resets, and rollback.
 use super::*;
+use crate::app::dispatch::session::lifecycle::model_switch_context_hint;
 /// `Action::ToggleVimMode` flips the active agent's `vim_mode` field,
 /// updates the in-process pager cache so future agents pick it up
 /// via `load_vim_mode`, emits `Effect::PersistSetting` so the new
@@ -301,6 +302,45 @@ fn slash_model_valid_dispatches_set_default_model_with_switch_and_persist() {
     );
     assert!(app.agents[&id].session.model_switch_pending);
 }
+
+#[test]
+fn slash_codex_model_switch_never_persists_into_grok_config() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let model_id = acp::ModelId::new(std::sync::Arc::from("codex:gpt-5.5"));
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .models
+        .available
+        .insert(
+            model_id.clone(),
+            acp::ModelInfo::new(model_id.clone(), "Codex - GPT-5.5".to_string()),
+        );
+
+    let effects = dispatch(
+        Action::SendPrompt("/model Codex - GPT-5.5".into()),
+        &mut app,
+    );
+
+    assert_eq!(effects.len(), 1, "Codex selection must be session-only");
+    assert!(matches!(
+        &effects[0],
+        Effect::SwitchModel { model_id: selected, .. } if selected == &model_id
+    ));
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistSetting {
+                key: "default_model",
+                ..
+            }
+        )),
+        "a codex:* ID must never be written to xAI's default_model"
+    );
+}
+
 #[test]
 fn model_switch_pending_resets_correctly_across_success_and_failure() {
     let mut app = test_app_with_agent();
@@ -345,6 +385,17 @@ fn model_switch_pending_resets_correctly_across_success_and_failure() {
         &mut app,
     );
     assert!(!app.agents[&id].session.model_switch_pending);
+}
+
+#[test]
+fn model_switch_context_hint_is_capacity_sensitive_and_actionable() {
+    assert!(model_switch_context_hint(84_000, Some(100_000), "Small Model").is_none());
+    let hint = model_switch_context_hint(85_000, Some(100_000), "Small Model")
+        .expect("85% should surface the switch hint");
+    assert!(hint.contains("85%"));
+    assert!(hint.contains("Small Model"));
+    assert!(hint.contains("`/compact`"));
+    assert!(model_switch_context_hint(100_000, None, "Unknown").is_none());
 }
 /// `set_compact_mode(app, new)` emits exactly one
 /// `Effect::PersistSetting` with the correct payload — `value`
@@ -1403,6 +1454,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "screen_mode" => {
             let _ = dispatch(Action::SetScreenMode("minimal".to_string()), app);
+        }
+        "language" => {
+            let _ = dispatch(Action::SetLanguage("zh-CN".to_string()), app);
         }
         "voice_keybind_enabled" => {
             let _ = dispatch(Action::SetVoiceKeybindEnabled(false), app);

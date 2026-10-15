@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
+use xai_grok_tools::implementations::grok_build::task::types::SubagentCapabilityModeExt;
 use xai_grok_tools::notification::ToolNotificationHandle;
 use xai_grok_tools::registry::types::SessionContext;
 use xai_grok_tools::types::tool::ToolKind;
@@ -955,6 +956,13 @@ impl AgentBuilder {
         tool_config
             .tools
             .retain(|tc| definition.session_tools_allowed(&tc.id));
+        // Capability is a final security clamp over the fully assembled
+        // function toolset. Applying it here prevents injected write, image,
+        // execute, or other out-of-mode helpers from widening the resolved
+        // read/write/execute ceiling.
+        if let Some(mode) = definition.capability_mode {
+            mode.filter_tool_config(&mut tool_config);
+        }
         {
             let mut saw_directive = false;
             let types: Vec<String> = definition
@@ -1227,9 +1235,9 @@ const TASK_TOOL_NAMING: xai_tool_types::TaskToolNaming<'static> = xai_tool_types
 /// Concise task-tool description for child sessions. Delegation from a child
 /// is possible but discouraged — prefer doing the work directly.
 ///
-/// NOTE: This hardcodes the built-in agent type names ("general-purpose",
-/// "explore", "plan"). If custom child-visible subagent types become common,
-/// consider generating this list dynamically like the parent description does.
+/// Built-in type names stay aligned with [`xai_tool_types::BUILTIN_SUBAGENTS`].
+/// Keep this list in sync when adding a new built-in, or generate it
+/// dynamically like the parent description.
 const CHILD_TASK_DESCRIPTION: &str = "\
 Launch a sub-agent to handle a specific sub-task. Use this only when \n\
 the sub-task is clearly independent and would benefit from a separate \n\
@@ -1237,7 +1245,7 @@ context (e.g., a parallel search while you continue working).\n\
 \n\
 Prefer doing the work yourself unless delegation is clearly necessary.\n\
 \n\
-Usage: specify ${{ params.task.subagent_type }} (\"general-purpose\", \"explore\", or \"plan\"), \n\
+Usage: specify ${{ params.task.subagent_type }} (\"general-purpose\", \"explore\", \"plan\", \"oracle\", or \"xdotcom\"), \n\
 a short ${{ params.task.description }}, and a detailed ${{ params.task.prompt }}.\n\
 ${{ params.task.run_in_background }}: Returns immediately with a subagent_id. Use the task output tool to retrieve results. This is set to true by default.";
 /// CLI [`xai_tool_types::SubagentToolNaming`]: each kind maps to its
@@ -1263,6 +1271,8 @@ fn builtin_tools_fragment(name: BuiltinAgentName) -> String {
         BuiltinAgentName::GeneralPurpose => xai_tool_types::GENERAL_PURPOSE_SUBAGENT,
         BuiltinAgentName::Explore => xai_tool_types::EXPLORE_SUBAGENT,
         BuiltinAgentName::Plan => xai_tool_types::PLAN_SUBAGENT,
+        BuiltinAgentName::Oracle => xai_tool_types::ORACLE_SUBAGENT,
+        BuiltinAgentName::Xdotcom => xai_tool_types::XDOTCOM_SUBAGENT,
         _ => return String::new(),
     };
     subagent.render_tools(&SUBAGENT_TOOL_NAMING)
@@ -1538,6 +1548,14 @@ mod tests {
             "child description should not contain examples"
         );
         assert!(
+            CHILD_TASK_DESCRIPTION.contains("oracle"),
+            "child description must advertise the built-in oracle type"
+        );
+        assert!(
+            CHILD_TASK_DESCRIPTION.contains("xdotcom"),
+            "child description must advertise the built-in xdotcom type"
+        );
+        assert!(
             CHILD_TASK_DESCRIPTION.len() < 700,
             "child description should be compact, got {} chars",
             CHILD_TASK_DESCRIPTION.len()
@@ -1698,6 +1716,43 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn capability_mode_is_final_clamp_after_default_tool_injection() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        use xai_grok_tools::notification::ToolNotificationHandle;
+
+        let mut profile = crate::config::AgentDefinition::default_grok_build();
+        profile.capability_mode = Some(xai_tool_types::SubagentCapabilityMode::ReadOnly);
+        let agent = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(profile)
+        .build()
+        .await
+        .expect("read-only agent should build");
+        let names: Vec<String> = agent
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect();
+
+        assert!(names.iter().any(|name| name == "read_file"));
+        for denied in [
+            "search_replace",
+            "write",
+            "run_terminal_command",
+            "image_gen",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == denied),
+                "{denied} escaped the read-only capability clamp: {names:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn curated_empty_toolset_fails_agent_build() {
         use xai_grok_tools::computer::local::LocalTerminalBackend;

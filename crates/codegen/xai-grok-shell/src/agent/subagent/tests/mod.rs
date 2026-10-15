@@ -10,6 +10,7 @@ use xai_grok_subagent_resolution::resolve_effective_overrides;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
     ChildCompletion, CompletionDisposition,
 };
+use xai_tool_types::SubagentReasoningEffort;
 #[test]
 fn canonical_total_tokens_does_not_double_count_reasoning() {
     let totals = xai_chat_state::UsageTotals {
@@ -26,6 +27,59 @@ fn cancellation_makes_an_otherwise_complete_usage_snapshot_incomplete() {
     assert!(usage_is_incomplete(false, true, 10, false));
     assert!(!usage_is_incomplete(false, false, 0, false));
     assert!(usage_is_incomplete(true, false, 0, false));
+}
+#[test]
+fn oracle_execution_budget_resolves_and_reserves_finalization_capacity() {
+    let mut definition = xai_grok_agent::config::AgentDefinition::oracle();
+    let budget = SubagentExecutionBudget::resolve(& definition, None);
+    assert_eq!(budget.max_turns, Some(12));
+    assert_eq!(budget.max_tool_calls, Some(40));
+    assert_eq!(budget.timeout_secs, Some(180));
+    assert_eq!(budget.finalize_grace_secs, Some(30));
+    assert_eq!(budget.finalize_at_model_calls(), Some(11));
+    assert_eq!(budget.finalize_at_tool_calls(), Some(32));
+    assert_eq!(budget.finalize_at_elapsed(), Some(std::time::Duration::from_secs(150)));
+    let wire = budget.wire().expect("Oracle is bounded");
+    assert_eq!(wire.max_turns, Some(12));
+    assert_eq!(wire.max_tool_calls, Some(40));
+    append_execution_budget_prompt(& mut definition, budget);
+    let prompt = definition.prompt_body.expect("Oracle prompt");
+    assert!(prompt.contains("12 model/tool-use rounds"));
+    assert!(prompt.contains("40 tool calls"));
+    assert!(prompt.contains("180 seconds total wall-clock time"));
+}
+#[test]
+fn partial_budget_results_require_new_plain_text_output() {
+    assert!(can_use_partial_budget_result(true, "useful partial answer", false));
+    assert!(! can_use_partial_budget_result(false, "answer", false));
+    assert!(! can_use_partial_budget_result(true, "   ", false));
+    assert!(
+        ! can_use_partial_budget_result(true, r#"{"answer":"partial"}"#, true),
+        "unvalidated schema output must not be reported as success"
+    );
+}
+#[test]
+fn unbounded_agent_does_not_gain_runtime_limits() {
+    let definition = xai_grok_agent::config::AgentDefinition::general_purpose();
+    let budget = SubagentExecutionBudget::resolve(& definition, None);
+    assert!(budget.is_unbounded());
+    assert!(budget.wire().is_none());
+}
+#[test]
+fn budget_trigger_codes_and_reasons_are_stable() {
+    for trigger in [
+        SubagentBudgetTrigger::FinalizingTurns,
+        SubagentBudgetTrigger::FinalizingToolCalls,
+        SubagentBudgetTrigger::FinalizingTimeout,
+        SubagentBudgetTrigger::MaxToolCalls,
+        SubagentBudgetTrigger::Timeout,
+    ] {
+        assert_eq!(SubagentBudgetTrigger::from_code(trigger.code()), Some(trigger));
+        assert!(! trigger.termination_reason().is_empty());
+    }
+    assert!(SubagentBudgetTrigger::MaxToolCalls.is_hard());
+    assert!(SubagentBudgetTrigger::Timeout.is_hard());
+    assert!(! SubagentBudgetTrigger::FinalizingTurns.is_hard());
 }
 #[tokio::test]
 async fn usage_ack_precedes_terminal_presentation() {
@@ -172,6 +226,8 @@ async fn emit_subagent_notification_stamps_one_event_id_on_both_paths() {
             child_session_id: "child-1".into(),
             status: "completed".into(),
             error: None,
+            termination_reason: None,
+            usage: None,
             tool_calls: 0,
             turns: 0,
             duration_ms: 5,
@@ -532,12 +588,12 @@ fn partial_override_fills_from_role() {
 #[test]
 fn reasoning_effort_explicit_overrides_role() {
     let overrides = SubagentRuntimeOverrides {
-        reasoning_effort: Some("high".into()),
+        reasoning_effort: Some(SubagentReasoningEffort::High),
         ..Default::default()
     };
     let role = xai_grok_subagent_resolution::config::SubagentRole {
         description: "test".into(),
-        reasoning_effort: Some("low".into()),
+        reasoning_effort: Some(SubagentReasoningEffort::Low),
         ..Default::default()
     };
     let resolved = resolve_effective_overrides(
@@ -547,14 +603,17 @@ fn reasoning_effort_explicit_overrides_role() {
         None,
         None,
     );
-    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        resolved.reasoning_effort,
+        Some(SubagentReasoningEffort::High)
+    );
 }
 #[test]
 fn reasoning_effort_falls_back_to_role() {
     let overrides = SubagentRuntimeOverrides::default();
     let role = xai_grok_subagent_resolution::config::SubagentRole {
         description: "test".into(),
-        reasoning_effort: Some("medium".into()),
+        reasoning_effort: Some(SubagentReasoningEffort::Medium),
         ..Default::default()
     };
     let resolved = resolve_effective_overrides(
@@ -564,7 +623,10 @@ fn reasoning_effort_falls_back_to_role() {
         None,
         None,
     );
-    assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(
+        resolved.reasoning_effort,
+        Some(SubagentReasoningEffort::Medium)
+    );
 }
 #[test]
 fn invalid_role_capability_mode_ignored() {
@@ -711,28 +773,28 @@ fn reasoning_effort_precedence_explicit_over_role_over_persona() {
         .insert(
             "dev".to_string(),
             xai_grok_subagent_resolution::config::SubagentPersona {
-                reasoning_effort: Some("low".into()),
+                reasoning_effort: Some(SubagentReasoningEffort::Low),
                 ..Default::default()
             },
         );
     let role = xai_grok_subagent_resolution::config::SubagentRole {
         description: "test".into(),
-        reasoning_effort: Some("medium".into()),
+        reasoning_effort: Some(SubagentReasoningEffort::Medium),
         ..Default::default()
     };
     let overrides = SubagentRuntimeOverrides {
         persona: Some("dev".into()),
-        reasoning_effort: Some("high".into()),
+        reasoning_effort: Some(SubagentReasoningEffort::High),
         ..Default::default()
     };
     let r = resolve_effective_overrides(&overrides, Some(&role), &personas, None, None);
-    assert_eq!(r.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(r.reasoning_effort, Some(SubagentReasoningEffort::High));
     let overrides = SubagentRuntimeOverrides {
         persona: Some("dev".into()),
         ..Default::default()
     };
     let r = resolve_effective_overrides(&overrides, Some(&role), &personas, None, None);
-    assert_eq!(r.reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(r.reasoning_effort, Some(SubagentReasoningEffort::Medium));
     let role_no_re = xai_grok_subagent_resolution::config::SubagentRole {
         description: "test".into(),
         ..Default::default()
@@ -744,7 +806,7 @@ fn reasoning_effort_precedence_explicit_over_role_over_persona() {
         None,
         None,
     );
-    assert_eq!(r.reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(r.reasoning_effort, Some(SubagentReasoningEffort::Low));
     let overrides = SubagentRuntimeOverrides::default();
     let r = resolve_effective_overrides(&overrides, None, &HashMap::new(), None, None);
     assert!(r.reasoning_effort.is_none());
@@ -1023,22 +1085,23 @@ fn verbatim_fork_falls_back_to_summary_on_incomplete_tail() {
         AssistantItem, ContentPart, ConversationItem, ToolCall,
     };
     let items = vec![
-            ConversationItem::system("parent system"),
-            ConversationItem::user("q1 UNIQUE_FORK_MARKER_TEST"),
-            ConversationItem::assistant("a1"),
-            ConversationItem::user("q2"),
-            ConversationItem::Assistant(AssistantItem {
-                content: String::new().into(),
-                tool_calls: vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                }],
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
-            }),
-        ];
+        ConversationItem::system("parent system"),
+        ConversationItem::user("q1 UNIQUE_FORK_MARKER_TEST"),
+        ConversationItem::assistant("a1"),
+        ConversationItem::user("q2"),
+        ConversationItem::Assistant(AssistantItem {
+            content: String::new().into(),
+            tool_calls: vec![ToolCall {
+                id: "tc1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            model_id: None,
+            reasoning_model_identity: None,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+    ];
     let ctx = verbatim_or_normalize_fork(items, 256_000);
     assert_eq!(ctx.source, InitialContextSource::Forked);
     assert!(
@@ -1415,7 +1478,7 @@ fn validate_subagent_type_returns_unknown_for_invented_type() {
     let outcome = validate_subagent_type("totally-invented-agent-name", &ctx);
     match outcome {
         SubagentValidateTypeOutcome::Unknown { available } => {
-            for expected in ["general-purpose", "explore", "plan"] {
+            for expected in ["general-purpose", "explore", "plan", "oracle", "xdotcom"] {
                 assert!(
                         available.iter().any(|n| n == expected),
                         "available list must include built-in {expected:?}: {available:?}",
@@ -2137,12 +2200,20 @@ fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingCo
     }
 }
 fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHandle {
+    spawn_test_parent_chat_state_at(model_slug, "https://api.test/v1")
+}
+fn spawn_test_parent_chat_state_at(
+    model_slug: &str,
+    base_url: &str,
+) -> xai_chat_state::ChatStateHandle {
     let (mock, _persistence_rx) = xai_chat_state::MockChatPersistence::new();
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let token = tokio_util::sync::CancellationToken::new();
+    let mut sampling_config = test_sampling_config(model_slug);
+    sampling_config.base_url = base_url.to_owned();
     xai_chat_state::ChatStateActor::spawn(
         vec![],
-        test_sampling_config(model_slug),
+        sampling_config,
         Box::new(mock),
         event_tx,
         token,

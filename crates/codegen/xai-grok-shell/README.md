@@ -1670,6 +1670,10 @@ per-agent pin overrides that: `[subagents.models].<agent>` (highest priority),
 then the agent definition's `model`. Both pins apply unconditionally,
 regardless of which model the parent is on.
 
+Pins can be edited from the TUI (`/agents` → select agent → `m`) and are
+hot-reloaded: the config watcher detects the `[subagents.models]` change and
+live sessions apply it to the next subagent spawn.
+
 ### Roles and Personas
 
 Roles define reusable capability/model defaults. Personas layer tone and behavior instructions onto the child prompt.
@@ -1807,7 +1811,23 @@ name = "Local Llama"
 temperature = 0.8
 ```
 
-**Ollama:**
+**Ollama (built-in platform — cloud by default):**
+
+Ollama is available as a built-in platform, defaulting to the Ollama Cloud API
+at `https://ollama.com/v1`. Set `OLLAMA_API_KEY` (or `GROK_OLLAMA_API_KEY`)
+in your environment:
+
+```bash
+export OLLAMA_API_KEY=your-key
+```
+
+Override for a local instance via `GROK_OLLAMA_BASE_URL`:
+
+```bash
+export GROK_OLLAMA_BASE_URL=http://localhost:11434/v1
+```
+
+You can also configure it manually:
 
 ```toml
 [model.ollama-codellama]

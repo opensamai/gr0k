@@ -74,6 +74,10 @@ pub(super) fn collect_live_doctor_report_for_terminal(
     if crate::app::voice_mode_enabled() {
         crate::diagnostics::apply_voice_probe(&mut report, true);
     }
+    crate::diagnostics::apply_oracle_model_pin_probe(
+        &mut report,
+        agent.session.models.current_model_id_str(),
+    );
     Some(report)
 }
 
@@ -84,6 +88,20 @@ fn doctor_fix_target(agent: &AgentView) -> DoctorFixTarget {
         session_binding_epoch: agent.session_binding_epoch,
         cwd: agent.session.cwd.clone(),
     }
+}
+
+pub(super) fn dispatch_readiness(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    let report = crate::readiness::assess(&agent.session.cwd);
+    agent
+        .scrollback
+        .push_block(RenderBlock::system(crate::readiness::render(&report)));
+    vec![]
 }
 
 pub(super) fn dispatch_doctor(request: DoctorRequest, app: &mut AppView) -> Vec<Effect> {
@@ -653,6 +671,26 @@ pub(super) fn dispatch_send_prompt_inner(
                     agent.prompt.set_text("");
                 }
                 return dispatch_doctor(request, app);
+            }
+            CommandResult::Readiness => {
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                return dispatch_readiness(app);
+            }
+            CommandResult::Changes => {
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                let Some(session_id) = agent.session.session_id.clone() else {
+                    agent.show_toast("No session yet — start one to review changes.");
+                    return vec![];
+                };
+                return vec![Effect::FetchChanges {
+                    agent_id: agent.session.id,
+                    session_id,
+                    post_action: false,
+                }];
             }
             CommandResult::Action(Action::ExitSession) => {
                 if consume_input {

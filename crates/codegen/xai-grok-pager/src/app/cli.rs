@@ -7,6 +7,8 @@ use std::path::PathBuf;
 /// Top-level commands for the pager binary.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
+    /// Use an existing Codex/ChatGPT subscription (native backend)
+    Codex(CodexArgs),
     /// Run Grok without the interactive UI
     Agent(Box<AgentArgs>),
     /// Show the configuration Grok discovers for this directory
@@ -20,22 +22,74 @@ pub enum Command {
     /// Manage running leader processes
     Leader(LeaderMgmtArgs),
     /// Sign out and clear cached credentials
-    Logout,
+    Logout {
+        /// Clear only the Kimi Code subscription credential (leave xAI alone).
+        #[arg(long = "kimi", conflicts_with = "all")]
+        kimi: bool,
+        /// Clear only the OpenAI Codex (ChatGPT) subscription credential.
+        #[arg(long = "openai", conflicts_with_all = ["kimi", "all"])]
+        openai: bool,
+        /// Clear only the Anthropic Claude (Pro/Max) subscription credential.
+        #[arg(long = "claude", alias = "anthropic", conflicts_with_all = ["kimi", "openai", "all"])]
+        claude: bool,
+        /// Clear xAI session **and** Kimi / Codex / Claude OAuth scopes.
+        /// Does not remove BYOK platform API keys or env vars (use
+        /// `/logout provider <id>` / unset env for those).
+        #[arg(long = "all", conflicts_with_all = ["kimi", "openai", "claude"])]
+        all: bool,
+    },
+    /// Configure the Nexus relay key without signing in (writes ~/.grok/auth.json)
+    ///
+    /// Nexus is a self-hosted OpenAI/Anthropic-compatible relay. This works
+    /// before any xAI login, so you can set up `nexus/*` models up front.
+    /// Run with no arguments to print setup guidance and current status.
+    Nexus {
+        /// API key to save. Omit to print setup guidance / current status.
+        #[arg(value_name = "API_KEY")]
+        key: Option<String>,
+        /// Optional self-hosted gateway root (default https://nexuscore.now).
+        #[arg(value_name = "BASE_URL")]
+        base_url: Option<String>,
+        /// Remove the stored Nexus key.
+        #[arg(long, conflicts_with_all = ["key", "base_url"])]
+        clear: bool,
+    },
     /// Sign in to Grok
     Login {
         /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
         #[arg(long, hide = true)]
         legacy: bool,
         /// Use Grok OAuth via auth.x.ai.
-        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
+        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth", "kimi", "openai"])]
         oauth: bool,
         /// Use device-code authentication for headless/remote environments.
         #[arg(
             long = "device-auth",
             visible_alias = "device-code",
-            conflicts_with_all = ["oauth"]
+            conflicts_with_all = ["oauth", "kimi"]
         )]
         device_auth: bool,
+        /// Sign in with a Kimi Code subscription (device OAuth).
+        ///
+        /// Stores credentials under the `oauth/kimi-code` scope and unlocks
+        /// `kimi-code/*` models. Independent of xAI login.
+        #[arg(long = "kimi", conflicts_with_all = ["oauth", "device_auth", "openai"])]
+        kimi: bool,
+        /// Sign in with an OpenAI Codex (ChatGPT Plus/Pro) subscription.
+        ///
+        /// Browser OAuth by default (PKCE + loopback callback, manual paste
+        /// supported); combine with `--device-auth` for headless environments.
+        /// Stores credentials under the `oauth/openai-codex` scope and unlocks
+        /// `openai-codex/*` models. Independent of xAI login.
+        #[arg(long = "openai", alias = "chatgpt", conflicts_with_all = ["oauth", "kimi"])]
+        openai: bool,
+        /// Sign in with an Anthropic Claude (Pro/Max) subscription.
+        ///
+        /// Browser OAuth (PKCE + loopback callback, manual paste supported).
+        /// Stores credentials under the `oauth/anthropic-claude` scope and
+        /// unlocks `anthropic-claude/*` models. Independent of xAI login.
+        #[arg(long = "claude", alias = "anthropic", conflicts_with_all = ["oauth", "kimi", "openai"])]
+        claude: bool,
         /// Authenticate for remote development environments (hidden).
         ///
         /// Field is always present so match arms stay feature-unification-safe
@@ -133,13 +187,52 @@ See ~/.grok/README.md for more information.
     /// `GROK_WORKSPACE_COMMAND=1` to enable it locally for testing.
     #[command(hide = true)]
     Workspace(WorkspaceMgmtArgs),
-    /// Open the Agent Dashboard view at startup.
+    /// Open the Agent Dashboard, or launch its local web observability UI.
     ///
-    /// Centralised, agent-native overview of every session (top-level and
-    /// subagents). Disabled when `[dashboard].enabled = false` in
-    /// `~/.grok/config.toml` or when the `GROK_AGENT_DASHBOARD=0` env
-    /// var is set.
-    Dashboard,
+    /// Bare `dashboard` opens the terminal-native multi-agent dashboard.
+    /// `dashboard --web` starts the read-only Rust web dashboard over local
+    /// session artifacts. The web server only accepts loopback bind addresses.
+    Dashboard(DashboardArgs),
+}
+
+#[derive(Debug, clap::Args, Clone, Default)]
+pub struct DashboardArgs {
+    /// Launch the local web dashboard instead of the terminal dashboard.
+    #[arg(long)]
+    pub web: bool,
+
+    /// Loopback address for `--web` (default: 127.0.0.1:9090).
+    #[arg(long, value_name = "ADDR", requires = "web")]
+    pub bind: Option<SocketAddr>,
+
+    /// Do not open the default browser for `--web`.
+    #[arg(long, requires = "web")]
+    pub no_open: bool,
+}
+/// Arguments for the subscription-backed Codex connector.
+#[derive(Debug, clap::Args, Clone)]
+pub struct CodexArgs {
+    /// Run one Codex prompt and exit.
+    #[arg(short = 'p', long = "prompt", conflicts_with = "message")]
+    pub prompt: Option<String>,
+    /// Initial prompt. Without a prompt, starts an interactive session.
+    #[arg(value_name = "PROMPT", conflicts_with = "prompt")]
+    pub message: Option<String>,
+    /// Codex model ID. Defaults to the subscription's current default.
+    #[arg(short = 'm', long = "model")]
+    pub model: Option<String>,
+    /// Deprecated: the native backend talks to ChatGPT directly (no Codex CLI).
+    #[arg(long = "codex-binary", default_value = "codex", value_hint = ValueHint::FilePath, hide = true)]
+    pub codex_binary: PathBuf,
+    /// Deprecated: app-server threads are not resumable; use `grok sessions`.
+    #[arg(long = "resume", value_name = "THREAD_ID", hide = true)]
+    pub resume: Option<String>,
+    /// Allow Codex to access the host without its workspace sandbox.
+    #[arg(long = "full-access")]
+    pub full_access: bool,
+    /// Check subscription authentication and list available Codex models.
+    #[arg(long = "status")]
+    pub status: bool,
 }
 /// Arguments for the `wrap` subcommand: the command to run, then its args.
 #[derive(Debug, clap::Args, Clone)]
@@ -1337,8 +1430,81 @@ mod tests {
     #[test]
     fn subcommand_takes_precedence_over_positional_prompt() {
         let args = PagerArgs::try_parse_from(["grok", "logout"]).expect("subcommand parses");
-        assert!(matches!(args.command, Some(Command::Logout)));
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                kimi: false,
+                openai: false,
+                claude: false,
+                all: false,
+            })
+        ));
+        let args = PagerArgs::try_parse_from(["grok", "logout", "--kimi"]).expect("parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                kimi: true,
+                openai: false,
+                claude: false,
+                all: false,
+            })
+        ));
+        let args = PagerArgs::try_parse_from(["grok", "logout", "--all"]).expect("parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                kimi: false,
+                openai: false,
+                claude: false,
+                all: true,
+            })
+        ));
+        assert!(
+            PagerArgs::try_parse_from(["grok", "logout", "--all", "--kimi"]).is_err(),
+            "--all conflicts with --kimi"
+        );
+        assert!(
+            PagerArgs::try_parse_from(["grok", "logout", "--all", "--openai"]).is_err(),
+            "--all conflicts with --openai"
+        );
+        assert!(
+            PagerArgs::try_parse_from(["grok", "logout", "--kimi", "--openai"]).is_err(),
+            "--kimi conflicts with --openai"
+        );
+        let args = PagerArgs::try_parse_from(["grok", "logout", "--openai"]).expect("parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Logout {
+                kimi: false,
+                openai: true,
+                claude: false,
+                all: false,
+            })
+        ));
         assert!(args.prompt.is_none());
+    }
+
+    #[test]
+    fn login_openai_flag_parses_and_conflicts() {
+        let args = PagerArgs::try_parse_from(["grok", "login", "--openai"]).expect("parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Login { openai: true, .. })
+        ));
+        // --openai may combine with --device-auth (headless device flow)…
+        let args = PagerArgs::try_parse_from(["grok", "login", "--openai", "--device-auth"])
+            .expect("parses");
+        assert!(matches!(
+            args.command,
+            Some(Command::Login {
+                openai: true,
+                device_auth: true,
+                ..
+            })
+        ));
+        // …but conflicts with --kimi and --oauth.
+        assert!(PagerArgs::try_parse_from(["grok", "login", "--openai", "--kimi"]).is_err());
+        assert!(PagerArgs::try_parse_from(["grok", "login", "--openai", "--oauth"]).is_err());
     }
     #[test]
     fn positional_prompt_conflicts_with_headless_single() {

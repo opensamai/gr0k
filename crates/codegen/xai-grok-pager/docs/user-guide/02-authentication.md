@@ -1,18 +1,52 @@
 # Authentication
 
-Grok supports several authentication methods, including interactive browser login, enterprise single sign-on (SSO), and headless CI/CD runners.
+Hyper (and Grok Build) supports **multiple independent auth methods**. You are not required to use only SpaceXAI / grok.com: you can mix subscriptions and API keys, and switch models without re-binding everything to one vendor.
+
+| Method | How | Typical use |
+|--------|-----|-------------|
+| SpaceXAI / Grok OAuth | `hyper login` or `l` on welcome | Grok-hosted models |
+| xAI API key | `export XAI_API_KEY=…` | CI / no browser |
+| OpenAI Codex (ChatGPT) | `hyper login --openai` / `/login openai` | ChatGPT Plus/Pro coding |
+| Kimi Code | `hyper login --kimi` / `/login kimi` | Kimi subscription |
+| BYOK platforms | `/providers <platform> <key>` or env keys | OpenAI, Anthropic, OpenRouter, Ollama, … |
+| Customer OIDC / SSO | config / env | Enterprise |
+
+Credentials live under `~/.grok/auth.json` in **separate scopes** so logging out of xAI does not wipe Codex or Kimi unless you ask.
 
 ---
 
-## Browser Login (Default)
+## First launch (Hyper community builds)
 
-On first launch, Grok opens your browser to authenticate with grok.com:
+**Hyper does not auto-open the Grok browser login.** You land on the welcome splash:
 
-```bash
-grok
+1. Press **`l`** when you want the default interactive login (usually grok.com).
+2. Or enter a session after any credential is already configured, then use slash commands:
+
+```text
+/login openai          # ChatGPT Codex OAuth
+/login kimi            # Kimi Code OAuth
+/providers openrouter <key>
+/providers anthropic <key>
+/model openrouter/...
 ```
 
-Grok stores credentials in `~/.grok/auth.json` and reuses them across sessions. Grok refreshes access tokens automatically in the background. When a token can't be refreshed, Grok prompts you to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
+If Grok **free usage** is exhausted, the upsell is not paywall-only: you can **switch model / use an API key** or **dismiss** and keep working with another provider. Consumer SuperGrok access gates do not lock the entire TUI on Hyper.
+
+Official `grok` builds may still auto-start SpaceXAI login; Hyper (`community-build`) prefers multi-provider choice.
+
+---
+
+## Browser Login (SpaceXAI / Grok)
+
+On first launch of an official Grok build, or when you press `l` / run login without flags, the CLI opens your browser to authenticate with SpaceXAI:
+
+```bash
+hyper
+# or
+hyper login
+```
+
+Credentials are stored in `~/.grok/auth.json` and reused across sessions. Access tokens refresh in the background. When a token can't be refreshed, you are prompted to sign in again. Credentials without a server-provided expiry fall back to a 30-day lifetime.
 
 ### Credential storage
 
@@ -37,7 +71,22 @@ Running `grok login` starts the sign-in flow again, replacing your cached sessio
 | `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
 | `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
 
-To sign out, run `grok logout`. It takes no flags and clears your cached credentials.
+To sign out of the **xAI** session, run `hyper logout` (or `grok logout` on
+the official binary). That clears the primary xAI session scope only; if Kimi
+or Codex sessions remain, the CLI prints how to clear them.
+
+Third-party subscriptions and BYOK keys are separate:
+
+| Command | Clears |
+|---------|--------|
+| `hyper logout` | xAI session (interactive OAuth / cached session); hints if Kimi/Codex remain |
+| `hyper logout --kimi` | Kimi Code OAuth only |
+| `hyper logout --openai` | OpenAI Codex (ChatGPT) OAuth only |
+| `hyper logout --all` | xAI + Kimi + Codex OAuth (not BYOK platform keys) |
+| `/logout provider <platform>` | A stored BYOK API key for that platform (same as `/providers clear`) |
+
+`XAI_API_KEY` and other env-based keys are never removed by logout — unset the
+environment variable yourself.
 
 ---
 
@@ -50,7 +99,7 @@ export XAI_API_KEY="xai-..."
 grok
 ```
 
-Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `grok logout` or delete `~/.grok/auth.json`.
+Grok uses the API key as a fallback when no session token is active. If you have already signed in interactively, the stored session token takes precedence. To fall back to the API key, run `hyper logout` (xAI session only) or delete the relevant scopes in `~/.grok/auth.json`.
 
 ---
 

@@ -1306,6 +1306,8 @@ mod tests {
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             oidc_issuer: None,
             oidc_client_id: None,
+            account_id: None,
+            platform_base_url: None,
         }
     }
     fn test_auth_manager() -> Arc<crate::auth::AuthManager> {

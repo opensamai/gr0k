@@ -1530,6 +1530,7 @@ pub(super) mod paste_key_tests {
             &crate::app::bundle::BundleState::default(),
             None,
             None,
+            Vec::new(),
         ));
         assert_refused(&mut agent, &mut counts, "agents modal");
         agent.agents_modal = None;

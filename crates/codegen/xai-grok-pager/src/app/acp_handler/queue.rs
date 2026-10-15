@@ -410,6 +410,22 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
         return false;
     };
     let is_active = is_matched_agent_active(app, id);
+
+    // Codex Live broker: extract the prompt_complete data before the agent
+    // borrow so we can feed it to the broker after finalize. The broker's
+    // exactly-once state handles duplicates with the durable TurnCompleted rail.
+    #[cfg(feature = "codex-live")]
+    let live_prompt_complete: Option<(String, String, Option<String>)> =
+        payload.prompt_id.as_ref().map(|pid| {
+            (
+                pid.clone(),
+                payload.stop_reason.clone().unwrap_or_default(),
+                payload.agent_result.clone(),
+            )
+        });
+    #[cfg(not(feature = "codex-live"))]
+    let _live_prompt_complete: Option<()> = None;
+
     let Some(agent) = app.agents.get_mut(&id) else {
         return false;
     };
@@ -425,5 +441,32 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
         payload.agent_result.as_deref(),
         payload.cancel_trigger(),
     );
-    super::super::turn_completion::apply_terminal_outcome(outcome, app, id, is_active)
+    let result = super::super::turn_completion::apply_terminal_outcome(outcome, app, id, is_active);
+
+    // Codex Live broker: feed the legacy prompt_complete rail to the broker.
+    // The broker's exactly-once state handles duplicate rails. Failure/cancel
+    // stop_reasons route through the single centralized `on_prompt_failed`
+    // rail (one `observe_failure` + one explicit `CompleteDelegation` per
+    // terminal delegation), so the final message is never dropped by a
+    // duplicate `observe_failure` returning an empty decision.
+    #[cfg(feature = "codex-live")]
+    if let Some((prompt_id, stop_reason, agent_result)) = live_prompt_complete {
+        let is_error = stop_reason == "error";
+        let is_cancel = stop_reason == "cancelled";
+        if is_error || is_cancel {
+            let msg = if is_error {
+                format!(
+                    "Delegation failed: {}",
+                    agent_result.as_deref().unwrap_or("unknown error")
+                )
+            } else {
+                "Delegation cancelled".to_string()
+            };
+            crate::live::acp_bridge::on_prompt_failed(app, session_id, &prompt_id, &msg);
+        } else {
+            crate::live::acp_bridge::on_turn_completed(app, session_id, &prompt_id);
+        }
+    }
+
+    result
 }

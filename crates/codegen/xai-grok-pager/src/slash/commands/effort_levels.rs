@@ -22,6 +22,7 @@ pub(crate) fn effort_description(level: ReasoningEffort) -> &'static str {
         ReasoningEffort::High => "Heavy reasoning",
         ReasoningEffort::Xhigh => "Extended reasoning",
         ReasoningEffort::Max => "Maximum reasoning",
+        ReasoningEffort::Ultra => "Highest reasoning tier (wire: max; same payload as Max for now)",
     }
 }
 
@@ -72,6 +73,9 @@ pub(crate) fn build_effort_arg_items(
                 match_text: format!("{sort_prefix} {insert_text}"),
                 insert_text,
                 description: option.description.clone().unwrap_or_default(),
+                locked: false,
+                action_id: None,
+                hidden: false,
             }
         })
         .collect()

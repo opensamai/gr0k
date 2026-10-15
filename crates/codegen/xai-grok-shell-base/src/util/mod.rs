@@ -208,14 +208,22 @@ pub fn kill_process_with_signal(pid: u32, signal: KillSignal) -> std::io::Result
         terminate.map_err(|e| std::io::Error::other(format!("TerminateProcess({pid}): {e}")))
     }
 }
-/// True if `pid` is a grok process; pairs with [`kill_process_by_pid`] to avoid killing a recycled PID.
-/// Best-effort on macOS/BSD (liveness-only via `kill -0`), exact on Linux (/proc cmdline) and Windows (image path).
+/// True if `pid` is a Grok Build / Hyper product process.
+///
+/// Pairs with [`kill_process_by_pid`] so leader cleanup does not treat a recycled
+/// PID as "stale" and delete live lock/socket files. Recognizes:
+/// - shipped binaries `grok` and `hyper` (exact basename)
+/// - in-tree test/dev binaries named `xai-grok-*`
+/// - managed install roots `~/.grok/bin/` and `~/.hyper/bin/`
+///
+/// Exact on Linux (`/proc` cmdline argv0), Windows (image path), and macOS
+/// (`proc_pidpath`). Other Unix falls back to liveness-only (`kill -0`).
 pub fn is_grok_process(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
         let cmdline_path = format!("/proc/{pid}/cmdline");
         match std::fs::read(&cmdline_path) {
-            Ok(data) => String::from_utf8_lossy(&data).contains("grok"),
+            Ok(data) => process_image_looks_like_product(&String::from_utf8_lossy(&data)),
             Err(_) => false,
         }
     }
@@ -245,20 +253,116 @@ pub fn is_grok_process(pid: u32) -> bool {
         if result.is_err() {
             return false;
         }
-        String::from_utf16_lossy(&buf[..size as usize])
-            .to_ascii_lowercase()
-            .contains("grok")
+        let path = String::from_utf16_lossy(&buf[..size as usize]).to_ascii_lowercase();
+        process_image_looks_like_product(&path)
     }
-    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        let mut cmd = std::process::Command::new("kill");
-        cmd.args(["-0", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        xai_tty_utils::detach_std_command(&mut cmd);
-        cmd.status().is_ok_and(|s| s.success())
+        // Prefer executable path identity (same basename rules as Linux/Windows).
+        // Fall back to liveness-only only when the path cannot be resolved.
+        match macos_process_image_path(pid) {
+            Some(path) => process_image_looks_like_product(&path),
+            None => process_is_alive_kill0(pid),
+        }
     }
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(windows),
+        not(target_os = "macos"),
+        not(target_os = "ios")
+    ))]
+    {
+        // Other Unix (e.g. BSD without libproc): liveness-only best effort.
+        process_is_alive_kill0(pid)
+    }
+}
+
+/// `kill -0` liveness probe (no signal delivered). Used as a last-resort
+/// fallback when the OS path of a process cannot be resolved.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_alive_kill0(pid: u32) -> bool {
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    xai_tty_utils::detach_std_command(&mut cmd);
+    cmd.status().is_ok_and(|s| s.success())
+}
+
+/// Resolve the full executable path for `pid` on macOS/iOS via `proc_pidpath`.
+///
+/// Returns `None` when the call fails (permissions, dead PID, buffer issues).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn macos_process_image_path(pid: u32) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE is 4 * MAXPATHLEN (1024) on Darwin.
+    const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: `proc_pidpath` writes at most `buf.len()` bytes into `buf` and
+    // returns the number of bytes written (excluding the trailing NUL) on
+    // success, or 0 / negative on failure. We only read the returned prefix.
+    let n = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len() as u32,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    let n = n as usize;
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    let path = std::str::from_utf8(&buf[..end]).ok()?.to_owned();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Whether a process image path / Linux cmdline identifies a product binary.
+///
+/// Linux `/proc/<pid>/cmdline` is NUL-separated argv. We only inspect **argv0**
+/// (the executable path / invocation name), never later arguments — so
+/// `sleep hyper` or `cat /.hyper/bin/foo` does not match. Windows image paths
+/// are a single path string (no argv split).
+pub(crate) fn process_image_looks_like_product(image: &str) -> bool {
+    let image = image.trim();
+    if image.is_empty() {
+        return false;
+    }
+    // Linux cmdline: only argv0 (before the first NUL). Fall back to the whole
+    // string for Windows full image paths and bare basenames.
+    let argv0 = image
+        .split_once('\0')
+        .map(|(head, _)| head)
+        .unwrap_or(image)
+        .trim();
+    if argv0.is_empty() {
+        return false;
+    }
+    let base = argv0
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(argv0)
+        .trim_end_matches(".exe");
+    let base_lower = base.to_ascii_lowercase();
+    if base_lower == "grok" || base_lower == "hyper" {
+        return true;
+    }
+    // Cargo test / example binaries: package names use hyphens in Cargo.toml
+    // (`xai-grok-shell-base`) but the built test artifact uses underscores
+    // (`xai_grok_shell_base-<hash>`).
+    if base_lower.starts_with("xai-grok-") || base_lower.starts_with("xai_grok_") {
+        return true;
+    }
+    // Managed install roots on argv0 only (full path of the executable).
+    let argv0_lower = argv0.to_ascii_lowercase();
+    argv0_lower.contains("/.hyper/bin/")
+        || argv0_lower.contains("/.grok/bin/")
+        || argv0_lower.contains("\\.hyper\\bin\\")
+        || argv0_lower.contains("\\.grok\\bin\\")
 }
 /// Stricter [`is_grok_process`] for the auto-kill zombie path: on macOS/BSD it
 /// name-matches via `ps` (not liveness-only), so eviction never SIGKILLs a
@@ -394,6 +498,37 @@ mod tests {
     fn is_grok_process_self_true_impossible_pid_false() {
         assert!(is_grok_process(std::process::id()));
         assert!(!is_grok_process(u32::MAX));
+    }
+    #[test]
+    fn process_image_recognizes_hyper_and_grok_basenames() {
+        assert!(process_image_looks_like_product("/home/u/.hyper/bin/hyper"));
+        assert!(process_image_looks_like_product(
+            r"C:\Users\u\.hyper\bin\hyper.exe"
+        ));
+        assert!(process_image_looks_like_product("/home/u/.grok/bin/grok"));
+        assert!(process_image_looks_like_product(
+            "/tmp/xai-grok-shell-base-abc123"
+        ));
+        assert!(process_image_looks_like_product(
+            "/tmp/xai_grok_shell_base-abc123"
+        ));
+        // Linux-style cmdline: argv0 + NUL + args
+        assert!(process_image_looks_like_product(
+            "/home/u/.hyper/bin/hyper\0leader\0kill"
+        ));
+        // Later argv tokens must NOT match (false-positive vector).
+        assert!(!process_image_looks_like_product(
+            "/usr/bin/sleep\0hyper"
+        ));
+        assert!(!process_image_looks_like_product(
+            "/bin/cat\0/home/u/.hyper/bin/secret"
+        ));
+        // Workspace path alone must not match without a product basename
+        assert!(!process_image_looks_like_product(
+            "/home/u/hyper-grok-build-new-feature/target/debug/deps/some_other_test-xyz"
+        ));
+        assert!(!process_image_looks_like_product("/usr/bin/sleep"));
+        assert!(!process_image_looks_like_product(""));
     }
     #[test]
     fn is_grok_process_strict_self_true_impossible_pid_false() {

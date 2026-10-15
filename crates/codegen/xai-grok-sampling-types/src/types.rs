@@ -60,6 +60,49 @@ where
     Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
 }
 
+/// Moonshot / Kimi K2.x `thinking` request object.
+///
+/// Wire shape (platform.kimi.ai):
+/// ```json
+/// { "type": "enabled"|"disabled", "keep": "all"|null }
+/// ```
+/// - K2.6: both fields
+/// - K2.5: `type` only (no `keep`)
+/// - K2.7-code: do not send (always on / keep=all)
+/// - K3: use top-level `reasoning_effort` instead
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct KimiThinkingParam {
+    /// `"enabled"` | `"disabled"`.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// `"all"` to preserve historical `reasoning_content`; omit/null otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<String>,
+}
+
+impl KimiThinkingParam {
+    pub fn enabled() -> Self {
+        Self {
+            type_: "enabled".into(),
+            keep: None,
+        }
+    }
+
+    pub fn enabled_keep_all() -> Self {
+        Self {
+            type_: "enabled".into(),
+            keep: Some("all".into()),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            type_: "disabled".into(),
+            keep: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,6 +120,10 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// OpenAI Chat Completions sticky key for automatic prompt-cache affinity
+    /// (replaces relying on the deprecated `user` field for cache bucketing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,8 +132,19 @@ pub struct ChatCompletionRequest {
     pub search_parameters: Option<SearchParameters>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<crate::rs::ResponseFormat>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Chat Completions wire: [`ReasoningEffort::Xhigh`] serializes as `"max"`
+    /// (Kimi K3 / OpenAI alias). See [`serialize_chat_reasoning_effort`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_chat_reasoning_effort"
+    )]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Moonshot / Kimi K2.x thinking control (`thinking.type` / `thinking.keep`).
+    /// K3 uses top-level [`Self::reasoning_effort`] instead; K2.7-code ignores
+    /// this (always on). See platform.kimi.ai thinking-mode docs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<KimiThinkingParam>,
 
     /// custom headers
     #[serde(skip)]
@@ -122,11 +180,13 @@ impl ChatCompletionRequest {
             frequency_penalty: None,
             presence_penalty: None,
             user: None,
+            prompt_cache_key: None,
             tools: None,
             tool_choice: None,
             search_parameters: None,
             response_format: None,
             reasoning_effort: None,
+            thinking: None,
             x_grok_conv_id: None,
             x_grok_req_id: None,
             x_grok_session_id: None,
@@ -148,11 +208,13 @@ impl ChatCompletionRequest {
             frequency_penalty: None,
             presence_penalty: None,
             user: None,
+            prompt_cache_key: None,
             tools: None,
             tool_choice: None,
             search_parameters: None,
             response_format: None,
             reasoning_effort: None,
+            thinking: None,
             x_grok_conv_id: None,
             x_grok_req_id: None,
             x_grok_session_id: None,
@@ -760,6 +822,15 @@ impl CompactionsRemaining {
 }
 
 /// Reasoning effort level. `None`/`Minimal` are omitted on the Anthropic Messages API.
+///
+/// Canonical serialize token for [`Self::Xhigh`] is **`xhigh`** (session
+/// persistence, Responses API mapping, UI). Chat Completions requests map
+/// `Xhigh` → `"max"` only on the [`ChatCompletionRequest`] field (Kimi K3 /
+/// OpenAI-style alias) via [`serialize_chat_reasoning_effort`].
+/// `"max"` deserializes / parses to the first-class [`Self::Max`] tier
+/// (Responses API, Codex, Kimi K3 catalogs). `"ultra"` is Hyper/Codex's
+/// subagent-delegation tier and maps to `"max"` on Chat Completions and
+/// Messages wire forms.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -769,8 +840,41 @@ pub enum ReasoningEffort {
     #[default]
     Medium,
     High,
+    /// Canonical wire/id is `"xhigh"`.
     Xhigh,
+    /// First-class max tier (Responses API / Codex); also what Kimi K3
+    /// catalogs emit as `"max"`.
     Max,
+    /// Codex app-server tier that enables automatic subagent delegation.
+    /// Chat Completions and Messages wire map this to `"max"`.
+    Ultra,
+}
+
+/// Chat Completions wire for [`ChatCompletionRequest::reasoning_effort`].
+///
+/// Maps [`ReasoningEffort::Xhigh`] / [`ReasoningEffort::Max`] /
+/// [`ReasoningEffort::Ultra`] → `"max"` so Moonshot/Kimi K3 (and
+/// OpenAI-style aliases) accept the field, without changing the enum's
+/// global serialize form used for conversation persistence.
+fn serialize_chat_reasoning_effort<S: serde::Serializer>(
+    effort: &Option<ReasoningEffort>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match effort {
+        None => serializer.serialize_none(),
+        Some(e) => {
+            let token = match e {
+                ReasoningEffort::None => "none",
+                ReasoningEffort::Minimal => "minimal",
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
+                // Kimi K3 documents `reasoning_effort: "max"` only.
+                ReasoningEffort::Xhigh | ReasoningEffort::Max | ReasoningEffort::Ultra => "max",
+            };
+            serializer.serialize_str(token)
+        }
+    }
 }
 
 impl ReasoningEffort {
@@ -782,7 +886,7 @@ impl ReasoningEffort {
             Self::Medium => crate::rs::ReasoningEffort::Medium,
             Self::High => crate::rs::ReasoningEffort::High,
             Self::Xhigh => crate::rs::ReasoningEffort::Xhigh,
-            Self::Max => crate::rs::ReasoningEffort::Max,
+            Self::Max | Self::Ultra => crate::rs::ReasoningEffort::Max,
         }
     }
 
@@ -809,12 +913,15 @@ impl ReasoningEffort {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
     pub fn to_messages_api(self) -> Option<&'static str> {
         match self {
             Self::None | Self::Minimal => None,
+            // Ultra is not a Messages wire token; fold to max like Chat Completions.
+            Self::Ultra => Some("max"),
             _ => Some(self.as_str()),
         }
     }
@@ -838,8 +945,9 @@ impl std::str::FromStr for ReasoningEffort {
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::Xhigh),
             "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
             _ => Err(format!(
-                "invalid reasoning effort: {s:?} (expected one of: none, minimal, low, medium, high, xhigh, max)"
+                "invalid reasoning effort: {s:?} (expected one of: none, minimal, low, medium, high, xhigh, max, ultra)"
             )),
         }
     }
@@ -1005,6 +1113,83 @@ pub fn parse_reasoning_efforts_meta(
 
 pub fn reasoning_efforts_meta_value(opts: &[ReasoningEffortOption]) -> serde_json::Value {
     serde_json::to_value(opts).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
+// ── Platform lock meta (BYOK discovery) ────────────────────────────────────
+//
+// Managed platform models (`{platform}/{model}`) whose provider credentials
+// are not configured are projected onto the ACP wire with these meta keys so
+// clients can render them dimmed with a lock affordance instead of hiding
+// them outright. Selecting one is rejected shell-side with the setup hint.
+
+/// `true` when the model needs a platform API key (BYOK) to become usable.
+pub const REQUIRES_API_KEY_META_KEY: &str = "requiresApiKey";
+/// `true` when the model needs a platform OAuth sign-in (e.g. Kimi Code).
+pub const REQUIRES_OAUTH_META_KEY: &str = "requiresOAuth";
+/// Registry platform id, e.g. `"deepseek"`.
+pub const PLATFORM_ID_META_KEY: &str = "platform";
+/// Human platform name, e.g. `"DeepSeek"`.
+pub const PLATFORM_NAME_META_KEY: &str = "platformName";
+/// Env var names that can hold the platform API key (BYOK platforms only).
+pub const API_KEY_ENV_META_KEY: &str = "apiKeyEnv";
+/// One-line setup instructions (env var or `[platforms.<id>]` config table).
+pub const SETUP_HINT_META_KEY: &str = "setupHint";
+
+/// Parsed lock/setup metadata for a credential-less managed platform model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlatformLockMeta {
+    pub platform: String,
+    pub platform_name: String,
+    pub setup_hint: String,
+    pub requires_oauth: bool,
+    pub api_key_env: Vec<String>,
+}
+
+/// Returns the lock meta when the model info is a credential-less managed
+/// platform model, `None` for ordinary (usable) models.
+pub fn parse_platform_lock_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<PlatformLockMeta> {
+    let map = meta?;
+    let requires_api_key = map
+        .get(REQUIRES_API_KEY_META_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let requires_oauth = map
+        .get(REQUIRES_OAUTH_META_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !requires_api_key && !requires_oauth {
+        return None;
+    }
+    let api_key_env = map
+        .get(API_KEY_ENV_META_KEY)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(PlatformLockMeta {
+        platform: map
+            .get(PLATFORM_ID_META_KEY)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        platform_name: map
+            .get(PLATFORM_NAME_META_KEY)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        setup_hint: map
+            .get(SETUP_HINT_META_KEY)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        requires_oauth,
+        api_key_env,
+    })
 }
 
 /// Which API backend to use for model inference.
@@ -1215,6 +1400,7 @@ mod tests {
             ReasoningEffort::High,
             ReasoningEffort::Xhigh,
             ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
         ] {
             let json = serde_json::to_string(&v).unwrap();
             assert_eq!(json, format!("\"{}\"", v.as_str()), "serialize {v:?}");
@@ -1222,6 +1408,17 @@ mod tests {
             assert_eq!(back, v, "round-trip {v:?}");
         }
         assert!(serde_json::from_str::<ReasoningEffort>("\"BOGUS\"").is_err());
+        // `"max"` deserializes to the first-class Max tier (Codex / Kimi K3).
+        // Serialize still emits canonical `"xhigh"` for Xhigh so session
+        // persistence stays stable.
+        assert_eq!(
+            serde_json::from_str::<ReasoningEffort>("\"max\"").unwrap(),
+            ReasoningEffort::Max
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Xhigh).unwrap(),
+            "\"xhigh\""
+        );
     }
 
     #[test]
@@ -1400,8 +1597,11 @@ mod tests {
         );
         let bad_type = as_map(serde_json::json!({"reasoningEffort": 3}));
         assert_eq!(parse_reasoning_effort_meta(Some(&bad_type)), None);
-        let unknown = as_map(serde_json::json!({"reasoningEffort": "ULTRA"}));
-        assert_eq!(parse_reasoning_effort_meta(Some(&unknown)), None);
+        let ultra = as_map(serde_json::json!({"reasoningEffort": "ULTRA"}));
+        assert_eq!(
+            parse_reasoning_effort_meta(Some(&ultra)),
+            Some(ReasoningEffort::Ultra)
+        );
     }
 
     #[test]

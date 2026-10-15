@@ -85,6 +85,7 @@ pub(super) fn make_subagent_info(child_sid: &str) -> SubagentInfo {
         resumed_from: None,
         capability_mode: None,
         workflow_run_id: None,
+        budget: None,
         context_normalized: false,
         parent_prompt_id: None,
         started_at: Instant::now(),
@@ -92,6 +93,8 @@ pub(super) fn make_subagent_info(child_sid: &str) -> SubagentInfo {
         finished: false,
         status: None,
         error: None,
+        termination_reason: None,
+        usage: None,
         duration_ms: None,
         tool_calls: None,
         turns: None,
@@ -1307,6 +1310,7 @@ pub(super) fn test_subagent_spawned(
         role: None,
         model: None,
         resumed_from: None,
+        budget: None,
     }
 }
 pub(super) fn test_subagent_finished(child_sid: &str) -> XaiSessionUpdate {
@@ -1315,6 +1319,8 @@ pub(super) fn test_subagent_finished(child_sid: &str) -> XaiSessionUpdate {
         child_session_id: child_sid.into(),
         status: "completed".into(),
         error: None,
+        termination_reason: None,
+        usage: None,
         tool_calls: 2,
         turns: 1,
         duration_ms: 500,
@@ -2133,3 +2139,5 @@ mod background_tasks;
 mod models;
 mod mcp;
 mod git_head;
+#[cfg(feature = "codex-live")]
+mod live;

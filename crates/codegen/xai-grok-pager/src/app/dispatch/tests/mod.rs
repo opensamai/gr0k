@@ -4,6 +4,7 @@ mod billing;
 mod cta_e2e;
 mod dashboard;
 mod jump;
+mod live;
 mod modes;
 mod notes;
 mod permissions;
@@ -274,6 +275,10 @@ fn test_app() -> AppView {
         voice_auth: None,
         voice_cmd_tx: None,
         voice_state: VoiceState::Idle,
+        #[cfg(feature = "codex-live")]
+        live_runtime: crate::live::state::LiveRuntime::default(),
+        #[cfg(feature = "codex-live")]
+        live_mode_enabled: false,
     }
 }
 /// Build a default `AgentSession` for
@@ -366,6 +371,7 @@ fn make_test_subagent(child_sid: &str, sa_id: &str) -> crate::app::subagent::Sub
         resumed_from: None,
         capability_mode: None,
         workflow_run_id: None,
+        budget: None,
         context_normalized: false,
         parent_prompt_id: None,
         started_at: std::time::Instant::now(),
@@ -373,6 +379,8 @@ fn make_test_subagent(child_sid: &str, sa_id: &str) -> crate::app::subagent::Sub
         finished: false,
         status: None,
         error: None,
+        termination_reason: None,
+        usage: None,
         duration_ms: None,
         tool_calls: None,
         turns: None,

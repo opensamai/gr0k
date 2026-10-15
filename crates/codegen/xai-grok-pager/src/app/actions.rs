@@ -109,6 +109,10 @@ pub enum Action {
     ImportClaudeConfirm,
     /// User cancelled the import modal — close without applying.
     ImportClaudeCancel,
+    /// Open the changes review modal (fetch pending hunks first).
+    OpenChanges,
+    /// Dispatch a review action (accept/reject) from the changes modal.
+    ChangesAction(crate::views::changes_modal::ChangesActionKind),
     /// Hide the import-claude menu row by recording the current `.claude/`
     /// content hash as "seen". Doesn't import anything, doesn't change
     /// runtime fallback behavior. The menu reappears only if `.claude/`
@@ -179,6 +183,35 @@ pub enum Action {
     /// any pending cold-start so a release during pipeline spawn can't leave a
     /// hot mic.
     VoiceStop,
+    /// Toggle the Codex Live voice session (`/live`). Starts if idle, stops if
+    /// active. Mutually exclusive with `/voice` dictation — starting one stops
+    /// the other.
+    #[cfg(feature = "codex-live")]
+    LiveToggle,
+    /// Stop the Codex Live session unconditionally (Esc, Ctrl+C, navigation,
+    /// quit, ACP disconnect). Idempotent.
+    #[cfg(feature = "codex-live")]
+    LiveStop,
+    /// Toggle the Live mute state (Space key in the visualizer).
+    #[cfg(feature = "codex-live")]
+    LiveToggleMute,
+    /// Set the Live mute state explicitly (`true` = muted, `false` = unmuted).
+    /// Space toggles; this is the explicit variant.
+    #[cfg(feature = "codex-live")]
+    LiveSetMuted(bool),
+    /// A `LiveEvent::Delegation` submitted text to the bound AgentSession.
+    /// Carries the draft snapshot so it can be restored after the prompt
+    /// pipeline clears the textarea. The event loop dispatches this to submit
+    /// the text through the normal `SendPrompt` path, then registers the
+    /// `(generation, delegation_id) -> (AgentId, SessionId, prompt_id)`.
+    #[cfg(feature = "codex-live")]
+    LiveDelegationSubmit {
+        agent_id: crate::app::agent::AgentId,
+        text: String,
+        delegation_id: String,
+        generation: u64,
+        draft: crate::live::state::DraftSnapshot,
+    },
     /// Send a direct bash command (bypasses agent loop).
     SendBashCommand(String),
     /// The user wiped a substantial prompt draft: show the seen-gated
@@ -393,8 +426,10 @@ pub enum Action {
         tool_name: String,
         enabled: bool,
     },
-    /// Cycle to next model.
+    /// Cycle to the next model in the scoped shortlist (`enabled_models`).
     NextModel,
+    /// Cycle to the previous model in the scoped shortlist.
+    PrevModel,
     /// Switch active model.
     SwitchModel {
         model_id: acp::ModelId,
@@ -509,6 +544,10 @@ pub enum Action {
     SetHunkTrackerMode(String),
     /// Set default screen mode (`fullscreen` | `minimal`); restart-required.
     SetScreenMode(String),
+    /// Set the UI display language (`auto` | `en` | `zh-CN`). SHELL-owned;
+    /// persisted to `[ui].language` and applied live via
+    /// `rust_i18n::set_locale` — no restart required.
+    SetLanguage(String),
     /// Enable/disable the Ctrl+Space / F8 voice-dictation shortcut. SHELL-owned;
     /// persisted to `[ui].voice_keybind_enabled`. Takes effect on the next
     /// keypress; `/voice` is unaffected.
@@ -561,6 +600,15 @@ pub enum Action {
     /// session and persists via `Effect::PersistSetting`. Does not
     /// carry effort — use `Action::SwitchModel` for that.
     SetDefaultModel(acp::ModelId),
+    /// Persist a third-party platform API key from `/providers` (stored in
+    /// `~/.grok/auth.json` under `platform/<id>`, then restamps the catalog).
+    /// Empty `api_key` clears the stored key. `base_url` carries the optional
+    /// self-hosted gateway root for BYOK platforms (Nexus).
+    SetPlatformApiKey {
+        platform: String,
+        api_key: String,
+        base_url: Option<String>,
+    },
     /// Clear the persisted default model (`cfg.models.default = None`).
     /// Active session's model is unchanged; next session resolves
     /// via the shell's default-resolution chain.
@@ -638,6 +686,12 @@ pub enum Action {
     SwitchAccount,
     /// User pressed login on the welcome screen.
     Login,
+    /// Interactive Kimi Code subscription login (`/login kimi`).
+    LoginKimi,
+    /// Interactive OpenAI Codex (ChatGPT) subscription login (`/login openai`).
+    LoginOpenAiCodex,
+    /// Interactive Anthropic Claude (Pro/Max) subscription login (`/login claude`).
+    LoginAnthropicClaude,
     /// Cancel an in-progress login that was started from inside a session
     /// (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit
@@ -1371,6 +1425,20 @@ pub struct DoctorFixTarget {
 }
 #[derive(Debug)]
 pub enum Effect {
+    /// Fetch pending changes (files + hunks) for the review modal.
+    /// `post_action`: this is a refetch after an action landed (must not
+    /// reopen a closed modal).
+    FetchChanges {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        post_action: bool,
+    },
+    /// Run one review action (accept/reject hunk/file/all).
+    ChangesAction {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        kind: crate::views::changes_modal::ChangesActionKind,
+    },
     /// Create a new ACP session.
     CreateSession {
         agent_id: AgentId,
@@ -1532,6 +1600,14 @@ pub enum Effect {
     Compact {
         agent_id: AgentId,
         session_id: acp::SessionId,
+    },
+    /// Persist a BYOK platform API key via `x.ai/internal/set_platform_api_key`
+    /// and restamp the catalog. Empty `api_key` clears the stored key.
+    /// `base_url` carries the optional self-hosted gateway root (Nexus).
+    SetPlatformApiKey {
+        platform: String,
+        api_key: String,
+        base_url: Option<String>,
     },
     /// Kill a background task.
     KillBgTask {
@@ -2164,6 +2240,27 @@ pub enum TaskResult {
         session_id: acp::SessionId,
         models: Option<acp::SessionModelState>,
     },
+    /// Pending changes (files + hunks) loaded for the review modal.
+    ChangesLoaded {
+        agent_id: AgentId,
+        files: Vec<crate::views::changes_modal::FileSummaryDto>,
+        hunks: Vec<crate::views::changes_modal::HunkDto>,
+        /// `true` for refetches after an action landed — those must not
+        /// reopen a modal the user closed meanwhile (oracle).
+        post_action: bool,
+    },
+    /// The pending-changes fetch failed.
+    ChangesFailed {
+        agent_id: AgentId,
+        error: String,
+    },
+    /// A review action (accept/reject) completed.
+    ChangesActionDone {
+        agent_id: AgentId,
+        success: bool,
+        error: Option<String>,
+        affected_count: Option<usize>,
+    },
     /// Session creation failed.
     SessionFailed {
         agent_id: AgentId,
@@ -2356,6 +2453,15 @@ pub enum TaskResult {
     CompactComplete {
         agent_id: AgentId,
         result: Result<(), String>,
+    },
+    /// `/providers` API key save / clear completed.
+    SetPlatformApiKeyComplete {
+        platform: String,
+        cleared: bool,
+        models_unlocked: u64,
+        /// Env var *names* still set after clear (values never included).
+        env_still_active: Vec<String>,
+        error: Option<String>,
     },
     /// Background task kill result. `outcome` is `None` when the agent
     /// returned an error envelope or an unparseable payload (treated as

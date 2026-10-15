@@ -47,6 +47,11 @@ pub enum CommandResult {
     HandledNoOp,
     /// Build or act on TUI doctor state from live app/session inputs.
     Doctor(DoctorRequest),
+    /// Run the repo-readiness probe set against the active session's
+    /// workspace and push the report to the scrollback.
+    Readiness,
+    /// Fetch pending hunks and open the changes review modal (A2).
+    Changes,
     /// Command failed with an error message.
     Error(String),
     /// Command produced a user-visible message.
@@ -96,6 +101,39 @@ pub struct ArgItem {
     pub insert_text: String,
     /// Description shown alongside the item.
     pub description: String,
+    /// Render dimmed with a lock affordance (credential-less BYOK models).
+    /// Selecting a locked item surfaces its setup hint via the command's
+    /// `run()` rather than performing the action. Locked rows are excluded
+    /// from the default (scoped) suggestion view; typing a query or opening
+    /// the picker's All view reveals them.
+    pub locked: bool,
+    /// Catalog/id payload for row-level actions (e.g. model id for hide).
+    /// `None` when the row has no actionable identity (effort rows, plain
+    /// option rows).
+    pub action_id: Option<String>,
+    /// The row represents a model currently in `[models].hidden_models`
+    /// (only synthesized into the picker's All view so it can be unhidden).
+    pub hidden: bool,
+}
+
+impl ArgItem {
+    /// Convenience constructor for ordinary (non-locked) items.
+    pub fn new(
+        display: impl Into<String>,
+        match_text: impl Into<String>,
+        insert_text: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            display: display.into(),
+            match_text: match_text.into(),
+            insert_text: insert_text.into(),
+            description: description.into(),
+            locked: false,
+            action_id: None,
+            hidden: false,
+        }
+    }
 }
 
 /// Read-only context for generating suggestions.

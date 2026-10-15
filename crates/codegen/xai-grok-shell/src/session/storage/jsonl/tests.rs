@@ -543,6 +543,12 @@ async fn test_subagent_notifications_round_trip() {
             role: None,
             model: None,
             resumed_from: None,
+            budget: Some(crate::extensions::notification::SubagentBudgetInfo {
+                max_turns: Some(12),
+                max_tool_calls: Some(40),
+                timeout_secs: Some(180),
+                finalize_grace_secs: Some(30),
+            }),
             workflow_run_id: None,
         },
         meta: None,
@@ -555,6 +561,18 @@ async fn test_subagent_notifications_round_trip() {
             child_session_id: "child-001".to_string(),
             status: "completed".to_string(),
             error: None,
+            termination_reason: Some("max_tool_calls_finalize".to_string()),
+            usage: Some(crate::extensions::notification::SubagentUsageInfo {
+                totals: crate::extensions::notification::PromptUsageModel {
+                    input_tokens: 1_000,
+                    output_tokens: 200,
+                    total_tokens: 1_200,
+                    model_calls: 4,
+                    cost_usd_ticks: Some(50_000_000),
+                    ..Default::default()
+                },
+                incomplete: false,
+            }),
             tool_calls: 5,
             turns: 2,
             duration_ms: 12345,
@@ -628,12 +646,18 @@ async fn test_subagent_notifications_round_trip() {
     let spawned_update = &spawned_json["params"]["update"];
     assert_eq!(spawned_update["sessionUpdate"], "subagent_spawned");
     assert_eq!(spawned_update["subagent_id"], "child-001");
+    assert_eq!(spawned_update["budget"]["maxToolCalls"], 40);
     let finished_json: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(finished_json["method"], "_x.ai/session/update");
     let finished_update = &finished_json["params"]["update"];
     assert_eq!(finished_update["sessionUpdate"], "subagent_finished");
     assert_eq!(finished_update["tool_calls"], 5);
     assert_eq!(finished_update["duration_ms"], 12345);
+    assert_eq!(
+        finished_update["termination_reason"],
+        "max_tool_calls_finalize"
+    );
+    assert_eq!(finished_update["usage"]["modelCalls"], 4);
 }
 #[tokio::test]
 async fn test_subagent_spawned_resumed_roundtrip() {
@@ -661,6 +685,7 @@ async fn test_subagent_spawned_resumed_roundtrip() {
             role: None,
             model: None,
             resumed_from: Some("source-agent-id".to_string()),
+            budget: None,
             workflow_run_id: None,
         },
         meta: None,
@@ -2206,24 +2231,15 @@ fn fork_filter_handles_consecutive_user_messages() {
 fn fork_filter_consecutive_users_with_tool_calls() {
     use xai_grok_sampling_types::conversation::*;
     let mut items = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("prefix"),
-            ConversationItem::user("query"),
-            ConversationItem::Assistant(AssistantItem {
-                content: String::new().into(),
-                tool_calls: vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                }],
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
-            }),
-            ConversationItem::tool_result("tc1", "output"),
-            ConversationItem::user("follow-up"),
-            // Incomplete turn — no assistant response
-        ];
+        ConversationItem::system("sys"), ConversationItem::user("prefix"),
+        ConversationItem::user("query"), ConversationItem::Assistant(AssistantItem {
+        content : String::new().into(), tool_calls : vec![ToolCall { id : "tc1".into(),
+        name : "bash".into(), arguments : "{}".into(), }], model_id : None, reasoning_model_identity : None,
+        model_fingerprint : None, reasoning_effort : None, }),
+        ConversationItem::tool_result("tc1", "output"),
+        ConversationItem::user("follow-up"),
+    ];
+
     super::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),
@@ -2235,20 +2251,13 @@ fn fork_filter_consecutive_users_with_tool_calls() {
 fn fork_filter_preserves_complete_tool_turn() {
     use xai_grok_sampling_types::conversation::*;
     let mut items = vec![
-            ConversationItem::user("q"),
-            ConversationItem::Assistant(AssistantItem {
-                content: String::new().into(),
-                tool_calls: vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                }],
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
-            }),
-            ConversationItem::tool_result("tc1", "output"),
-        ];
+        ConversationItem::user("q"), ConversationItem::Assistant(AssistantItem { content
+        : String::new().into(), tool_calls : vec![ToolCall { id : "tc1".into(), name :
+        "bash".into(), arguments : "{}".into(), }], model_id : None, reasoning_model_identity : None, model_fingerprint :
+        None, reasoning_effort : None, }), ConversationItem::tool_result("tc1",
+        "output"),
+    ];
+
     super::fork_filter_chat(&mut items);
     assert_eq!(items.len(), 3, "complete tool turn should be preserved");
 }
@@ -2256,22 +2265,13 @@ fn fork_filter_preserves_complete_tool_turn() {
 fn fork_filter_strips_incomplete_tool_turn() {
     use xai_grok_sampling_types::conversation::*;
     let mut items = vec![
-            ConversationItem::user("q1"),
-            ConversationItem::assistant("a1"),
-            ConversationItem::user("q2"),
-            ConversationItem::Assistant(AssistantItem {
-                content: String::new().into(),
-                tool_calls: vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                }],
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
-            }),
-            // Missing tool result — incomplete
-        ];
+        ConversationItem::user("q1"), ConversationItem::assistant("a1"),
+        ConversationItem::user("q2"), ConversationItem::Assistant(AssistantItem { content
+        : String::new().into(), tool_calls : vec![ToolCall { id : "tc1".into(), name :
+        "bash".into(), arguments : "{}".into(), }], model_id : None, reasoning_model_identity : None, model_fingerprint :
+        None, reasoning_effort : None, }),
+    ];
+
     super::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),
@@ -2463,28 +2463,16 @@ fn fork_filter_keeps_turn_with_reasoning_between_user_and_assistant() {
 fn fork_filter_keeps_multi_tool_cycle_turn_with_reasoning() {
     use xai_grok_sampling_types::conversation::*;
     let mut items = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("q"),
-            ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
-                "plan",
-            )),
-            ConversationItem::Assistant(AssistantItem {
-                content: String::new().into(),
-                tool_calls: vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                }],
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
-            }),
-            ConversationItem::tool_result("tc1", "output"),
-            ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
-                "reflect",
-            )),
-            ConversationItem::assistant("final text"),
-        ];
+        ConversationItem::system("sys"), ConversationItem::user("q"),
+        ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("plan",)),
+        ConversationItem::Assistant(AssistantItem { content : String::new().into(),
+        tool_calls : vec![ToolCall { id : "tc1".into(), name : "bash".into(), arguments :
+        "{}".into(), }], model_id : None, reasoning_model_identity : None, model_fingerprint : None,
+        reasoning_effort : None, }), ConversationItem::tool_result("tc1", "output"),
+        ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("reflect",)),
+        ConversationItem::assistant("final text"),
+    ];
+
     super::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),
@@ -2502,37 +2490,19 @@ fn fork_filter_keeps_multi_tool_cycle_turn_with_reasoning() {
 fn fork_filter_keeps_multi_tool_turn_with_reasoning_between_results() {
     use xai_grok_sampling_types::conversation::*;
     let mut items = vec![
-            ConversationItem::system("sys"),
-            ConversationItem::user("q"),
-            ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
-                "plan",
-            )),
-            ConversationItem::Assistant(AssistantItem {
-                content: String::new().into(),
-                tool_calls: vec![
-                    ToolCall {
-                        id: "tc1".into(),
-                        name: "bash".into(),
-                        arguments: "{}".into(),
-                    },
-                    ToolCall {
-                        id: "tc2".into(),
-                        name: "grep".into(),
-                        arguments: "{}".into(),
-                    },
-                ],
-                model_id: None,
-                model_fingerprint: None,
-                reasoning_effort: None,
-            }),
-            ConversationItem::tool_result("tc1", "out1"),
-            ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("mid")),
-            ConversationItem::tool_result("tc2", "out2"),
-            ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
-                "reflect",
-            )),
-            ConversationItem::assistant("final"),
-        ];
+        ConversationItem::system("sys"), ConversationItem::user("q"),
+        ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("plan",)),
+        ConversationItem::Assistant(AssistantItem { content : String::new().into(),
+        tool_calls : vec![ToolCall { id : "tc1".into(), name : "bash".into(), arguments :
+        "{}".into(), }, ToolCall { id : "tc2".into(), name : "grep".into(), arguments :
+        "{}".into(), },], model_id : None, reasoning_model_identity : None, model_fingerprint : None,
+        reasoning_effort : None, }), ConversationItem::tool_result("tc1", "out1"),
+        ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("mid")),
+        ConversationItem::tool_result("tc2", "out2"),
+        ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("reflect",)),
+        ConversationItem::assistant("final"),
+    ];
+
     super::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),

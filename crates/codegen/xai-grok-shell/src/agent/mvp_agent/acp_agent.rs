@@ -550,10 +550,17 @@ impl acp::Agent for MvpAgent {
         );
         if let Some(preferred) = self.cfg.borrow().grok_com_config.preferred_method {
             let kind = auth_method::AuthMethodKind::from_id(&arguments.method_id);
-            let allowed = match preferred {
-                crate::auth::PreferredAuthMethod::ApiKey => kind.is_api_key(),
-                crate::auth::PreferredAuthMethod::Oidc => kind.is_session_based(),
-            };
+            // Kimi Code / Codex / Claude are independent third-party channels
+            // and are always allowed alongside preferred xAI methods.
+            let allowed = matches!(
+                kind,
+                auth_method::AuthMethodKind::KimiCode
+                    | auth_method::AuthMethodKind::OpenAiCodex
+                    | auth_method::AuthMethodKind::AnthropicClaude
+            ) || match preferred {
+                    crate::auth::PreferredAuthMethod::ApiKey => kind.is_api_key(),
+                    crate::auth::PreferredAuthMethod::Oidc => kind.is_session_based(),
+                };
             if !allowed {
                 let msg = match preferred {
                     crate::auth::PreferredAuthMethod::ApiKey => {
@@ -768,6 +775,183 @@ impl acp::Agent for MvpAgent {
                 });
                 self.maybe_fetch_post_auth_settings().await;
                 Ok(self.auth_response_with_meta())
+            }
+            auth_method::KIMI_CODE_METHOD_ID => {
+                let auth_meta = AuthRequestMeta::from_json(arguments.meta.as_ref());
+                let client_seq = auth_meta.request_seq;
+                let mut cancelled = false;
+                let (cancel, _guard) = self.interactive_auth.begin(None, client_seq);
+                let auth_result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        Err(anyhow::anyhow!("Authentication cancelled"))
+                    }
+                    r = crate::auth::kimi::run_kimi_code_login() => r,
+                };
+                let auth = auth_result.map_err(|e| {
+                    emit_login_span(
+                        false,
+                        "kimi-code",
+                        None,
+                        Some(if cancelled {
+                            "login_cancelled"
+                        } else {
+                            "login_flow_failed"
+                        }),
+                    );
+                    let mut err = acp::Error::auth_required();
+                    err.message = e.to_string();
+                    err
+                })?;
+                // Re-stamp kimi-code/* catalog entries with the new bearer.
+                self.models_manager.restamp_platform_credentials();
+                // Do not replace the primary xAI AuthManager session.
+                emit_login_span(true, "kimi-code", None, None);
+                log_event(xai_grok_telemetry::events::Login {
+                    auth_method: "kimi-code".to_string(),
+                    user_id: None,
+                });
+                let _ = auth;
+                Ok(Default::default())
+            }
+            auth_method::OPENAI_CODEX_METHOD_ID => {
+                let auth_meta = AuthRequestMeta::from_json(arguments.meta.as_ref());
+                let client_seq = auth_meta.request_seq;
+                let mut cancelled = false;
+                let auth_result = if !auth_meta.headless {
+                    // Interactive (TUI): push the auth URL and accept a
+                    // manually pasted code through the client UI channels.
+                    let (url_tx, url_rx) = tokio::sync::oneshot::channel();
+                    let (code_tx, code_rx) = tokio::sync::mpsc::channel(1);
+                    let (cancel, _guard) = self.interactive_auth.begin(
+                        Some(crate::auth::single_flight::AttemptChannels::new(
+                            code_tx, url_rx,
+                        )),
+                        client_seq,
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            cancelled = true;
+                            Err(anyhow::anyhow!("Authentication cancelled"))
+                        }
+                        r = crate::auth::openai_codex::run_openai_codex_login(
+                            Some(crate::auth::AuthChannels {
+                                url_tx: Some(url_tx),
+                                code_rx,
+                            }),
+                            crate::auth::openai_codex::CodexLoginMethod::Browser,
+                        ) => r,
+                    }
+                } else {
+                    // Headless ACP: device code is reliable over SSH/CI where
+                    // loopback browser callbacks are unavailable (even if the
+                    // agent process has a pseudo-TTY on stdin).
+                    let (cancel, _guard) = self.interactive_auth.begin(None, client_seq);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            cancelled = true;
+                            Err(anyhow::anyhow!("Authentication cancelled"))
+                        }
+                        r = crate::auth::openai_codex::run_openai_codex_login(
+                            None,
+                            crate::auth::openai_codex::CodexLoginMethod::DeviceCode,
+                        ) => r,
+                    }
+                };
+                let auth = auth_result.map_err(|e| {
+                    emit_login_span(
+                        false,
+                        "openai-codex",
+                        None,
+                        Some(if cancelled {
+                            "login_cancelled"
+                        } else {
+                            "login_flow_failed"
+                        }),
+                    );
+                    let mut err = acp::Error::auth_required();
+                    err.message = e.to_string();
+                    err
+                })?;
+                // Re-stamp openai-codex/* catalog entries with the new bearer.
+                self.models_manager.restamp_platform_credentials();
+                // Do not replace the primary xAI AuthManager session.
+                emit_login_span(true, "openai-codex", None, None);
+                log_event(xai_grok_telemetry::events::Login {
+                    auth_method: "openai-codex".to_string(),
+                    user_id: None,
+                });
+                let _ = auth;
+                Ok(Default::default())
+            }
+            auth_method::ANTHROPIC_CLAUDE_METHOD_ID => {
+                let auth_meta = AuthRequestMeta::from_json(arguments.meta.as_ref());
+                let client_seq = auth_meta.request_seq;
+                let mut cancelled = false;
+                // Interactive (TUI): push the auth URL + accept a pasted code.
+                // Headless: no channels — the loopback/browser path is driven
+                // by the CLI login binary, not this ACP method.
+                let auth_result = if !auth_meta.headless {
+                    let (url_tx, url_rx) = tokio::sync::oneshot::channel();
+                    let (code_tx, code_rx) = tokio::sync::mpsc::channel(1);
+                    let (cancel, _guard) = self.interactive_auth.begin(
+                        Some(crate::auth::single_flight::AttemptChannels::new(
+                            code_tx, url_rx,
+                        )),
+                        client_seq,
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            cancelled = true;
+                            Err(anyhow::anyhow!("Authentication cancelled"))
+                        }
+                        r = crate::auth::anthropic_claude::run_anthropic_claude_login(
+                            Some(crate::auth::AuthChannels {
+                                url_tx: Some(url_tx),
+                                code_rx,
+                            }),
+                        ) => r,
+                    }
+                } else {
+                    let (cancel, _guard) = self.interactive_auth.begin(None, client_seq);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            cancelled = true;
+                            Err(anyhow::anyhow!("Authentication cancelled"))
+                        }
+                        r = crate::auth::anthropic_claude::run_anthropic_claude_login(None) => r,
+                    }
+                };
+                let auth = auth_result.map_err(|e| {
+                    emit_login_span(
+                        false,
+                        "anthropic-claude",
+                        None,
+                        Some(if cancelled {
+                            "login_cancelled"
+                        } else {
+                            "login_flow_failed"
+                        }),
+                    );
+                    let mut err = acp::Error::auth_required();
+                    err.message = e.to_string();
+                    err
+                })?;
+                // Re-stamp anthropic-claude/* catalog entries with the new bearer.
+                self.models_manager.restamp_platform_credentials();
+                // Do not replace the primary xAI AuthManager session.
+                emit_login_span(true, "anthropic-claude", None, None);
+                log_event(xai_grok_telemetry::events::Login {
+                    auth_method: "anthropic-claude".to_string(),
+                    user_id: None,
+                });
+                let _ = auth;
+                Ok(Default::default())
             }
             auth_method::GROK_COM_METHOD_ID | auth_method::OIDC_METHOD_ID => {
                 let grok_ctx = self.auth_manager.grok_com_config();
@@ -1874,10 +2058,20 @@ impl acp::Agent for MvpAgent {
             "load_session: restoring persisted model (debug)"
         );
         let is_grok_build = persisted_model.0.starts_with("grok-build");
+        // Locked BYOK rows ride in `available` for discovery but can't sample —
+        // fallbacks must skip them or a restored session breaks on first prompt.
+        let usable =
+            |id: &acp::ModelId| crate::agent::models::usable_in_projection(&available, id);
         let same_family_fallback = if is_grok_build {
-            available.keys().find(|id| id.0.starts_with("grok-build")).cloned()
+            available
+                .keys()
+                .find(|id| usable(id) && id.0.starts_with("grok-build"))
+                .cloned()
         } else {
-            available.keys().find(|id| !id.0.starts_with("grok-build")).cloned()
+            available
+                .keys()
+                .find(|id| usable(id) && !id.0.starts_with("grok-build"))
+                .cloned()
         };
         let selectable_catalog_key = selectable_catalog_key_for_persisted(
             &models,
@@ -1942,7 +2136,7 @@ impl acp::Agent for MvpAgent {
         } else {
             let fallback = available
                 .keys()
-                .next()
+                .find(|id| usable(id))
                 .cloned()
                 .unwrap_or_else(|| persisted_model.clone());
             tracing::warn!(
@@ -2190,7 +2384,7 @@ impl acp::Agent for MvpAgent {
                     &unavailable_model,
                 )
                 .unwrap_or(unavailable_model.clone());
-            if available.contains_key(&restore_model_id) {
+            if crate::agent::models::usable_in_projection(&available, &restore_model_id) {
                 tracing::info!(
                     session_id = %arguments.session_id.0,
                     model_id = %restore_model_id.0,
@@ -3336,6 +3530,19 @@ impl acp::Agent for MvpAgent {
                     .data("This model isn't allowed by your allowed_models setting."),
             );
         }
+        // Locked platform model: present in the picker for BYOK discovery but
+        // not usable until the provider credential is configured. Reject here
+        // too (not just client-side) so a third-party base URL can never be
+        // reached with the xAI session token via a crafted set_model call.
+        if model.is_managed_platform_model() && !model.has_own_credentials() {
+            let (platform, hint) = model
+                .managed_platform()
+                .map(|p| (p.display_name(), p.setup_hint()))
+                .unwrap_or(("this platform", String::new()));
+            return Err(acp::Error::invalid_params().data(format!(
+                "Provider '{platform}' is not configured. To enable it: {hint}"
+            )));
+        }
         let session_id = args.session_id.clone();
         let res = crate::agent::handlers::model_switch::apply(self, args).await;
         if res.is_ok()
@@ -3407,8 +3614,10 @@ impl acp::Agent for MvpAgent {
             | "x.ai/internal/reload_all_mcp_servers"
             | "x.ai/internal/reload_project_mcp_servers" | "x.ai/internal/reload_skills"
             | "x.ai/internal/reload_workflows" | "x.ai/internal/reload_models"
-            | "x.ai/internal/reload_models_cache" | "x.ai/internal/auth_cleared"
-            | "x.ai/plugins/reload" | "x.ai/commands/list" => {
+            | "x.ai/internal/reload_models_cache" | "x.ai/internal/reload_subagent_models"
+            | "x.ai/internal/set_platform_api_key"
+            | "x.ai/internal/auth_cleared" | "x.ai/plugins/reload"
+            | "x.ai/commands/list" => {
                 crate::extensions::session_admin::handle(self, &args).await
             }
             "x.ai/session/repair" => crate::extensions::repair::handle(self, &args).await,

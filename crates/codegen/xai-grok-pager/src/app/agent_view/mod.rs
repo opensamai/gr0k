@@ -1126,6 +1126,12 @@ pub struct AgentView {
     pub hit_upgrade_cta: HitArea,
     /// Stop button in the voice record indicator row (`[stop]`), far right.
     pub hit_voice_stop_button: HitArea,
+    /// Mute/unmute control in the Codex Live visualizer footer.
+    #[cfg(feature = "codex-live")]
+    pub hit_live_mute_button: HitArea,
+    /// Stop control in the Codex Live visualizer footer.
+    #[cfg(feature = "codex-live")]
+    pub hit_live_stop_button: HitArea,
     /// Scrollbar track for the scrollback pane (for click-to-jump / drag).
     pub hit_scrollbar: HitArea,
     /// Whether a scrollbar drag is in progress on the scrollback scrollbar.
@@ -1717,7 +1723,7 @@ fn translate_local_submit(
             InputOutcome::Action(Action::OpenUrl(url.to_string()))
         }
         LocalQuestionKind::FreeUsageUpsell { source } => {
-            let url = qv
+            let action_id = qv
                 .questions
                 .first()
                 .and_then(|q| q.options.get(*idx))
@@ -1729,7 +1735,15 @@ fn translate_local_submit(
                     auth_method: None,
                 },
             );
-            InputOutcome::Action(Action::OpenUrl(url.to_string()))
+            // Community multi-provider escapes are handled in
+            // `submit_question_answers` (needs `&mut self`). URL paths stay here.
+            if action_id == super::dispatch::UPSELL_ACTION_SWITCH_MODEL
+                || action_id == super::dispatch::UPSELL_ACTION_DISMISS
+            {
+                // Placeholder — real work is done before this free function runs.
+                return InputOutcome::Changed;
+            }
+            InputOutcome::Action(Action::OpenUrl(action_id.to_string()))
         }
         LocalQuestionKind::AgentTypeMismatch { model_id, effort } => {
             let start_new = *idx == 0;
@@ -2094,6 +2108,7 @@ fn resolve_action(action_id: Option<ActionId>) -> Option<InputOutcome> {
         ActionId::FocusPrompt => Action::FocusPrompt,
         ActionId::FocusScrollback => Action::FocusScrollback,
         ActionId::NextModel => Action::NextModel,
+        ActionId::PrevModel => Action::PrevModel,
         ActionId::CycleMode => Action::CycleMode,
         ActionId::CancelTurn
         | ActionId::Quit
@@ -2394,6 +2409,7 @@ pub(crate) mod test_fixtures {
             resumed_from: None,
             capability_mode: None,
             workflow_run_id: None,
+            budget: None,
             context_normalized: false,
             parent_prompt_id: None,
             started_at: Instant::now(),
@@ -2401,6 +2417,8 @@ pub(crate) mod test_fixtures {
             finished: false,
             status: None,
             error: None,
+            termination_reason: None,
+            usage: None,
             duration_ms: None,
             tool_calls: None,
             turns: None,

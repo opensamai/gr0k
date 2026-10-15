@@ -663,7 +663,19 @@ where
 {
     let opt = Option::<u32>::deserialize(deserializer)?;
     if let Some(0) = opt {
-        return Err(serde::de::Error::custom("maxTurns must be greater than 0"));
+        return Err(serde::de::Error::custom("value must be greater than 0"));
+    }
+    Ok(opt)
+}
+
+/// Accepts a positive u64 or null/absent. Rejects 0.
+fn deserialize_nonzero_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    if let Some(0) = opt {
+        return Err(serde::de::Error::custom("value must be greater than 0"));
     }
     Ok(opt)
 }
@@ -673,8 +685,8 @@ where
 /// are defined in exactly one place. The enum covers all built-in
 /// agents for centralized name management and `by_name()` dispatch.
 ///
-/// `subagent_variants()` returns only the 3 that are exposed to the LLM
-/// via the `TaskTool` description. The remaining 6 are top-level agent
+/// `subagent_variants()` returns the built-ins exposed to the LLM via the
+/// `TaskTool` description. The remaining variants are top-level agent
 /// profiles resolvable by name but not advertised as subagent types.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter, AsRefStr, IntoStaticStr,
@@ -691,7 +703,9 @@ pub enum BuiltinAgentName {
     GeneralPurpose,
     Explore,
     Plan,
+    Oracle,
     BrowserUse,
+    Xdotcom,
     #[strum(serialize = "grok-build-orchestrator")]
     GrokBuildOrchestrator,
 }
@@ -720,13 +734,15 @@ impl BuiltinAgentName {
             Self::GeneralPurpose => AgentDefinition::general_purpose(),
             Self::Explore => AgentDefinition::explore(),
             Self::Plan => AgentDefinition::plan(),
+            Self::Oracle => AgentDefinition::oracle(),
             Self::BrowserUse => AgentDefinition::browser_use(),
+            Self::Xdotcom => AgentDefinition::xdotcom(),
             Self::GrokBuildOrchestrator => AgentDefinition::grok_build_orchestrator(),
         }
     }
     /// Built-in agents available as subagents via the Task tool.
     pub fn subagent_variants() -> &'static [Self] {
-        &[Self::GeneralPurpose, Self::Explore, Self::Plan]
+        &[Self::GeneralPurpose, Self::Explore, Self::Plan, Self::Oracle, Self::Xdotcom]
     }
 }
 /// Portable agent identity — parsed from .grok/agents/*.md.
@@ -748,8 +764,8 @@ pub struct AgentDefinition {
     #[serde(default = "default_grok_build_toolset")]
     pub tool_config: ToolServerConfig,
     /// Runtime capability mode that constrains which tool kinds the agent
-    /// can use. Applied during subagent spawn in `handle_subagent_request`
-    /// by filtering the definition's `tool_config` before session creation.
+    /// can use. Subagent resolution intersects all ceilings, and AgentBuilder
+    /// enforces the result after default tools have been injected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_mode: Option<xai_tool_types::SubagentCapabilityMode>,
     #[serde(default)]
@@ -787,8 +803,18 @@ pub struct AgentDefinition {
     pub disallowed_tools: Vec<String>,
     #[serde(default)]
     pub effort: Option<Effort>,
+    /// Maximum model/tool-use rounds for one prompt. `None` is unlimited.
     #[serde(default, deserialize_with = "deserialize_nonzero_u32")]
     pub max_turns: Option<u32>,
+    /// Maximum tool invocations before the runtime cancels the subagent.
+    #[serde(default, deserialize_with = "deserialize_nonzero_u32")]
+    pub max_tool_calls: Option<u32>,
+    /// Total subagent wall-clock budget, including initialization.
+    #[serde(default, deserialize_with = "deserialize_nonzero_u64")]
+    pub timeout_secs: Option<u64>,
+    /// Time reserved before `timeout_secs` for a final answer without more tools.
+    #[serde(default, deserialize_with = "deserialize_nonzero_u64")]
+    pub finalize_grace_secs: Option<u64>,
     #[serde(default)]
     pub isolation: Option<IsolationMode>,
     #[serde(default)]
@@ -1029,6 +1055,17 @@ pub enum Effort {
 impl Effort {
     pub const VALID_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 }
+impl From<Effort> for xai_tool_types::SubagentReasoningEffort {
+    fn from(value: Effort) -> Self {
+        match value {
+            Effort::Low => Self::Low,
+            Effort::Medium => Self::Medium,
+            Effort::High => Self::High,
+            Effort::XHigh => Self::Xhigh,
+            Effort::Max => Self::Max,
+        }
+    }
+}
 const _: () = assert!(Effort::VALID_VALUES.len() == <Effort as strum::EnumCount>::COUNT);
 #[derive(
     Debug,
@@ -1049,6 +1086,14 @@ pub enum IsolationMode {
 }
 impl IsolationMode {
     pub const VALID_VALUES: &[&str] = &["none", "worktree"];
+}
+impl From<IsolationMode> for xai_tool_types::SubagentIsolationMode {
+    fn from(value: IsolationMode) -> Self {
+        match value {
+            IsolationMode::None => Self::None,
+            IsolationMode::Worktree => Self::Worktree,
+        }
+    }
 }
 const _: () =
     assert!(IsolationMode::VALID_VALUES.len() == <IsolationMode as strum::EnumCount>::COUNT);
@@ -1466,6 +1511,9 @@ impl AgentDefinition {
             tools: vec![],
             effort: None,
             max_turns: None,
+            max_tool_calls: None,
+            timeout_secs: None,
+            finalize_grace_secs: None,
             isolation: None,
             background: None,
             color: None,
@@ -1567,9 +1615,13 @@ impl AgentDefinition {
         Self {
             description: xai_tool_types::EXPLORE_SUBAGENT.description.to_string(),
             tool_config: explore_toolset(),
+            capability_mode: Some(xai_tool_types::SubagentCapabilityMode::ReadOnly),
+            tools: vec!["read_file".into(), "list_dir".into(), "grep".into()],
             permission_mode: PermissionMode::Plan,
             prompt_body: Some(subagent_prompts::EXPLORE_PROMPT.to_string()),
             inherit_skills: false,
+            inject_default_tools: false,
+            mcp_inheritance: McpInheritance::None,
             ..Self::base(BuiltinAgentName::Explore, "")
         }
     }
@@ -1579,10 +1631,37 @@ impl AgentDefinition {
         Self {
             description: xai_tool_types::PLAN_SUBAGENT.description.to_string(),
             tool_config: plan_toolset(),
+            capability_mode: Some(xai_tool_types::SubagentCapabilityMode::ReadOnly),
             permission_mode: PermissionMode::Plan,
             prompt_body: Some(subagent_prompts::PLAN_PROMPT.to_string()),
             inherit_skills: false,
+            mcp_inheritance: McpInheritance::None,
             ..Self::base(BuiltinAgentName::Plan, "")
+        }
+    }
+    /// Oracle subagent — read-only deep-analysis advisor the working agent
+    /// consults when stuck. Read-only at the toolset (same tools as
+    /// explore); the working agent keeps ownership of every edit.
+    ///
+    /// Pairs with a stronger pinned model: `/agents` → `m`, or
+    /// `[subagents.models] oracle = "..."` in config.toml.
+    pub fn oracle() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::ORACLE_SUBAGENT.description.to_string(),
+            tool_config: explore_toolset(),
+            capability_mode: Some(xai_tool_types::SubagentCapabilityMode::ReadOnly),
+            tools: vec!["read_file".into(), "list_dir".into(), "grep".into()],
+            permission_mode: PermissionMode::Plan,
+            prompt_body: Some(subagent_prompts::ORACLE_PROMPT.to_string()),
+            inherit_skills: false,
+            inject_default_tools: false,
+            mcp_inheritance: McpInheritance::None,
+            max_turns: Some(12),
+            max_tool_calls: Some(40),
+            timeout_secs: Some(180),
+            finalize_grace_secs: Some(30),
+            ..Self::base(BuiltinAgentName::Oracle, "")
         }
     }
     /// Browser Use agent definition.
@@ -1600,6 +1679,18 @@ impl AgentDefinition {
                 BuiltinAgentName::BrowserUse,
                 "Web browsing and interaction agent.",
             )
+        }
+    }
+    /// X.com (Twitter) subagent definition.
+    ///
+    /// A content and engagement specialist with full tool access.
+    /// Uses the general-purpose toolset (full GrokBuild tools).
+    pub fn xdotcom() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::XDOTCOM_SUBAGENT.description.to_string(),
+            prompt_body: Some(subagent_prompts::XDOTCOM_PROMPT.to_string()),
+            ..Self::base(BuiltinAgentName::Xdotcom, "")
         }
     }
     /// Grok Build Orchestrator — GBL model with full GrokBuild tools
@@ -1799,17 +1890,20 @@ mod tests {
     /// until classified.
     fn expected_strict_harness(name: BuiltinAgentName) -> bool {
         match name {
-            BuiltinAgentName::Codex | BuiltinAgentName::GrokBuildOrchestrator => true,
+            BuiltinAgentName::Codex
+            | BuiltinAgentName::GrokBuildOrchestrator
+            | BuiltinAgentName::Explore
+            | BuiltinAgentName::Oracle => true,
             BuiltinAgentName::GrokBuild
             | BuiltinAgentName::GrokBuildConcise
             | BuiltinAgentName::GrokBuildPlan
             | BuiltinAgentName::GrokBuildPlanNoSubagents
             | BuiltinAgentName::GrokBuildAskUser
             | BuiltinAgentName::GeneralPurpose
-            | BuiltinAgentName::Explore
             | BuiltinAgentName::Plan
             | BuiltinAgentName::Opencode
-            | BuiltinAgentName::BrowserUse => false,
+            | BuiltinAgentName::BrowserUse
+            | BuiltinAgentName::Xdotcom => false,
         }
     }
     /// Invariant: structural `is_strict_harness()` must match the
@@ -1830,7 +1924,7 @@ mod tests {
     }
     #[test]
     fn is_strict_harness_agent_type_classifies_by_name() {
-        for strict in ["codex", "grok-build-orchestrator"] {
+        for strict in ["codex", "grok-build-orchestrator", "explore", "oracle"] {
             assert!(
                 is_strict_harness_agent_type(strict),
                 "{strict} should be strict"
@@ -1843,6 +1937,7 @@ mod tests {
             "grok-build-ask-user",
             "opencode",
             "browser-use",
+            "xdotcom",
             "custom-user-agent",
             "",
             "grok-build-totally-made-up",
@@ -1972,6 +2067,82 @@ Agent.
         );
     }
     #[test]
+    fn test_parse_execution_budget_fields() {
+        let content = "---\nname: bounded\ndescription: Test\nmaxTurns: 12\nmaxToolCalls: 40\ntimeoutSecs: 180\nfinalizeGraceSecs: 30\n---\n";
+        let def = AgentDefinition::parse(content).unwrap();
+        assert_eq!(def.max_turns, Some(12));
+        assert_eq!(def.max_tool_calls, Some(40));
+        assert_eq!(def.timeout_secs, Some(180));
+        assert_eq!(def.finalize_grace_secs, Some(30));
+    }
+    #[test]
+    fn test_parse_zero_execution_budget_fields_rejected() {
+        for field in ["maxToolCalls", "timeoutSecs", "finalizeGraceSecs"] {
+            let content = format!("---\nname: test\ndescription: Test\n{field}: 0\n---\n");
+            assert!(
+                AgentDefinition::parse(&content).is_err(),
+                "{field}: 0 should be rejected at parse time"
+            );
+        }
+    }
+    #[test]
+    fn oracle_has_bounded_execution_defaults() {
+        let def = AgentDefinition::oracle();
+        assert_eq!(def.max_turns, Some(12));
+        assert_eq!(def.max_tool_calls, Some(40));
+        assert_eq!(def.timeout_secs, Some(180));
+        assert_eq!(def.finalize_grace_secs, Some(30));
+    }
+    #[test]
+    fn oracle_is_enforced_read_only_by_its_exact_toolset() {
+        let def = AgentDefinition::oracle();
+        let actual: Vec<&str> = def
+            .tool_config
+            .tools
+            .iter()
+            .map(|tool| tool.id.as_str())
+            .collect();
+        let expected = [
+            ToolConfig::from(&grok_build::ReadFileTool).id,
+            ToolConfig::from(&grok_build::ListDirTool).id,
+            ToolConfig::from(&grok_build::GrepTool).id,
+        ];
+        assert_eq!(
+            actual,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            def.capability_mode,
+            Some(xai_tool_types::SubagentCapabilityMode::ReadOnly)
+        );
+        assert_eq!(def.permission_mode, PermissionMode::Plan);
+        assert!(!def.inject_default_tools);
+        assert_eq!(def.mcp_inheritance, McpInheritance::None);
+        assert!(!def.hosted_tool_allowed("web_search"));
+        assert!(!def.hosted_tool_allowed("x_search"));
+    }
+    #[test]
+    fn built_in_read_only_subagents_have_runtime_capability_ceilings() {
+        for def in [
+            AgentDefinition::explore(),
+            AgentDefinition::plan(),
+            AgentDefinition::oracle(),
+        ] {
+            assert_eq!(
+                def.capability_mode,
+                Some(xai_tool_types::SubagentCapabilityMode::ReadOnly),
+                "{} must remain read-only after default tool injection",
+                def.name
+            );
+            assert_eq!(
+                def.mcp_inheritance,
+                McpInheritance::None,
+                "{} must not inherit unclassified MCP tools",
+                def.name
+            );
+        }
+    }
+    #[test]
     fn test_parse_model_empty_is_inherit() {
         let content = "---\nname: test\ndescription: Test\nmodel: \"\"\n---\n";
         let def = AgentDefinition::parse(content).unwrap();
@@ -1989,6 +2160,9 @@ Agent.
         let def = AgentDefinition::parse(content).unwrap();
         assert!(def.effort.is_none());
         assert!(def.max_turns.is_none());
+        assert!(def.max_tool_calls.is_none());
+        assert!(def.timeout_secs.is_none());
+        assert!(def.finalize_grace_secs.is_none());
         assert!(def.isolation.is_none());
         assert!(def.background.is_none());
         assert!(def.color.is_none());
@@ -2463,6 +2637,7 @@ description: Test default tool config
             ("general-purpose", BuiltinAgentName::GeneralPurpose),
             ("explore", BuiltinAgentName::Explore),
             ("plan", BuiltinAgentName::Plan),
+            ("oracle", BuiltinAgentName::Oracle),
             ("browser-use", BuiltinAgentName::BrowserUse),
         ] {
             let parsed = BuiltinAgentName::from_str(s).unwrap();
@@ -2492,10 +2667,12 @@ description: Test default tool config
     #[test]
     fn test_builtin_agent_name_subagent_variants() {
         let variants = BuiltinAgentName::subagent_variants();
-        assert_eq!(variants.len(), 3);
+        assert_eq!(variants.len(), 5);
         assert!(variants.contains(&BuiltinAgentName::GeneralPurpose));
         assert!(variants.contains(&BuiltinAgentName::Explore));
         assert!(variants.contains(&BuiltinAgentName::Plan));
+        assert!(variants.contains(&BuiltinAgentName::Oracle));
+        assert!(variants.contains(&BuiltinAgentName::Xdotcom));
     }
     #[test]
     fn test_all_builtins_have_inherit_model() {
