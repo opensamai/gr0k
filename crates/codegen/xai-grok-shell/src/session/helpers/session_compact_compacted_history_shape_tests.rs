@@ -58,16 +58,6 @@ async fn test_compacted_history_raw_strings() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "I'll read the file now.".into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "read_file".into(),
-                arguments: r#"{"target_file": "src/auth.rs"}"#.into(),
-            }],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         ConversationItem::tool_result("tc1", "fn login() { /* buggy code */ }"),
         ConversationItem::Assistant(AssistantItem {
@@ -81,18 +71,6 @@ async fn test_compacted_history_raw_strings() {
             }],
             model_id: None,
             reasoning_model_identity: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
-        }
-            content: "Found the bug, applying fix.".into(),
-            tool_calls: vec![ToolCall {
-                id: "tc2".into(),
-                name: "search_replace".into(),
-                arguments:
-                    r#"{"file_path": "src/auth.rs", "old_string": "buggy", "new_string": "fixed"}"#
-                        .into(),
-            }],
-            model_id: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }),
@@ -252,16 +230,6 @@ async fn grok_build_compaction_drops_working_tail_regression_206460() {
             }],
             model_id: None,
             reasoning_model_identity: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
-        }
-            content: "reading the file".into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "read_file".into(),
-                arguments: r#"{"target_file": "src/auth.rs"}"#.into(),
-            }],
-            model_id: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }),

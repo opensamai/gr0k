@@ -1457,16 +1457,6 @@ async fn side_question_trims_reasoning_orphaned_by_mid_turn_truncation() {
                     reasoning_model_identity: None,
                     model_fingerprint: None,
                     reasoning_effort: None,
-                }
-                    content: String::new().into(),
-                    tool_calls: vec![ToolCall {
-                        id: "tc1".into(),
-                        name: "read_file".into(),
-                        arguments: "{}".into(),
-                    }],
-                    model_id: None,
-                    model_fingerprint: None,
-                    reasoning_effort: None,
                 }),
             ]);
 

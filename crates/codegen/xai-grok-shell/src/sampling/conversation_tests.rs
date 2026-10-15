@@ -59,16 +59,6 @@ fn fork_filter_consecutive_users_with_tool_calls() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: String::new().into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            }],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         ConversationItem::tool_result("tc1", "output"),
         ConversationItem::user("follow-up"),
@@ -97,16 +87,6 @@ fn fork_filter_preserves_complete_tool_turn() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: String::new().into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            }],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         ConversationItem::tool_result("tc1", "output"),
     ];
@@ -130,16 +110,6 @@ fn fork_filter_strips_incomplete_tool_turn() {
             }],
             model_id: None,
             reasoning_model_identity: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
-        }
-            content: String::new().into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "bash".into(),
-                arguments: "{}".into(),
-            }],
-            model_id: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }),
@@ -202,23 +172,6 @@ fn fork_filter_keeps_multi_tool_turn_with_reasoning_between_results() {
             ],
             model_id: None,
             reasoning_model_identity: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
-        }
-            content: String::new().into(),
-            tool_calls: vec![
-                ToolCall {
-                    id: "tc1".into(),
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                },
-                ToolCall {
-                    id: "tc2".into(),
-                    name: "grep".into(),
-                    arguments: "{}".into(),
-                },
-            ],
-            model_id: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }),

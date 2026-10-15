@@ -2047,24 +2047,6 @@ async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "I'll fix the typo and run tests.".into(),
-            tool_calls: vec![
-                ToolCall {
-                    id: "call_3".into(),
-                    name: "edit_file".to_string(),
-                    arguments: r#"{"target_file":"src/main.rs","new_string":"Hello, world!"}"#
-                        .into(),
-                },
-                ToolCall {
-                    id: "call_4".into(),
-                    name: "run_terminal_cmd".to_string(),
-                    arguments: r#"{"command":"cargo test"}"#.into(),
-                },
-            ],
-            model_id: Some("grok-3".to_string()),
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         // [9] Tool result for call_3
         ConversationItem::tool_result("call_3", "File edited successfully."),
@@ -2789,12 +2771,6 @@ fn conversation_item_preserves_reasoning_siblings() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "response".into(),
-            tool_calls: vec![],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
     ]);
     assert_eq!(result.len(), 3);
@@ -2818,12 +2794,6 @@ fn strip_reasoning_blocks_drops_reasoning_siblings() {
             tool_calls: vec![],
             model_id: None,
             reasoning_model_identity: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
-        }
-            content: "response".into(),
-            tool_calls: vec![],
-            model_id: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }),
@@ -2874,16 +2844,6 @@ fn prepare_for_summarization_drops_reasoning_sibling_on_mutated_assistant() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "I'll search.".into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "grep".into(),
-                arguments: "{}".into(),
-            }],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         ConversationItem::tool_result("tc1", "match found"),
     ]);
@@ -2928,12 +2888,6 @@ fn prepare_for_summarization_drops_standalone_reasoning_sibling() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "plain text response".into(),
-            tool_calls: vec![],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
     ]);
     assert_eq!(result.len(), 1);
@@ -2971,16 +2925,6 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "calling grep".into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "grep".into(),
-                arguments: "{}".into(),
-            }],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         ConversationItem::tool_result("tc1", "match"),
         ConversationItem::user("second turn"),
@@ -2992,12 +2936,6 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
             reasoning_model_identity: None,
             model_fingerprint: None,
             reasoning_effort: None,
-        }
-            content: "thinking only".into(),
-            tool_calls: vec![],
-            model_id: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
         }),
         ConversationItem::tool_result("tc2", "stray"),
         ConversationItem::user("third turn"),
@@ -3006,12 +2944,6 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
             tool_calls: vec![],
             model_id: None,
             reasoning_model_identity: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
-        }
-            content: "plain reply".into(),
-            tool_calls: vec![],
-            model_id: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }),
@@ -3080,16 +3012,6 @@ fn prepare_for_summarization_is_idempotent() {
             }],
             model_id: None,
             reasoning_model_identity: None,
-            model_fingerprint: None,
-            reasoning_effort: None,
-        }
-            content: "hi".into(),
-            tool_calls: vec![ToolCall {
-                id: "tc1".into(),
-                name: "ls".into(),
-                arguments: "{}".into(),
-            }],
-            model_id: None,
             model_fingerprint: None,
             reasoning_effort: None,
         }),
