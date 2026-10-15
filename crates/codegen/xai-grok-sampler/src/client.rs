@@ -38,7 +38,7 @@ use xai_grok_sampling_types::{
 use crate::config::{AuthScheme, OriginClientInfo, RequestCompression, SamplerConfig};
 use crate::events::SamplingErrorInfo;
 use crate::request_compression::{compress_body, should_compress};
-use crate::span_timing::{ERROR, STATUS_CODE, SUCCESS, StreamSpanTiming};
+use crate::span_timing::{ERROR, ItemClass, STATUS_CODE, SUCCESS, StreamSpanTiming};
 use crate::stream_classify::{chat_chunk_class, message_event_class, responses_event_class};
 use crate::types::ResponsesStreamItem;
 use xai_grok_auth::bearer_suffix;
@@ -295,6 +295,16 @@ fn decode_responses_sse_frame(
             Ok(None) => Ok(ResponsesStreamItem::Heartbeat),
             Err(err) => Err(err),
         }
+    }
+}
+
+/// Classify one [`ResponsesStreamItem`] for `StreamSpanTiming::hold_until_first_content`.
+/// A heartbeat carries no model output and never ends the stream, so it keeps
+/// the TTFT span held (liveness-only) instead of counting as first content.
+fn responses_stream_item_class(item: &ResponsesStreamItem) -> ItemClass {
+    match item {
+        ResponsesStreamItem::Heartbeat => ItemClass::Other,
+        ResponsesStreamItem::Event(event) => responses_event_class(event),
     }
 }
 
@@ -1540,7 +1550,6 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
-        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("chat/completions"));
         let http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -1572,7 +1581,6 @@ impl SamplingClient {
                 self.record_401_attribution(
                     crate::attribution::SamplingConsumer::ChatCompletionsStream,
                     sent_bearer.as_deref(),
-                    sent_bearer_prefix.as_deref(),
                 );
                 let endpoint = self.endpoint("chat/completions");
                 let body = response.bytes().await.unwrap_or_default();
@@ -1855,7 +1863,7 @@ impl SamplingClient {
         &self,
         request: CreateResponseWrapper,
     ) -> Result<(
-        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        BoxStream<'static, Result<ResponsesStreamItem>>,
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
@@ -1951,7 +1959,6 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("responses"));
         let mut http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -2085,7 +2092,7 @@ impl SamplingClient {
             .boxed();
 
         Ok((
-            span_timing.hold_until_first_content(events, responses_event_class),
+            span_timing.hold_until_first_content(events, responses_stream_item_class),
             model_metadata,
             doom_loop,
         ))
@@ -2284,7 +2291,6 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("messages"));
-        let (http_request, sent_bearer_prefix) = self.post(self.endpoint("messages"));
         let http_request = grok_headers
             .apply(builder)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -2648,7 +2654,7 @@ impl SamplingClient {
     /// [`Self::conversation_collect`] with a caller-chosen idle timeout, for short side calls (autocomplete, memory notes) that must give up fast.
     pub async fn conversation_collect_with_idle_timeout(
         &self,
-        request: ConversationRequest,
+        mut request: ConversationRequest,
         idle_timeout: std::time::Duration,
     ) -> Result<ConversationResponse> {
         self.apply_conversation_defaults(&mut request)?;
@@ -3814,11 +3820,14 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let (request, sent_bearer_prefix) = client.post("https://example.test/v1/responses");
-        let request = request.build().expect("request should build");
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = client.post("https://example.test/v1/responses");
+        let request = builder.build().expect("request should build");
 
         assert!(request.headers().get(AUTHORIZATION).is_none());
-        assert!(sent_bearer_prefix.is_none());
+        assert!(sent_bearer.is_none());
     }
 
     #[test]
@@ -3837,8 +3846,11 @@ mod tests {
             let info = client.auth_info();
             assert_eq!(info.auth_type, "bearer");
             assert!(info.auth_prefix.is_none());
-            let (request, sent_bearer_prefix) = client.post("https://example.test/v1/responses");
-            let request = request.build().expect("request should build");
+            let SentRequest {
+                builder,
+                sent_bearer,
+            } = client.post("https://example.test/v1/responses");
+            let request = builder.build().expect("request should build");
 
             assert_eq!(
                 request
@@ -3854,10 +3866,10 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 expected
             );
-            assert_eq!(sent_bearer_prefix.as_deref(), Some("fresh-bearer"));
+            assert_eq!(sent_bearer.as_deref(), Some("fresh-bearer"));
             client.record_401_attribution(
                 crate::attribution::SamplingConsumer::Responses,
-                sent_bearer_prefix.as_deref(),
+                sent_bearer.as_deref(),
             );
             assert_eq!(
                 calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3877,14 +3889,17 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let (request, sent_bearer_prefix) = client.post("https://example.test/v1/messages");
-        let request = request.build().expect("request should build");
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = client.post("https://example.test/v1/messages");
+        let request = builder.build().expect("request should build");
         assert!(
             request.headers().get(AUTHORIZATION).is_none(),
             "failed refresh must not send the expired construction-time bearer"
         );
         assert!(request.headers().get("x-api-key").is_none());
-        assert!(sent_bearer_prefix.is_none());
+        assert!(sent_bearer.is_none());
     }
 
     #[test]
@@ -3897,14 +3912,17 @@ mod tests {
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
-        let (request, sent_bearer_prefix) = client.post("https://example.test/v1/messages");
-        let request = request.build().expect("request should build");
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = client.post("https://example.test/v1/messages");
+        let request = builder.build().expect("request should build");
         assert!(request.headers().get(AUTHORIZATION).is_none());
         assert!(
             request.headers().get("x-api-key").is_none(),
             "failed live resolution must not send a stale construction-time x-api-key"
         );
-        assert!(sent_bearer_prefix.is_none());
+        assert!(sent_bearer.is_none());
     }
 
     /// Regression: when `api_key` (which seeds `default_headers` with an
@@ -4046,7 +4064,7 @@ mod tests {
             "stale default Authorization must not be sent when resolver is empty"
         );
         assert!(
-            sent_bearer_prefix.is_none(),
+            sent.is_none(),
             "resolver None must not attribute a stripped default seed"
         );
     }

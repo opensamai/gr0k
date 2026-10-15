@@ -421,8 +421,8 @@ async fn apply_retry_decision(
             if stripped == 0 {
                 // The classifier matched but the request contains no removable
                 // continuation state. Repeating the same payload cannot help.
-                emit_failed(event_tx, request_id, err);
-                send_completion(completion_tx, Err(clone_error(err)));
+                let terminal_event_queued = emit_failed(event_tx, request_id, err);
+                send_completion(completion, Err(clone_error(err)), terminal_event_queued);
                 return false;
             }
             *retry_count += 1;
@@ -1581,8 +1581,8 @@ mod tests {
 
         let cancel_token = CancellationToken::new();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (completion_tx, _completion_rx) = oneshot::channel();
-        let mut completion_tx = Some(completion_tx);
+        let (completion_tx, mut completion_rx) = oneshot::channel();
+        let mut completion = CompletionState::new(Some(completion_tx));
         let mut retry_count = 0;
         let mut request = ConversationRequest::from_items(vec![
             ConversationItem::user("question"),
@@ -1614,7 +1614,8 @@ mod tests {
             &mut client,
             &config,
             &cancel_token,
-            &mut completion_tx,
+            &mut completion,
+            &tracing::Span::none(),
         )
         .await;
 
@@ -1649,7 +1650,7 @@ mod tests {
             other => panic!("expected portable-context retry event, got {other:?}"),
         }
         assert!(
-            completion_tx.is_some(),
+            matches!(completion_rx.try_recv(), Ok(None)),
             "retry must not complete the request"
         );
     }
