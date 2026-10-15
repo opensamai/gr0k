@@ -18,6 +18,11 @@ pub fn settings_cache_identity(auth: &GrokAuth, alpha_test_key: Option<&str>) ->
         AuthMode::Oidc => "oidc",
         AuthMode::External => "external",
         AuthMode::ApiKey => "api_key",
+        // gr0k third-party subscription logins; each has its own OAuth store
+        // scope, so they are distinct accounts for settings-cache identity.
+        AuthMode::KimiCode => "kimi_code",
+        AuthMode::OpenAiCodex => "openai_codex",
+        AuthMode::AnthropicClaude => "anthropic_claude",
     };
     crate::remote_settings::scope_hash(&[
         principal,
