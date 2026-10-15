@@ -1804,7 +1804,9 @@ mod tests {
                 | BuiltinAgentName::GeneralPurpose
                 | BuiltinAgentName::Explore
                 | BuiltinAgentName::Plan
+                | BuiltinAgentName::Oracle
                 | BuiltinAgentName::BrowserUse
+                | BuiltinAgentName::Xdotcom
                 | BuiltinAgentName::GrokBuildOrchestrator => false,
             };
             assert_eq!(

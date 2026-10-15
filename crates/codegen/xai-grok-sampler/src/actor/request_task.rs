@@ -1146,6 +1146,7 @@ mod tests {
             &CancellationToken::new(),
             Arc::new(Mutex::new(None)),
             None,
+            None,
             FailedResponseCapture::default(),
             Arc::new(AtomicBool::new(false)),
             policy,
@@ -1165,6 +1166,7 @@ mod tests {
             &event_tx,
             &CancellationToken::new(),
             Arc::new(Mutex::new(None)),
+            None,
             None,
             FailedResponseCapture::default(),
             Arc::new(AtomicBool::new(false)),
@@ -1228,6 +1230,7 @@ mod tests {
             &event_tx,
             &CancellationToken::new(),
             Arc::new(Mutex::new(None)),
+            None,
             None,
             FailedResponseCapture::default(),
             Arc::new(AtomicBool::new(false)),
@@ -1601,6 +1604,7 @@ mod tests {
             model_metadata: None,
             retry_after_secs: None,
             should_retry: Some(false),
+            error_code: None,
         };
 
         let should_continue = apply_retry_decision(
@@ -1650,7 +1654,10 @@ mod tests {
             other => panic!("expected portable-context retry event, got {other:?}"),
         }
         assert!(
-            matches!(completion_rx.try_recv(), Ok(None)),
+            matches!(
+                completion_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
             "retry must not complete the request"
         );
     }

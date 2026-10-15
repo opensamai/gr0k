@@ -1013,7 +1013,7 @@ mod tests {
             // Reasoning is already captured, so an intact replay would carry it: only the veto can empty the capture
             // The collector is armed before the stream runs, so the abort lands on the tool frame
             capture.record_reasoning_delta(0, 0, "reasoning-1".into(), "looping thought");
-            let raw = stream::iter(vec![Ok(tool_frame), Ok(completed_event())]).boxed();
+            let raw = raw_events(vec![Ok(tool_frame), Ok(completed_event())]);
             let events = collect(stream_responses_tracked(
                 raw,
                 None,
@@ -1070,11 +1070,10 @@ mod tests {
 
     /// Returns the (collapsed stop reason, raw wire stop reason) for an Incomplete response ending with the given `incomplete_details.reason`.
     async fn stop_reasons_for_incomplete(reason: &str) -> (Option<StopReason>, Option<String>) {
-        let raw = stream::iter(vec![
+        let raw = raw_events(vec![
             Ok(text_delta_event("cut")),
             Ok(incomplete_event(reason)),
-        ])
-        .boxed();
+        ]);
         let events = collect(stream_responses(
             raw,
             None,
@@ -1144,7 +1143,7 @@ mod tests {
                 response: build_response(rs_types::Status::Incomplete),
                 sequence_number: 0,
             });
-        let raw = stream::iter(vec![Ok(text_delta_event("cut")), Ok(event)]).boxed();
+        let raw = raw_events(vec![Ok(text_delta_event("cut")), Ok(event)]);
         let events = collect(stream_responses(
             raw,
             None,
@@ -1184,7 +1183,7 @@ mod tests {
                 response,
                 sequence_number: 0,
             });
-        let raw = stream::iter(vec![Ok(event)]).boxed();
+        let raw = raw_events(vec![Ok(event)]);
         let events = collect(stream_responses(
             raw,
             None,
@@ -1297,7 +1296,7 @@ mod tests {
             message: "could not decode image".into(),
             param: None,
         });
-        let raw = stream::iter(vec![Ok(error_event)]).boxed();
+        let raw = raw_events(vec![Ok(error_event)]);
         let events = collect(stream_responses(
             raw,
             None,
@@ -1559,7 +1558,7 @@ mod tests {
                 ),
             },
         );
-        let raw = stream::iter(vec![Ok(in_progress), Ok(done), Ok(completed_event())]).boxed();
+        let raw = raw_events(vec![Ok(in_progress), Ok(done), Ok(completed_event())]);
         let events = collect(stream_responses(
             raw,
             None,
