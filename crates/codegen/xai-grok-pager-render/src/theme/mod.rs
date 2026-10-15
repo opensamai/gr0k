@@ -35,7 +35,7 @@ pub enum ThemeKind {
     OscuraMidnight = 5,
     /// Every bg is `Reset` so the terminal canvas shows through; legible on both polarities without appearance detection.
     /// Hidden and unparseable while `cache::terminal_theme_enabled()` is off.
-    Terminal = 6,
+    Terminal = 18,
     /// Follow system appearance. Disk stores `"auto"`; `cache::CURRENT` holds only the resolved concrete kind. Excluded from [`ALL`].
     Auto = 4,
 
