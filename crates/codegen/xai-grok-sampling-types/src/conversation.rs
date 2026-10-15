@@ -893,7 +893,9 @@ fn strip_images_where(
         }
     }
     stripped
+}
 
+impl ConversationRequest {
     /// Remove provider/model-bound continuation state while retaining portable
     /// user, assistant, and local tool history. Used for a single recovery
     /// attempt when a provider rejects stale reasoning/signature/native-tool
