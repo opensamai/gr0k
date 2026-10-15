@@ -1,11 +1,9 @@
 use std::path::{Component, Path};
 
 use crate::sampling::{
-use crate::sampling::{
     ApiBackend, ChatCompletionRequest, ChatRequestMessage, Client as OaiCompatClient,
     ConversationItem, ConversationRequest, ConversationToolChoice, HostedTool, SamplingError,
     ToolChoice, ToolDefinition, ToolSpec, conversation_to_chat_messages,
-};
 };
 use agent_client_protocol as acp;
 use async_openai::types::responses::ResponseStreamEvent;

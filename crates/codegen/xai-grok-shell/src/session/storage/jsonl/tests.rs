@@ -1292,7 +1292,7 @@ fn fork_filter_consecutive_users_with_tool_calls() {
         ConversationItem::user("follow-up"),
     ];
 
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert_eq!(
         items.len(),
         5,
@@ -1319,7 +1319,7 @@ fn fork_filter_preserves_complete_tool_turn() {
         ConversationItem::tool_result("tc1", "output"),
     ];
 
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert_eq!(items.len(), 3, "complete tool turn should be preserved");
 }
 #[test]
@@ -1343,7 +1343,7 @@ fn fork_filter_strips_incomplete_tool_turn() {
         }),
     ];
 
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert_eq!(
         items.len(),
         2,
@@ -1406,7 +1406,7 @@ async fn fork_inherits_sandbox_profile() {
 #[test]
 fn fork_filter_empty_input_produces_empty() {
     let mut items: Vec<ConversationItem> = vec![];
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert!(items.is_empty());
 }
 #[test]
@@ -1420,7 +1420,7 @@ fn fork_filter_keeps_turn_with_reasoning_between_user_and_assistant() {
             )),
             ConversationItem::assistant("a"),
         ];
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),
             4,
@@ -1442,7 +1442,7 @@ fn fork_filter_keeps_multi_tool_cycle_turn_with_reasoning() {
         ConversationItem::assistant("final text"),
     ];
 
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),
             7,
@@ -1472,7 +1472,7 @@ fn fork_filter_keeps_multi_tool_turn_with_reasoning_between_results() {
         ConversationItem::assistant("final"),
     ];
 
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),
             9,
@@ -1495,7 +1495,7 @@ fn fork_filter_drops_trailing_incomplete_goal_turn_after_reasoning() {
             ConversationItem::assistant("a"),
             ConversationItem::user("/goal do the thing"),
         ];
-    super::fork_filter_chat(&mut items);
+    crate::sampling::fork_filter_chat(&mut items);
     assert_eq!(
             items.len(),
             4,
