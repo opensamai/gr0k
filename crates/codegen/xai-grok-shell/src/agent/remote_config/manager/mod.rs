@@ -652,7 +652,6 @@ impl ModelsManager {
         self.catalog_key(model_id).is_some()
     }
 
-    #[cfg(test)]
     fn prefetched(&self) -> Option<IndexMap<String, ModelEntry>> {
         self.inner.catalog.read().prefetched.clone()
     }

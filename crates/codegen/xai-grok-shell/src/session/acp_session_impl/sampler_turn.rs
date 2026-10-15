@@ -1540,7 +1540,10 @@ impl SessionActor {
                         None,
                     );
                     self.prepare_sampler_for_turn().await;
-                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        credential: error.credential,
+                        store: RecoveredStore::AuthProvider,
+                    });
                 }
                 None => {
                     tracing::warn!(
@@ -1573,7 +1576,10 @@ impl SessionActor {
                         None,
                     );
                     self.prepare_sampler_for_turn().await;
-                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        credential: error.credential,
+                        store: RecoveredStore::AuthProvider,
+                    });
                 }
                 None => {
                     tracing::warn!(
@@ -1604,7 +1610,10 @@ impl SessionActor {
                         None,
                     );
                     self.prepare_sampler_for_turn().await;
-                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit);
+                    return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                        credential: error.credential,
+                        store: RecoveredStore::AuthProvider,
+                    });
                 }
                 None => {
                     tracing::warn!(

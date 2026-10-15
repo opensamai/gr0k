@@ -532,10 +532,7 @@ pub struct ModelsConfig {
     /// `/model` / Ctrl+M — use `allowed_models` / `hidden_models` for that.
     ///
     /// Alias `enabledModels` accepts Pi's camelCase settings key.
-    #[serde(
-        alias = "enabledModels",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(alias = "enabledModels", skip_serializing_if = "Option::is_none")]
     pub enabled_models: Option<Vec<String>>,
     /// Force `hidden = true` on these model IDs (still usable via `-m`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3469,6 +3466,7 @@ fn inject_moonshot_builtin_models(resolved: &mut IndexMap<String, ModelEntry>) {
             show_model_fingerprint: false,
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
+            ..Default::default()
         };
         tracing::debug!(
             model_key = %key,
@@ -5446,7 +5444,10 @@ pub fn anthropic_claude_bearer_resolver_for_model(
     if !model_uses_anthropic_claude_oauth(model) {
         return None;
     }
-    Some(Arc::new(crate::auth::anthropic_claude::AnthropicClaudeBearerResolver) as SharedBearerResolver)
+    Some(
+        Arc::new(crate::auth::anthropic_claude::AnthropicClaudeBearerResolver)
+            as SharedBearerResolver,
+    )
 }
 
 /// Whether this catalog entry routes through Kimi Code OAuth (subscription).

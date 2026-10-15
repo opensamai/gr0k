@@ -60,6 +60,27 @@ const SCRATCH_ARTIFACT_ROOT: &str = "scratch";
 
 pub(crate) type TelemetryHook = Arc<dyn Fn(&str, &serde_json::Value, bool) + Send + Sync>;
 
+/// Bridge the sampling effort enum to the tool-types subagent enum carried by
+/// [`SubagentRuntimeOverrides`]. Variants are 1:1 over the `none..=ultra`
+/// tokens; the inverse direction parses at the model boundary in
+/// `agent::subagent::handle_request`.
+fn subagent_effort_from_sampling(
+    effort: xai_grok_sampling_types::ReasoningEffort,
+) -> xai_tool_types::SubagentReasoningEffort {
+    use xai_grok_sampling_types::ReasoningEffort as S;
+    use xai_tool_types::SubagentReasoningEffort as T;
+    match effort {
+        S::None => T::None,
+        S::Minimal => T::Minimal,
+        S::Low => T::Low,
+        S::Medium => T::Medium,
+        S::High => T::High,
+        S::Xhigh => T::Xhigh,
+        S::Max => T::Max,
+        S::Ultra => T::Ultra,
+    }
+}
+
 /// Per-episode agent counters, reported on `WorkflowRunEnded`.
 #[derive(Debug, Default)]
 pub(crate) struct WorkflowAgentStats {
@@ -550,7 +571,7 @@ impl HostService {
                     cwd: None,
                     runtime_overrides: SubagentRuntimeOverrides {
                         model: opts.model.clone(),
-                        reasoning_effort: reasoning_effort.map(|effort| effort.to_string()),
+                        reasoning_effort: reasoning_effort.map(subagent_effort_from_sampling),
                         output_token_budget: None,
                         model_override_provenance: ModelOverrideProvenance::Tool {
                             selection: self.params.task_model_selection.get(),

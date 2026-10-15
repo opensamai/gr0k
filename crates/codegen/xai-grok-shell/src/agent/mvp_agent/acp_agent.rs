@@ -1273,7 +1273,7 @@ impl acp::Agent for MvpAgent {
                     &unavailable_model,
                 )
                 .unwrap_or(unavailable_model.clone());
-            if crate::agent::models::usable_in_projection(&available, &restore_model_id) {
+            if crate::agent::remote_config::usable_in_projection(&available, &restore_model_id) {
                 tracing::info!(
                     session_id = %arguments.session_id.0,
                     model_id = %restore_model_id.0,

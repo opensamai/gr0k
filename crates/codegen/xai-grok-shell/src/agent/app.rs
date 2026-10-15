@@ -1293,10 +1293,19 @@ pub async fn run_leader(
                         }
                         ConfigUpdate::SubagentModelsChanged => {
                             info!("Subagent model pins change detected — reloading live sessions");
-                            let line = internal_reload_request_line(
-                                "config-reload-subagent-models",
-                                "x.ai/internal/reload_subagent_models",
-                                serde_json::json!({}),
+                            // Hyper-only method: deliberately not an
+                            // `InternalMethod` variant (see
+                            // `extensions::session_admin`), so build the
+                            // `_`-prefixed wire line inline instead of via
+                            // `internal_reload_request_line`.
+                            let line = format!(
+                                "{}\n",
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": "config-reload-subagent-models",
+                                    "method": "_x.ai/internal/reload_subagent_models",
+                                    "params": serde_json::json!({}),
+                                })
                             );
                             let mut tx = acp_tx_for_config.lock().await;
                             if let Err(e) = tx.write_all(line.as_bytes()).await {

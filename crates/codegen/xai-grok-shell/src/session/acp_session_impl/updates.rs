@@ -750,6 +750,8 @@ impl SessionActor {
                 child_session_id,
                 status,
                 error,
+                termination_reason: _,
+                usage: _,
                 tool_calls,
                 turns,
                 duration_ms,

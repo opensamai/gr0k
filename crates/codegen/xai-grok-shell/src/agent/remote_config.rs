@@ -23,7 +23,7 @@ pub(crate) use resolution::{
     CatalogSource, allowlist_denied_message, allowlist_excludes_all_message,
     allowlist_matches_nothing, available_models, fallback_model_id, models_endpoint_empty_message,
     resolve_catalog_key, resolve_default_model, resolve_model_catalog,
-    selectable_catalog_key_for_persisted, validate_selectable,
+    selectable_catalog_key_for_persisted, usable_in_projection, validate_selectable,
 };
 #[cfg(test)]
 pub(in crate::agent::remote_config) use xai_grok_cloud_config::Commit;

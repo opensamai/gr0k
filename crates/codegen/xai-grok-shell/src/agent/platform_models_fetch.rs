@@ -159,7 +159,7 @@ fn fetch_one_platform_models(
     if platform == PlatformId::Nexus {
         return fetch_nexus_models(bearer);
     }
-    let client = crate::http::shared_blocking_client();
+    let client = crate::http::shared_startup_blocking_client();
     let url = platform.models_list_url();
     tracing::info!(platform = platform.as_str(), %url, "fetching platform models");
     let mut request = client
@@ -215,9 +215,7 @@ fn resolve_nexus_root() -> String {
     let raw = std::env::var("GROK_NEXUS_BASE_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            crate::auth::read_platform_base_url(&xai_grok_config::grok_home(), "nexus")
-        })
+        .or_else(|| crate::auth::read_platform_base_url(&xai_grok_config::grok_home(), "nexus"))
         .unwrap_or_else(|| NEXUS_BASE_URL_DEFAULT.to_string());
     nexus_normalize_root(&raw)
 }
@@ -243,8 +241,7 @@ fn fetch_nexus_models(bearer: &str) -> Result<Vec<ModelEntryConfig>, PlatformMod
         Ok(wires) => {
             any_ok = true;
             for wire in wires {
-                let entry =
-                    nexus_wire_to_entry(wire, ApiBackend::ChatCompletions, &chat_base, "");
+                let entry = nexus_wire_to_entry(wire, ApiBackend::ChatCompletions, &chat_base, "");
                 out.insert(entry_key(&entry), entry);
             }
         }
@@ -278,11 +275,8 @@ fn fetch_nexus_models(bearer: &str) -> Result<Vec<ModelEntryConfig>, PlatformMod
 }
 
 /// `GET {base}/models` with Bearer auth; parse the wire listing.
-fn fetch_nexus_endpoint(
-    bearer: &str,
-    base: &str,
-) -> Result<Vec<WireModel>, PlatformModelsError> {
-    let client = crate::http::shared_blocking_client();
+fn fetch_nexus_endpoint(bearer: &str, base: &str) -> Result<Vec<WireModel>, PlatformModelsError> {
+    let client = crate::http::shared_startup_blocking_client();
     let url = format!("{}/models", base.trim_end_matches('/'));
     tracing::info!(%url, "fetching nexus models");
     let response = client
@@ -317,9 +311,8 @@ fn nexus_wire_to_entry(
 ) -> ModelEntryConfig {
     let platform = PlatformId::Nexus;
     let think_efforts = wire.think_efforts.as_ref().filter(|t| t.support);
-    let context_window = std::num::NonZeroU64::new(wire.context_length).unwrap_or_else(|| {
-        std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW).expect("non-zero")
-    });
+    let context_window = std::num::NonZeroU64::new(wire.context_length)
+        .unwrap_or_else(|| std::num::NonZeroU64::new(DEFAULT_CONTEXT_WINDOW).expect("non-zero"));
     let reasoning_efforts = think_efforts
         .map(think_efforts_to_options)
         .unwrap_or_default();
@@ -345,7 +338,10 @@ fn nexus_wire_to_entry(
         );
     }
     ModelEntryConfig {
-        id: Some(format!("{}{key_suffix}", platform.managed_model_key(&wire.id))),
+        id: Some(format!(
+            "{}{key_suffix}",
+            platform.managed_model_key(&wire.id)
+        )),
         name: Some(name),
         model: wire.id,
         base_url: base_url.to_owned(),
@@ -379,6 +375,7 @@ fn nexus_wire_to_entry(
         show_model_fingerprint: false,
         stream_tool_calls: None,
         laziness_detector: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -500,6 +497,7 @@ pub(crate) fn platform_wire_model_to_entry(
         show_model_fingerprint: false,
         stream_tool_calls: None,
         laziness_detector: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -730,7 +728,10 @@ mod tests {
         // Nexus Messages still uses Bearer (NOT x-api-key like Anthropic).
         assert!(entry.auth_scheme.is_none());
         assert_eq!(
-            entry.extra_headers.get("anthropic-version").map(String::as_str),
+            entry
+                .extra_headers
+                .get("anthropic-version")
+                .map(String::as_str),
             Some(xai_grok_models::ANTHROPIC_VERSION_HEADER_VALUE)
         );
     }
