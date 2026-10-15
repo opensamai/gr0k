@@ -1884,6 +1884,7 @@ mod tests {
             role: None,
             model: None,
             resumed_from: None,
+            budget: None,
             workflow_run_id: None,
             agent_address: Some("opaque-address".into()),
         };
@@ -1991,6 +1992,7 @@ mod tests {
     fn subagent_budget_and_usage_roundtrip() {
         let spawned = SessionUpdate::SubagentSpawned {
             subagent_id: "sa-budget".into(),
+            attempt_id: None,
             parent_session_id: "parent".into(),
             parent_prompt_id: None,
             child_session_id: "child".into(),
@@ -2010,6 +2012,7 @@ mod tests {
                 finalize_grace_secs: Some(30),
             }),
             workflow_run_id: None,
+            agent_address: None,
         };
         let spawned_json = serde_json::to_value(&spawned).unwrap();
         assert_eq!(spawned_json["budget"]["maxToolCalls"], 40);
@@ -2020,6 +2023,7 @@ mod tests {
 
         let finished = SessionUpdate::SubagentFinished {
             subagent_id: "sa-budget".into(),
+            attempt_id: None,
             child_session_id: "child".into(),
             status: "completed".into(),
             error: None,

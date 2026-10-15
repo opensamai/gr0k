@@ -36,6 +36,7 @@ fn spawned(
         role: None,
         model: Some("test-model".to_owned()),
         resumed_from: resumed_from.map(str::to_owned),
+        budget: None,
         workflow_run_id: None,
         agent_address: None,
     }
@@ -53,6 +54,8 @@ fn finished_for(
         child_session_id: subagent_id.to_owned(),
         status: "completed".to_owned(),
         error: None,
+        termination_reason: None,
+        usage: None,
         tool_calls: 1,
         turns: 1,
         duration_ms: 1,

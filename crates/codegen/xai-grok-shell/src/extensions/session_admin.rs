@@ -805,7 +805,7 @@ fn handle_reload_subagent_models(agent: &MvpAgent) -> ExtResult {
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
     // `cli_flag` only gates `enabled` (which we deliberately do not touch);
     // `models` is parsed straight from the `[subagents]` table.
-    let resolved = crate::config::SubagentsConfig::resolve(false, &disk_config);
+    let resolved = crate::config::SubagentsConfig::resolve(None, &disk_config);
     let count = resolved.models.len();
     agent.cfg.borrow_mut().subagent_model_overrides = resolved.models;
     agent.cfg.borrow_mut().subagent_effort_overrides = resolved.effort;

@@ -48,18 +48,11 @@ impl xai_grok_login::refresh::TokenRefresher for AlwaysTransientFailRefresher {
 
 /// `(tempdir, manager)` with an expired OIDC token loaded so `unauthorized_recovery()` actually dispatches to the refresher.
 /// Tempdir must outlive the manager (auth.json path).
-///
-/// Use the env-independent test constructor: temporarily unsetting
-/// `GROK_AUTH` / `GROK_AUTH_PATH` here would clobber another parallel test's
-/// fixture and could make it read the developer's real credential file.
 fn auth_manager_with_refresher(
     refresher: Arc<dyn xai_grok_login::refresh::TokenRefresher>,
 ) -> (tempfile::TempDir, Arc<AuthManager>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let am = Arc::new(AuthManager::new_test_isolated(
-        dir.path(),
-        GrokComConfig::default(),
-    ));
+    let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
     am.hot_swap(GrokAuth {
         key: "initial-test-key".into(),
         auth_mode: AuthMode::Oidc,
@@ -179,15 +172,9 @@ async fn make_actor_parts_with_method_and_credentials(
 
 /// `(tempdir, manager)` holding a valid OIDC token (so `get_valid_token()` is a
 /// cache hit). The tempdir must outlive the manager (auth.json path).
-///
-/// See [`auth_manager_with_refresher`] for why this bypasses process-global
-/// auth environment variables.
 fn auth_manager_with_valid_token(key: &str) -> (tempfile::TempDir, Arc<AuthManager>) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let am = Arc::new(AuthManager::new_test_isolated(
-        dir.path(),
-        GrokComConfig::default(),
-    ));
+    let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
     am.hot_swap(GrokAuth {
         key: key.into(),
         auth_mode: AuthMode::Oidc,
@@ -1555,7 +1542,15 @@ async fn sampler_401_on_open_platform_endpoint_skips_session_recovery() {
                 actor.chat_state_handle.update_sampling_config(cfg);
             }
 
-            let result = actor.handle_sampling_failure(auth_error()).await;
+            let result = actor
+                .handle_sampling_failure(
+                    auth_error(),
+                    0,
+                    transient_state(0, true),
+                    false,
+                    TurnParkState::Fresh,
+                )
+                .await;
 
             let Err(err) = result else {
                 panic!(

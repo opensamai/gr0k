@@ -912,6 +912,7 @@ async fn verbatim_chat_compaction_strips_reasoning_after_endpoint_switch() {
 
     generate_session_compact(
         chat_history,
+        0,
         vec![],
         vec![],
         client,
@@ -920,6 +921,7 @@ async fn verbatim_chat_compaction_strips_reasoning_after_endpoint_switch() {
         std::time::Duration::from_secs(30),
         0,
         crate::util::config::CompactionToolChoice::Auto,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap_or_else(|_| panic!("compaction must succeed after an endpoint switch"));
@@ -991,6 +993,7 @@ async fn chat_completions_compaction_attaches_tools_with_tool_choice_auto() {
     let client = Client::new(config.clone()).unwrap();
     generate_session_compact(
         chat_history.clone(),
+        0,
         tools,
         vec![],
         client,
@@ -999,12 +1002,14 @@ async fn chat_completions_compaction_attaches_tools_with_tool_choice_auto() {
         std::time::Duration::from_secs(30),
         0,
         crate::util::config::CompactionToolChoice::Auto,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap_or_else(|_| panic!("compaction with tools must succeed"));
     let client = Client::new(config.clone()).unwrap();
     generate_session_compact(
         chat_history,
+        0,
         vec![],
         vec![],
         client,
@@ -1013,6 +1018,7 @@ async fn chat_completions_compaction_attaches_tools_with_tool_choice_auto() {
         std::time::Duration::from_secs(30),
         0,
         crate::util::config::CompactionToolChoice::Auto,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap_or_else(|_| panic!("compaction without tools must succeed"));
@@ -1089,6 +1095,7 @@ async fn responses_compaction_attaches_tools_with_tool_choice_auto() {
     let client = Client::new(config.clone()).unwrap();
     generate_session_compact(
         chat_history.clone(),
+        0,
         tools,
         hosted,
         client,
@@ -1097,12 +1104,14 @@ async fn responses_compaction_attaches_tools_with_tool_choice_auto() {
         std::time::Duration::from_secs(30),
         0,
         crate::util::config::CompactionToolChoice::Auto,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap_or_else(|_| panic!("Responses compaction with tools must succeed"));
     let client = Client::new(config.clone()).unwrap();
     generate_session_compact(
         chat_history,
+        0,
         vec![],
         vec![],
         client,
@@ -1111,6 +1120,7 @@ async fn responses_compaction_attaches_tools_with_tool_choice_auto() {
         std::time::Duration::from_secs(30),
         0,
         crate::util::config::CompactionToolChoice::Auto,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap_or_else(|_| panic!("Responses compaction without tools must succeed"));

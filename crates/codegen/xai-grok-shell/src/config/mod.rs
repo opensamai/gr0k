@@ -107,6 +107,7 @@ impl Default for SubagentsConfig {
             limit_behavior: None,
             workflow_max_concurrent: None,
             models: std::collections::HashMap::new(),
+            effort: std::collections::HashMap::new(),
             toggle: std::collections::HashMap::new(),
             roles: std::collections::HashMap::new(),
             personas: std::collections::HashMap::new(),
