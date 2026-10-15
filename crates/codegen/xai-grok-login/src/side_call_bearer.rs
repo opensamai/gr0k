@@ -86,6 +86,10 @@ impl AuthManager {
 pub(crate) fn is_xai_side_call_principal(auth: &GrokAuth) -> bool {
     match auth.auth_mode {
         AuthMode::ApiKey => true,
+        // Third-party subscription tokens (Moonshot/OpenAI/Anthropic) are
+        // foreign-authority credentials by construction; never send them to
+        // an xAI host as this account's own credential.
+        AuthMode::KimiCode | AuthMode::OpenAiCodex | AuthMode::AnthropicClaude => false,
         AuthMode::Oidc | AuthMode::External | AuthMode::WebLogin => {
             !auth.oidc_issuer.as_deref().is_some_and(is_foreign_issuer)
         }

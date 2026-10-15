@@ -22,6 +22,7 @@ use crate::model::GrokAuth;
 use crate::storage::{
     auth_json_path, read_anthropic_claude_auth, store_anthropic_claude_auth,
 };
+use xai_grok_shell_base::util::grok_home;
 
 /// Hard timeout for the interactive login (matches Codex: 15 minutes).
 const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
@@ -37,7 +38,7 @@ pub async fn run_anthropic_claude_login(
     channels: Option<AuthChannels>,
 ) -> anyhow::Result<GrokAuth> {
     let auth = browser_login(channels).await?;
-    let auth_path = auth_json_path();
+    let auth_path = auth_json_path(&grok_home::grok_home());
     let home = auth_path.parent().unwrap_or(std::path::Path::new("."));
     store_anthropic_claude_auth(home, &auth)?;
     crate::platform_refresh_sticky::clear_sticky_family(
@@ -317,7 +318,7 @@ fn anthropic_claude_bearer_resolution(
 /// Persisted access token for catalog/startup gating without a network hop.
 /// An expired token with a non-empty refresh token still marks a valid login.
 pub fn anthropic_claude_catalog_access_token_cached() -> Option<String> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     catalog_access_token(read_anthropic_claude_auth(home)?)
 }
@@ -350,7 +351,7 @@ pub async fn ensure_anthropic_claude_auth() -> Option<GrokAuth> {
 /// `force`: always hit the token endpoint. Else return the cached credential
 /// while it is within its local TTL.
 async fn refresh_anthropic_claude_auth(force: bool) -> Option<GrokAuth> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     let auth = read_anthropic_claude_auth(home)?;
     if !force && !crate::is_expired(&auth) {
@@ -394,7 +395,7 @@ pub fn ensure_anthropic_claude_access_token_blocking() -> Option<String> {
 
 /// Blocking variant of [`ensure_anthropic_claude_auth`].
 pub fn ensure_anthropic_claude_auth_blocking() -> Option<GrokAuth> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     let auth = read_anthropic_claude_auth(home)?;
     if !crate::is_expired(&auth) {

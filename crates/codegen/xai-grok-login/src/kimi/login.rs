@@ -12,6 +12,7 @@ use crate::storage::{
     auth_json_path, read_kimi_code_auth, store_kimi_code_auth,
     store_kimi_code_auth_after_refresh_locked,
 };
+use xai_grok_shell_base::util::grok_home;
 
 const SLOW_DOWN_INCREMENT_SECS: u64 = 5;
 /// Match Codex / AuthManager: wait long enough for a sibling IdP call.
@@ -44,7 +45,7 @@ pub async fn run_kimi_code_login() -> anyhow::Result<GrokAuth> {
             PollLoopOutcome::Done(auth) => {
                 let auth = *auth;
                 // Honor GROK_AUTH_PATH (same path refresh/read use), not only ~/.grok.
-                let auth_path = auth_json_path();
+                let auth_path = auth_json_path(&grok_home::grok_home());
                 let home = auth_path.parent().unwrap_or(std::path::Path::new("."));
                 store_kimi_code_auth(home, &auth)?;
                 crate::platform_refresh_sticky::clear_sticky_family(
@@ -103,7 +104,7 @@ pub async fn ensure_kimi_code_access_token() -> Option<String> {
 /// login still exposes `kimi-code/*`; its lazy [`KimiCodeBearerResolver`]
 /// refreshes only when the model is actually used.
 pub fn kimi_code_access_token_cached() -> Option<String> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     let auth = read_kimi_code_auth(home)?;
     if crate::is_expired(&auth) {
@@ -126,7 +127,7 @@ pub fn kimi_code_access_token_cached() -> Option<String> {
 /// a current token. Startup therefore remains network-free without ever
 /// falling back to this expired value on the wire.
 pub fn kimi_code_catalog_access_token_cached() -> Option<String> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     catalog_access_token(read_kimi_code_auth(home)?)
 }
@@ -159,7 +160,7 @@ async fn refresh_kimi_code_auth(force: bool) -> Option<GrokAuth> {
         record_sticky_permanent_failure, sticky_permanent_failure,
     };
 
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     let auth = read_kimi_code_auth(home)?;
     if !force && !crate::is_expired(&auth) {
@@ -184,8 +185,10 @@ async fn refresh_kimi_code_auth(force: bool) -> Option<GrokAuth> {
     let file_lock = match crate::manager::lock::try_lock_auth_file_async(
         &path,
         KIMI_REFRESH_LOCK_TIMEOUT,
+        crate::manager::lock::Heartbeat::Attach,
     )
     .await
+    .into_guard()
     {
         Some(lock) => lock,
         None => {
@@ -206,8 +209,13 @@ async fn refresh_kimi_code_auth(force: bool) -> Option<GrokAuth> {
     } else {
         tracing::warn!("auth: Kimi refresh lock lost before IdP; re-acquiring");
         drop(file_lock);
-        match crate::manager::lock::try_lock_auth_file_async(&path, KIMI_REFRESH_LOCK_TIMEOUT)
-            .await
+        match crate::manager::lock::try_lock_auth_file_async(
+            &path,
+            KIMI_REFRESH_LOCK_TIMEOUT,
+            crate::manager::lock::Heartbeat::Attach,
+        )
+        .await
+        .into_guard()
         {
             Some(relock) => {
                 if let Some(adopted) = try_adopt_sibling_kimi_token(home, &refresh, force) {
@@ -239,8 +247,10 @@ async fn refresh_kimi_code_auth(force: bool) -> Option<GrokAuth> {
             match crate::manager::lock::try_lock_auth_file_async(
                 &path,
                 KIMI_REFRESH_LOCK_TIMEOUT,
+                crate::manager::lock::Heartbeat::Attach,
             )
             .await
+            .into_guard()
             {
                 Some(relock) => Some(relock),
                 None => {
@@ -368,7 +378,7 @@ async fn ensure_kimi_code_access_token_with_op_timeout() -> Option<String> {
 ///
 /// Always prefers an unexpired disk cache with **no** network / runtime hop.
 pub fn ensure_kimi_code_access_token_blocking() -> Option<String> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     let auth = read_kimi_code_auth(home)?;
     if !crate::is_expired(&auth) {

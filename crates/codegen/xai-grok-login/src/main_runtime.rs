@@ -101,7 +101,7 @@ mod tests {
         });
 
         runtime.block_on(async {
-            crate::http::shared_client()
+            xai_grok_http::shared_client()
                 .get(format!("{base_url}/warm"))
                 .send()
                 .await
@@ -116,7 +116,7 @@ mod tests {
             let result = block_on_main_or_new_current_thread(Some(handle), async move {
                 tokio::time::timeout(
                     std::time::Duration::from_millis(150),
-                    crate::http::shared_client().get(stalled_url).send(),
+                    xai_grok_http::shared_client().get(stalled_url).send(),
                 )
                 .await
                 .is_err()

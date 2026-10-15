@@ -26,6 +26,7 @@ use crate::storage::{
     auth_json_path, read_openai_codex_auth, store_openai_codex_auth,
     store_openai_codex_auth_after_refresh_locked,
 };
+use xai_grok_shell_base::util::grok_home;
 
 /// How the user wants to authenticate (Pi `Select OpenAI Codex login method`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +57,7 @@ pub async fn run_openai_codex_login(
         CodexLoginMethod::DeviceCode => device_code_login(&host, channels).await?,
     };
     // Honor GROK_AUTH_PATH (same path refresh/read use), not only ~/.grok.
-    let auth_path = auth_json_path();
+    let auth_path = auth_json_path(&grok_home::grok_home());
     let home = auth_path.parent().unwrap_or(std::path::Path::new("."));
     store_openai_codex_auth(home, &auth)?;
     crate::platform_refresh_sticky::clear_sticky_family(
@@ -533,7 +534,7 @@ pub async fn ensure_openai_codex_auth() -> Option<GrokAuth> {
 /// [`OpenAiCodexBearerResolver`] replaces the catalog stamp per request, and
 /// the sampler removes the stamp entirely when live resolution fails.
 pub fn openai_codex_catalog_access_token_cached() -> Option<String> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     catalog_access_token(read_openai_codex_auth(home)?)
 }
@@ -583,7 +584,7 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
         record_sticky_permanent_failure, sticky_permanent_failure,
     };
 
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     let auth = read_openai_codex_auth(home)?;
     if !force && !crate::is_expired(&auth) {
@@ -609,8 +610,10 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
     let file_lock = match crate::manager::lock::try_lock_auth_file_async(
         &path,
         CODEX_REFRESH_LOCK_TIMEOUT,
+        crate::manager::lock::Heartbeat::Attach,
     )
     .await
+    .into_guard()
     {
         Some(lock) => lock,
         None => {
@@ -643,8 +646,10 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
         match crate::manager::lock::try_lock_auth_file_async(
             &path,
             CODEX_REFRESH_LOCK_TIMEOUT,
+            crate::manager::lock::Heartbeat::Attach,
         )
         .await
+        .into_guard()
         {
             Some(relock) => {
                 if let Some(adopted) = try_adopt_sibling_codex_token(home, &refresh, force) {
@@ -686,8 +691,10 @@ async fn refresh_openai_codex_auth(force: bool) -> Option<GrokAuth> {
             match crate::manager::lock::try_lock_auth_file_async(
                 &path,
                 CODEX_REFRESH_LOCK_TIMEOUT,
+                crate::manager::lock::Heartbeat::Attach,
             )
             .await
+            .into_guard()
             {
                 Some(relock) => Some(relock),
                 None => {
@@ -820,7 +827,7 @@ pub fn ensure_openai_codex_access_token_blocking() -> Option<String> {
 
 /// Blocking variant of [`ensure_openai_codex_auth`].
 pub fn ensure_openai_codex_auth_blocking() -> Option<GrokAuth> {
-    let path = auth_json_path();
+    let path = auth_json_path(&grok_home::grok_home());
     let home = path.parent().unwrap_or(&path);
     let auth = read_openai_codex_auth(home)?;
     if !crate::is_expired(&auth) {

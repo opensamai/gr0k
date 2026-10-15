@@ -58,6 +58,7 @@ xai-grok-config-types = { workspace = true }
 xai-grok-env = { workspace = true }
 xai-grok-http = { workspace = true }
 xai-grok-memory = { workspace = true }
+xai-grok-models = { workspace = true }
 xai-grok-sampler = { workspace = true }
 xai-grok-shell-base = { workspace = true }
 xai-grok-telemetry = { workspace = true }
@@ -76,6 +77,7 @@ loom = { workspace = true, optional = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
 filetime = { workspace = true }

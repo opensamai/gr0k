@@ -439,14 +439,19 @@ pub fn wire_otel_auth_manager(auth_manager: Arc<AuthManager>) {
 }
 
 /// Email for the external OTEL stream. OIDC/gateway only; never API-key,
-/// WebLogin, or a blank address. Callers must also skip deployment-key
+/// WebLogin, a third-party subscription login (Kimi/Codex/Claude), or a blank
+/// address. Callers must also skip deployment-key
 /// snapshots — this helper only inspects `GrokAuth`.
 pub fn oauth_gateway_email_from_auth(auth: &crate::GrokAuth) -> Option<String> {
     match auth.auth_mode {
         crate::AuthMode::Oidc | crate::AuthMode::External => {
             auth.email.clone().filter(|e| !e.is_empty())
         }
-        crate::AuthMode::ApiKey | crate::AuthMode::WebLogin => None,
+        crate::AuthMode::ApiKey
+        | crate::AuthMode::WebLogin
+        | crate::AuthMode::KimiCode
+        | crate::AuthMode::OpenAiCodex
+        | crate::AuthMode::AnthropicClaude => None,
     }
 }
 
