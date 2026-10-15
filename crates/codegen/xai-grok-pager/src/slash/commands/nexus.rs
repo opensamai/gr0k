@@ -133,7 +133,7 @@ mod tests {
     fn guide_mentions_gateway_and_commands() {
         let guide = nexus_setup_guide();
         assert!(guide.contains("nexuscore.now"), "guide: {guide}");
-        assert!(guide.contains("hyper nexus"), "guide: {guide}");
+        assert!(guide.contains("gr0k nexus"), "guide: {guide}");
         assert!(guide.contains("/nexus"), "guide: {guide}");
     }
 

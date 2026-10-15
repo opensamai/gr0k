@@ -1,69 +1,18 @@
-//! Plugin hooks adapter — pre-filter and source-entry builder.
-//!
-//! This module is a bridge between plugin hook JSON files and the shared
-//! `xai-grok-hooks` runtime.  It pre-filters unsupported events from plugin
-//! hook files before passing them to `parse_hook_file()`, and injects
-//! plugin-specific environment variables into the resulting `HookSpec` entries.
-//!
-//! This is NOT a second hooks engine — it feeds into the existing
-//! `xai-grok-hooks` crate's parser and runtime.
+//! Plugin hooks adapter: pre-filter plugin hook JSON, then feed it to `xai-grok-hooks`' parser and inject plugin env vars.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use xai_grok_hooks::config::{HookSpec, parse_hook_file};
+use xai_grok_hooks::config::{HookProvenance, HookSpec, parse_hook_file};
+use xai_grok_hooks::discovery::HookRegistry;
+use xai_grok_hooks::event::HookEventName;
 
 use super::manifest::substitute_env_vars;
+use super::registry::{LoadedPlugin, PluginRegistry};
 
-/// Supported hook event names.
-/// Both PascalCase and snake_case forms are accepted.
-const SUPPORTED_EVENTS: &[&str] = &[
-    // v0 events — PascalCase and snake_case
-    "SessionStart",
-    "PreToolUse",
-    "PostToolUse",
-    "SessionEnd",
-    "session_start",
-    "pre_tool_use",
-    "post_tool_use",
-    "session_end",
-    // v2 events — PascalCase and snake_case
-    "Notification",
-    "Stop",
-    "StopFailure",
-    "UserPromptSubmit",
-    "PostToolUseFailure",
-    "PermissionDenied",
-    "SubagentStart",
-    "SubagentStop",
-    // `SubagentEnd` is the legacy alias for `SubagentStop`.
-    "SubagentEnd",
-    "PreCompact",
-    "PostCompact",
-    "notification",
-    "stop",
-    "stop_failure",
-    "user_prompt_submit",
-    "post_tool_use_failure",
-    "permission_denied",
-    "subagent_start",
-    "subagent_stop",
-    "subagent_end",
-    "pre_compact",
-    "post_compact",
-];
-
-/// Parse plugin hook files with pre-filtering and env injection.
-///
-/// For each trusted plugin with hooks, this function:
-/// 1. Reads the hooks JSON file
-/// 2. Pre-filters unsupported event names (avoiding parse failures)
-/// 3. Parses via `parse_hook_file()`
-/// 4. Injects plugin-specific env vars into each resulting `HookSpec`
-///
-/// Returns `(specs, warnings)` — specs are ready to merge into the
-/// `HookRegistry`, warnings are unsupported-handler or parse errors.
-pub fn parse_plugin_hooks(
+/// Read, pre-filter, and parse a plugin's hooks file, then inject the plugin env vars.
+fn parse_plugin_hooks(
     hooks_path: &Path,
     plugin_name: &str,
     plugin_root: &str,
@@ -93,12 +42,8 @@ pub fn parse_plugin_hooks(
     (specs, warnings)
 }
 
-/// Parse inline hooks from a manifest JSON value.
-///
-/// Same pipeline as [`parse_plugin_hooks()`] but skips the file I/O step.
-/// The `value` is expected to be the manifest's inline hooks object,
-/// structured as `{ "hooks": { "EventName": [...] } }`.
-pub fn parse_plugin_hooks_from_value(
+/// Like [`parse_plugin_hooks`] for an inline manifest hooks value (no file I/O).
+fn parse_plugin_hooks_from_value(
     value: &serde_json::Value,
     plugin_name: &str,
     plugin_root: &str,
@@ -123,10 +68,84 @@ pub fn parse_plugin_hooks_from_value(
     (specs, warnings)
 }
 
+/// Parses the hooks file and inline manifest hooks of `plugin`, logging each parse warning once.
+pub(crate) fn load_plugin_hook_specs(plugin: &LoadedPlugin) -> Vec<HookSpec> {
+    let root = plugin.root_str();
+    let data = plugin.data_dir_str();
+    let parsed = [
+        plugin
+            .hooks_path
+            .as_deref()
+            .map(|path| parse_plugin_hooks(path, &plugin.name, &root, &data)),
+        plugin
+            .inline_hooks
+            .as_ref()
+            .map(|value| parse_plugin_hooks_from_value(value, &plugin.name, &root, &data)),
+    ];
+    let mut specs = Vec::new();
+    for (plugin_specs, warnings) in parsed.into_iter().flatten() {
+        for warning in &warnings {
+            tracing::warn!("{warning}");
+        }
+        specs.extend(plugin_specs);
+    }
+    specs
+}
+
+/// Hooks of each active (enabled and trusted) plugin in `registry`, parsed when the registry was built.
+pub fn active_plugin_hook_specs(registry: &PluginRegistry) -> Vec<HookSpec> {
+    registry
+        .active_plugins()
+        .into_iter()
+        .flat_map(|plugin| plugin.hook_specs.iter().cloned())
+        .collect()
+}
+
+/// Where a new session's plugin hooks come from.
+pub enum PluginHookSource<'a> {
+    /// The plugin registry a top-level session was spawned with.
+    Registry(Option<&'a PluginRegistry>),
+    /// The parent registry a subagent inherits.
+    /// A subagent's own plugin registry is the process-wide snapshot. That snapshot can hold another directory's plugins.
+    Parent,
+}
+
+/// Returns `base` with its plugin hooks taken from `source`, or `None` when no hook remains.
+pub fn with_plugin_hooks(
+    base: Option<Arc<HookRegistry>>,
+    source: PluginHookSource<'_>,
+) -> Option<Arc<HookRegistry>> {
+    match source {
+        PluginHookSource::Registry(plugins) => replace_plugin_hooks(
+            base,
+            plugins.map(active_plugin_hook_specs).unwrap_or_default(),
+        ),
+        PluginHookSource::Parent => base,
+    }
+}
+
+/// Returns `base` with its plugin-layer hooks replaced by `specs`, or `None` when no hook remains.
+/// Returns `base` unchanged when neither side has a plugin hook.
+pub fn replace_plugin_hooks(
+    base: Option<Arc<HookRegistry>>,
+    specs: Vec<HookSpec>,
+) -> Option<Arc<HookRegistry>> {
+    if specs.is_empty()
+        && !base
+            .as_deref()
+            .is_some_and(|registry| registry.has_layer(HookProvenance::Plugin))
+    {
+        return base;
+    }
+    let mut registry = base.map(Arc::unwrap_or_clone).unwrap_or_default();
+    registry.remove_layer(HookProvenance::Plugin);
+    registry.append_specs(specs);
+    (!registry.is_empty()).then(|| Arc::new(registry))
+}
+
 /// Shared processing pipeline for plugin hooks (file-based or inline).
 ///
-/// Pre-filters unsupported events, parses via `parse_hook_file()`,
-/// injects plugin env vars, and namespaces hook names.
+/// Pre-filters unsupported events, parses via `parse_hook_file()`, injects plugin env vars, and namespaces hook names.
 fn process_hooks_content(
     content: &str,
     source_path: &Path,
@@ -138,11 +157,6 @@ fn process_hooks_content(
     let mut warnings: Vec<String> = Vec::new();
 
     for event in &skipped_events {
-        tracing::info!(
-            plugin = plugin_name,
-            event = event,
-            "skipping unsupported hook event from plugin"
-        );
         warnings.push(format!(
             "plugin {plugin_name}: skipped unsupported event '{event}'"
         ));
@@ -151,14 +165,10 @@ fn process_hooks_content(
     let (mut specs, parse_errors) = parse_hook_file(&filtered_content, source_path);
 
     for err in &parse_errors {
-        let msg = format!("plugin {plugin_name}: {err}");
-        tracing::warn!("{msg}");
-        warnings.push(msg);
+        warnings.push(format!("plugin {plugin_name}: {err}"));
     }
 
-    // Build plugin env vars. `GROK_PLUGIN_*` is the native contract;
-    // `CLAUDE_PLUGIN_*` aliases the same values for external hooks that read
-    // those names.
+    // Native `GROK_PLUGIN_*` vars plus their vendor-compat aliases.
     let plugin_env: HashMap<String, String> = HashMap::from([
         ("GROK_PLUGIN_ROOT".to_string(), plugin_root.to_string()),
         ("CLAUDE_PLUGIN_ROOT".to_string(), plugin_root.to_string()),
@@ -166,39 +176,23 @@ fn process_hooks_content(
         ("CLAUDE_PLUGIN_DATA".to_string(), plugin_data.to_string()),
     ]);
 
-    // Inject env vars and update source labels.
-    //
-    // The plugin adapter owns the keys in `plugin_env` (CLAUDE_PLUGIN_ROOT
-    // etc.), so plugin-injected values must always win over any
-    // user-declared `env` on the hook JSON for those specific keys --
-    // otherwise a plugin author could (deliberately or by accident) pin
-    // the plugin root to an arbitrary path and break the plugin
-    // contract. User-declared keys not owned by the plugin are
-    // preserved.
     for spec in &mut specs {
+        // Plugin-owned keys always win over user-declared `env`, or a plugin author could repoint the plugin root and break the contract
         for (k, v) in &plugin_env {
             spec.extra_env.insert(k.clone(), v.clone());
         }
-        // Prefix name with plugin namespace for identification
-        spec.name = format!("plugin/{}/{}", plugin_name, spec.name);
-        // Substitute plugin env vars in command paths at config-load time so
-        // that hooks like `${CLAUDE_PLUGIN_ROOT}/hooks/foo.sh` resolve to the
-        // real plugin directory regardless of which spawn branch the runner
-        // takes (mirrors what managed_mcp does for MCP server commands).
+        spec.layer = HookProvenance::Plugin;
+        spec.name = format!(
+            "{}{}/{}",
+            xai_grok_hooks::config::PLUGIN_HOOK_PREFIX,
+            plugin_name,
+            spec.name
+        );
+        // Resolve plugin path placeholders at load time (mirrors managed_mcp) so the command works regardless of the runner's spawn branch
         if let Some(cmd) = &spec.command {
             let cmd_str = cmd.to_string_lossy();
-            // Mirror what `managed_mcp::load_plugin_mcp_servers_from_config`
-            // does for plugin MCP server commands: first substitute the
-            // plugin-specific placeholders (`${CLAUDE_PLUGIN_ROOT}` and
-            // friends), then run the result through the generic
-            // `${VAR}` / `$VAR` env expansion. Doing both passes at
-            // config-load time keeps hook env var resolution consistent
-            // with managed MCP server resolution and avoids relying on
-            // the runtime `sh -c` shell-metachar heuristic in
-            // `xai-grok-hooks::runner::command` for env vars whose
-            // values are already known at load time.
             let substituted = substitute_env_vars(&cmd_str, plugin_root, plugin_data);
-            let expanded = xai_grok_config::expand_env_vars_in_string(&substituted);
+            let expanded = xai_grok_hooks::config::expand_env_skipping_runner_vars(&substituted);
             if expanded != cmd_str {
                 spec.command = Some(PathBuf::from(expanded));
             }
@@ -208,21 +202,14 @@ fn process_hooks_content(
     (specs, warnings)
 }
 
-/// Pre-filter unsupported event names from a hooks JSON file.
-///
-/// Parses the JSON, removes event keys from the `"hooks"` object that are
-/// not in the supported set, and returns the filtered JSON string plus the
-/// list of removed event names.
-///
-/// This is critical because the hooks crate uses `HashMap<HookEventName, ...>`
-/// deserialization which causes a full parse failure on unknown event names.
+/// Drop `hooks` event keys the parser wouldn't accept, returning the filtered JSON and the removed names.
+/// The filter is not needed for correctness (the parser is lenient); it exists to warn the plugin author about the drops.
+/// A key is supported exactly when [`HookEventName::parse_key`] accepts it, so there is no allowlist to drift.
 fn prefilter_unsupported_events(json_content: &str) -> (String, Vec<String>) {
     let mut value: serde_json::Value = match serde_json::from_str(json_content) {
         Ok(v) => v,
-        Err(_) => {
-            // If JSON is invalid, return as-is and let parse_hook_file handle the error
-            return (json_content.to_string(), vec![]);
-        }
+        // Invalid JSON: let parse_hook_file report it.
+        Err(_) => return (json_content.to_string(), vec![]),
     };
 
     let mut skipped = Vec::new();
@@ -230,7 +217,7 @@ fn prefilter_unsupported_events(json_content: &str) -> (String, Vec<String>) {
     if let Some(hooks_obj) = value.get_mut("hooks").and_then(|v| v.as_object_mut()) {
         let keys_to_remove: Vec<String> = hooks_obj
             .keys()
-            .filter(|key| !SUPPORTED_EVENTS.contains(&key.as_str()))
+            .filter(|key| HookEventName::parse_key(key).is_none())
             .cloned()
             .collect();
 
@@ -250,6 +237,11 @@ fn prefilter_unsupported_events(json_content: &str) -> (String, Vec<String>) {
 mod tests {
     use super::*;
 
+    /// Test-only lookup: `["k"]` would panic on a missing key, so index through a pointer path.
+    fn jp<'a>(v: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        v.pointer(path).unwrap_or(&serde_json::Value::Null)
+    }
+
     #[test]
     fn prefilter_removes_unsupported_events() {
         let json = r#"{
@@ -268,7 +260,7 @@ mod tests {
         assert!(skipped.contains(&"UnknownHook".to_string()));
 
         let parsed: serde_json::Value = serde_json::from_str(&filtered).unwrap();
-        let hooks = parsed["hooks"].as_object().unwrap();
+        let hooks = jp(&parsed, "/hooks").as_object().unwrap();
         assert!(hooks.contains_key("SessionStart"));
         assert!(hooks.contains_key("PostToolUse"));
         assert!(!hooks.contains_key("CustomEvent"));
@@ -309,7 +301,7 @@ mod tests {
     fn prefilter_handles_invalid_json() {
         let json = "not valid json{";
         let (filtered, skipped) = prefilter_unsupported_events(json);
-        assert_eq!(filtered, json); // returned as-is
+        assert_eq!(filtered, json);
         assert!(skipped.is_empty());
     }
 
@@ -353,23 +345,25 @@ mod tests {
         let (specs, warnings) =
             parse_plugin_hooks(&hooks_file, "my-plugin", "/path/to/plugin", "/path/to/data");
 
-        // Should have 1 spec from SessionStart, FutureEvent was filtered
+        // One spec from SessionStart; FutureEvent was filtered
         assert_eq!(specs.len(), 1);
-        assert!(specs[0].name.starts_with("plugin/my-plugin/"));
+        let Some(spec) = specs.first() else {
+            panic!("expected one spec: {specs:?}");
+        };
+        assert!(spec.name.starts_with("plugin/my-plugin/"));
         assert_eq!(
-            specs[0].extra_env.get("GROK_PLUGIN_ROOT").unwrap(),
-            "/path/to/plugin"
+            spec.extra_env.get("GROK_PLUGIN_ROOT").map(String::as_str),
+            Some("/path/to/plugin")
         );
         assert_eq!(
-            specs[0].extra_env.get("CLAUDE_PLUGIN_ROOT").unwrap(),
-            "/path/to/plugin"
+            spec.extra_env.get("CLAUDE_PLUGIN_ROOT").map(String::as_str),
+            Some("/path/to/plugin")
         );
         assert_eq!(
-            specs[0].extra_env.get("GROK_PLUGIN_DATA").unwrap(),
-            "/path/to/data"
+            spec.extra_env.get("GROK_PLUGIN_DATA").map(String::as_str),
+            Some("/path/to/data")
         );
 
-        // Should have a warning about FutureEvent
         assert!(warnings.iter().any(|w| w.contains("FutureEvent")));
     }
 
@@ -395,10 +389,13 @@ mod tests {
         );
 
         assert_eq!(specs.len(), 1);
-        assert!(specs[0].name.starts_with("plugin/inline-plugin/"));
+        let Some(spec) = specs.first() else {
+            panic!("expected one spec: {specs:?}");
+        };
+        assert!(spec.name.starts_with("plugin/inline-plugin/"));
         assert_eq!(
-            specs[0].extra_env.get("GROK_PLUGIN_ROOT").unwrap(),
-            "/path/to/plugin"
+            spec.extra_env.get("GROK_PLUGIN_ROOT").map(String::as_str),
+            Some("/path/to/plugin")
         );
         assert!(warnings.is_empty());
     }
@@ -424,12 +421,7 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("FutureEvent")));
     }
 
-    /// Regression: hook commands that reference
-    /// `${CLAUDE_PLUGIN_ROOT}` (or its `GROK_PLUGIN_ROOT` alias) must be
-    /// substituted at config-load time so the runner spawns the real
-    /// plugin path. Without substitution the runner's pre-spawn env-var
-    /// check refuses to run such hooks (the dispatcher fail-opens so the
-    /// tool call itself is not blocked, but the hook never runs).
+    /// Regression: plugin path placeholders must resolve at load time, else the runner's pre-spawn env check refuses to run the hook.
     #[test]
     fn parse_plugin_hooks_substitutes_plugin_root_in_command() {
         let value = serde_json::json!({
@@ -462,8 +454,6 @@ mod tests {
         assert!(commands.contains(&"/opt/plugins/gb1183/hooks/alias.sh".to_string()));
         assert!(commands.contains(&"/var/plugins/gb1183/cache/post.sh".to_string()));
 
-        // None of the resolved commands should still contain the literal
-        // `${...}` placeholder.
         for cmd in &commands {
             assert!(
                 !cmd.contains("${"),
@@ -471,12 +461,7 @@ mod tests {
             );
         }
 
-        // The plugin adapter must NOT mutate
-        // `command_raw`. The pager UI / ACP DTO surface the raw form
-        // for display so users see what they wrote (and so any secrets
-        // resolved from `extra_env` don't leak). A future "tidy" pass
-        // that mistakenly rewrote `command_raw` would silently break
-        // the secrets-leakage protection.
+        // `command_raw` must stay unmodified: it's the display form and rewriting it would leak `extra_env`-resolved secrets
         let raws: Vec<&str> = specs
             .iter()
             .map(|s| s.command_raw.as_deref().unwrap_or(""))
@@ -503,22 +488,8 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    /// Regression: plugin hook commands that reference generic env vars
-    /// (e.g. `${HOME}` / `$HOME`) must be expanded at config-load time
-    /// just like managed MCP server commands. Otherwise resolution
-    /// depends on the runtime `sh -c` heuristic in
-    /// `xai-grok-hooks::runner::command`, which can fail for hooks
-    /// whose handler doesn't otherwise contain shell metacharacters.
-    /// Plugin hooks must not be double-expanded: a `${CLAUDE_PLUGIN_ROOT}`
-    /// reference resolves to the plugin root exactly once, and the result
-    /// contains no leftover `$` placeholders. This is the contract the
-    /// hooks_adapter has long held, and it must continue to hold
-    /// now that `parse_hook_file` itself does an env-expansion pass with
-    /// the per-hook `extra_env`. The first pass (in `parse_hook_file`)
-    /// runs against an EMPTY `extra_env` for plugin hooks (the adapter
-    /// only fills it in afterwards), so the placeholder survives that
-    /// pass and the second pass (here, after `extra_env` is wired in)
-    /// resolves it.
+    /// Regression: generic env vars (`${HOME}`) resolve at load time.
+    /// Plugin placeholders resolve exactly once (no leftover `$`, no double-expansion).
     #[test]
     fn parse_plugin_hooks_resolves_plugin_root_exactly_once() {
         let value = serde_json::json!({
@@ -540,12 +511,11 @@ mod tests {
 
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(specs.len(), 1);
-        let cmd = specs[0]
-            .command
-            .as_ref()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let cmd = specs
+            .first()
+            .and_then(|s| s.command.as_ref())
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|| panic!("expected command on first spec: {specs:?}"));
         assert_eq!(cmd, "/the/plugin/root/x.sh");
         assert!(
             !cmd.contains('$'),
@@ -553,17 +523,10 @@ mod tests {
         );
     }
 
-    /// Plugin hook JSON may declare its own `env` map. The user-declared
-    /// keys land in `extra_env`, but the plugin adapter MUST override
-    /// any user-declared value for keys the plugin owns
-    /// (CLAUDE_PLUGIN_ROOT, GROK_PLUGIN_ROOT, CLAUDE_PLUGIN_DATA,
-    /// GROK_PLUGIN_DATA). This preserves the plugin contract while still
-    /// supporting user-defined env vars on plugin hooks.
+    /// User-declared `env` is kept, but the four plugin-owned keys always win.
     #[test]
     fn parse_plugin_hooks_user_env_merged_with_plugin_precedence() {
-        // Exercise ALL FOUR plugin-owned keys, not just
-        // CLAUDE_PLUGIN_ROOT. A regression that only iterates one key
-        // would otherwise pass.
+        // All four keys, so a one-key regression can't pass.
         let value = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
@@ -594,17 +557,16 @@ mod tests {
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(specs.len(), 1);
 
-        // User-declared key the plugin doesn't own: preserved verbatim.
+        let Some(spec) = specs.first() else {
+            panic!("expected one spec: {specs:?}");
+        };
         assert_eq!(
-            specs[0].extra_env.get("FOO").map(String::as_str),
+            spec.extra_env.get("FOO").map(String::as_str),
             Some("bar"),
             "user-declared env keys must survive plugin merge"
         );
 
-        // All four plugin-owned keys: plugin wins, user's attempt is
-        // overridden. CLAUDE_PLUGIN_ROOT and GROK_PLUGIN_ROOT both map
-        // to plugin_root; CLAUDE_PLUGIN_DATA and GROK_PLUGIN_DATA both
-        // map to plugin_data.
+        // All four plugin-owned keys: plugin wins over the user's attempt.
         for (key, expected) in [
             ("CLAUDE_PLUGIN_ROOT", "/actual/plugin/root"),
             ("GROK_PLUGIN_ROOT", "/actual/plugin/root"),
@@ -612,7 +574,7 @@ mod tests {
             ("GROK_PLUGIN_DATA", "/actual/plugin/data"),
         ] {
             assert_eq!(
-                specs[0].extra_env.get(key).map(String::as_str),
+                spec.extra_env.get(key).map(String::as_str),
                 Some(expected),
                 "plugin-injected key {key} must override user-declared value"
             );
@@ -621,10 +583,7 @@ mod tests {
 
     #[test]
     fn parse_plugin_hooks_expands_generic_env_vars_in_command() {
-        // SAFETY: only mutated within this single-threaded test.
-        // SAFETY: this test sets process env vars; tokio test macros
-        // serialize tests within the same module by default but to be
-        // robust use a uniquely-named var.
+        // Uniquely-named var so concurrent tests don't collide.
         let var = "GB1183_HOOKS_ADAPTER_TEST_HOME";
         // SAFETY: env writes are not thread-safe; this test is single-threaded.
         unsafe {
@@ -670,5 +629,145 @@ mod tests {
         for cmd in &commands {
             assert!(!cmd.contains('$'), "command still contains $: {cmd}");
         }
+    }
+
+    const USER_HOOK: &str = "hooks:session_start[0].hooks[0]";
+    const PARENT_PLUGIN_HOOK: &str = "plugin/parent-plugin/plugin:session_start[0].hooks[0]";
+    const OTHER_PLUGIN_HOOK: &str = "plugin/other-plugin/plugin:session_start[0].hooks[0]";
+
+    fn session_start_hooks() -> serde_json::Value {
+        serde_json::json!({
+            "hooks": {
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": "true" }] }]
+            }
+        })
+    }
+
+    fn user_registry() -> Arc<HookRegistry> {
+        let (specs, errors) = parse_hook_file(
+            &session_start_hooks().to_string(),
+            Path::new("/user/hooks.json"),
+        );
+        assert_eq!(0, errors.len());
+        let mut registry = HookRegistry::default();
+        registry.append_specs(specs);
+        Arc::new(registry)
+    }
+
+    fn plugin_registry(name: &str) -> PluginRegistry {
+        use crate::plugins::PluginScope;
+        use crate::plugins::manifest::PathOrInline;
+
+        let mut plugin =
+            crate::plugins::registry::tests::make_discovered(name, PluginScope::User, true);
+        plugin.manifest.hooks = Some(PathOrInline::Inline(session_start_hooks()));
+        PluginRegistry::from_discovered(vec![plugin], &[], &[name.to_owned()])
+    }
+
+    fn hook_names(registry: Option<&HookRegistry>) -> Vec<String> {
+        let mut names: Vec<String> = registry
+            .map(|r| r.all_hooks().iter().map(|s| s.name.clone()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn own_registry(plugins: &PluginRegistry) -> PluginHookSource<'_> {
+        PluginHookSource::Registry(Some(plugins))
+    }
+
+    #[test]
+    fn plugin_hooks_join_discovered_hooks() {
+        let plugins = plugin_registry("parent-plugin");
+
+        let merged = with_plugin_hooks(Some(user_registry()), own_registry(&plugins));
+
+        assert_eq!(
+            vec![USER_HOOK.to_owned(), PARENT_PLUGIN_HOOK.to_owned()],
+            hook_names(merged.as_deref())
+        );
+    }
+
+    #[test]
+    fn plugin_hooks_load_without_any_other_hook() {
+        let plugins = plugin_registry("parent-plugin");
+
+        let merged = with_plugin_hooks(None, own_registry(&plugins));
+
+        assert_eq!(
+            vec![PARENT_PLUGIN_HOOK.to_owned()],
+            hook_names(merged.as_deref())
+        );
+    }
+
+    #[test]
+    fn disabled_plugin_contributes_no_hooks() {
+        use crate::plugins::PluginScope;
+        use crate::plugins::manifest::PathOrInline;
+
+        let mut plugin = crate::plugins::registry::tests::make_discovered(
+            "parent-plugin",
+            PluginScope::User,
+            true,
+        );
+        plugin.manifest.hooks = Some(PathOrInline::Inline(session_start_hooks()));
+        let plugins =
+            PluginRegistry::from_discovered(vec![plugin], &["parent-plugin".to_owned()], &[]);
+
+        assert!(with_plugin_hooks(None, own_registry(&plugins)).is_none());
+    }
+
+    #[test]
+    fn subagent_keeps_parent_plugin_hooks_over_its_own_registry() {
+        let parent_plugins = plugin_registry("parent-plugin");
+        let snapshot_plugins = plugin_registry("other-plugin");
+        let parent = with_plugin_hooks(Some(user_registry()), own_registry(&parent_plugins));
+
+        let child = with_plugin_hooks(parent.clone(), PluginHookSource::Parent);
+        let from_snapshot = with_plugin_hooks(parent, own_registry(&snapshot_plugins));
+
+        assert_eq!(
+            vec![USER_HOOK.to_owned(), PARENT_PLUGIN_HOOK.to_owned()],
+            hook_names(child.as_deref())
+        );
+        assert_eq!(
+            vec![USER_HOOK.to_owned(), OTHER_PLUGIN_HOOK.to_owned()],
+            hook_names(from_snapshot.as_deref())
+        );
+    }
+
+    #[test]
+    fn reapplied_plugin_registry_replaces_its_hooks() {
+        let plugins = plugin_registry("parent-plugin");
+        let first = with_plugin_hooks(Some(user_registry()), own_registry(&plugins));
+
+        let second = with_plugin_hooks(first, own_registry(&plugins));
+
+        assert_eq!(
+            vec![USER_HOOK.to_owned(), PARENT_PLUGIN_HOOK.to_owned()],
+            hook_names(second.as_deref())
+        );
+    }
+
+    #[test]
+    fn plugin_hooks_leave_with_the_plugin_registry() {
+        let plugins = plugin_registry("parent-plugin");
+        let with_plugins = with_plugin_hooks(Some(user_registry()), own_registry(&plugins));
+
+        let without = with_plugin_hooks(with_plugins, PluginHookSource::Registry(None));
+
+        assert_eq!(vec![USER_HOOK.to_owned()], hook_names(without.as_deref()));
+    }
+
+    #[test]
+    fn registry_without_plugin_hooks_is_passed_through() {
+        let base = user_registry();
+
+        let merged = with_plugin_hooks(
+            Some(Arc::clone(&base)),
+            own_registry(&PluginRegistry::empty()),
+        );
+
+        assert!(merged.is_some_and(|merged| Arc::ptr_eq(&base, &merged)));
     }
 }

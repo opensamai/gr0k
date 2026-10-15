@@ -1,28 +1,28 @@
 #!/bin/sh
 #
-# Hyper installer (macOS / Linux).
+# gr0k installer (macOS / Linux).
 #
 # Downloads the matching platform artifact from this repo's GitHub Releases,
 # verifies its SHA-256 against the release's SHA256SUMS manifest, and installs
-# the binary as ~/.hyper/bin/hyper (versioned binary in ~/.hyper/downloads/,
+# the binary as ~/.gr0k/bin/gr0k (versioned binary in ~/.gr0k/downloads/,
 # atomic symlink in bin/).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | sh
 #   sh install.sh --version v0.2.109      # pin a specific release
 #
 # Environment:
-#   HYPER_SHARE_DIR        install root (default: ~/.hyper)
-#   HYPER_UPDATE_BASE_URL  GitHub-Releases-shaped API base (default:
-#                          https://api.github.com/repos/DaviRain-Su/hyper-grok-build/releases)
+#   GR0K_SHARE_DIR         install root (default: ~/.gr0k; legacy HYPER_SHARE_DIR still honored)
+#   GR0K_UPDATE_BASE_URL   GitHub-Releases-shaped API base (default:
+#                          https://api.github.com/repos/opensamai/gr0k/releases)
 #
-# Fails fast on any error; never leaves a partial binary as the active hyper.
+# Fails fast on any error; never leaves a partial binary as the active gr0k.
 
 set -eu
 
-REPO="DaviRain-Su/hyper-grok-build"
-API_BASE="${HYPER_UPDATE_BASE_URL:-https://api.github.com/repos/${REPO}/releases}"
-HYPER_HOME="${HYPER_SHARE_DIR:-$HOME/.hyper}"
+REPO="opensamai/gr0k"
+API_BASE="${GR0K_UPDATE_BASE_URL:-${HYPER_UPDATE_BASE_URL:-https://api.github.com/repos/${REPO}/releases}}"
+GR0K_HOME="${GR0K_SHARE_DIR:-${HYPER_SHARE_DIR:-$HOME/.gr0k}}"
 
 err() {
     printf 'install.sh: error: %s\n' "$*" >&2
@@ -138,7 +138,7 @@ else
     err "either sha256sum or shasum is required to verify the download"
 fi
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hyper-install.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gr0k-install.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
 # ── Resolve the release ──────────────────────────────────────────────────────
@@ -174,7 +174,7 @@ ASSET=""
 ARCHIVE_URL=""
 for cand in "$TRIPLE" ${TRIPLE_FALLBACK:-}; do
     [ -n "$cand" ] || continue
-    trial="hyper-${RESOLVED_VERSION}-${cand}.tar.gz"
+    trial="gr0k-${RESOLVED_VERSION}-${cand}.tar.gz"
     found="$(printf '%s\n' "$URLS" | grep -F "/$trial" | head -n 1 || true)"
     if [ -n "$found" ]; then
         ASSET="$trial"
@@ -185,7 +185,7 @@ for cand in "$TRIPLE" ${TRIPLE_FALLBACK:-}; do
 done
 if [ -z "$ARCHIVE_URL" ]; then
     available="$(printf '%s\n' "$URLS" \
-        | sed -n 's|.*/\(hyper-[^/"]*\)|\1|p' \
+        | sed -n 's|.*/\(gr0k-[^/"]*\)|\1|p' \
         | grep -v '^$' \
         | sort -u \
         | tr '\n' ' ')"
@@ -193,7 +193,7 @@ if [ -z "$ARCHIVE_URL" ]; then
 fi
 
 # ── Download + verify ────────────────────────────────────────────────────────
-printf 'Downloading hyper v%s (%s)...\n' "$RESOLVED_VERSION" "$TRIPLE"
+printf 'Downloading gr0k v%s (%s)...\n' "$RESOLVED_VERSION" "$TRIPLE"
 fetch "$ARCHIVE_URL" "$TMP_DIR/$ASSET" || err "download failed: $ARCHIVE_URL"
 fetch "$SUMS_URL" "$TMP_DIR/SHA256SUMS" || err "download failed: $SUMS_URL"
 
@@ -214,31 +214,31 @@ printf 'Checksum verified.\n'
 
 # ── Extract + install ────────────────────────────────────────────────────────
 tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR" || err "failed to extract $ASSET"
-[ -f "$TMP_DIR/hyper" ] || err "archive $ASSET does not contain a 'hyper' binary"
-chmod 0755 "$TMP_DIR/hyper"
+[ -f "$TMP_DIR/gr0k" ] || err "archive $ASSET does not contain a 'gr0k' binary"
+chmod 0755 "$TMP_DIR/gr0k"
 
-DOWNLOADS_DIR="$HYPER_HOME/downloads"
-BIN_DIR="$HYPER_HOME/bin"
+DOWNLOADS_DIR="$GR0K_HOME/downloads"
+BIN_DIR="$GR0K_HOME/bin"
 mkdir -p "$DOWNLOADS_DIR" "$BIN_DIR"
 
 # Versioned binary + smoke-test before touching the active link.
-VERSIONED="hyper-${RESOLVED_VERSION}-${PLATFORM_OS}-${PLATFORM_ARCH}"
-mv -f "$TMP_DIR/hyper" "$DOWNLOADS_DIR/$VERSIONED"
+VERSIONED="gr0k-${RESOLVED_VERSION}-${PLATFORM_OS}-${PLATFORM_ARCH}"
+mv -f "$TMP_DIR/gr0k" "$DOWNLOADS_DIR/$VERSIONED"
 
 # Smoke-test the versioned download *before* swapping the managed symlink so a
 # bad binary (glibc / CPU incompatibility) never breaks a working install.
 "$DOWNLOADS_DIR/$VERSIONED" --version >/dev/null 2>&1 \
     || err "downloaded binary failed smoke test; existing install left untouched"
 
-TMP_LINK="$BIN_DIR/hyper.install.$$"
+TMP_LINK="$BIN_DIR/gr0k.install.$$"
 ln -s "../downloads/$VERSIONED" "$TMP_LINK"
-mv -f "$TMP_LINK" "$BIN_DIR/hyper"
+mv -f "$TMP_LINK" "$BIN_DIR/gr0k"
 
-printf '\nhyper v%s installed to %s\n' "$RESOLVED_VERSION" "$BIN_DIR/hyper"
+printf '\ngr0k v%s installed to %s\n' "$RESOLVED_VERSION" "$BIN_DIR/gr0k"
 
 case ":$PATH:" in
     *":$BIN_DIR:"*)
-        printf 'Run `hyper` to get started.\n'
+        printf 'Run `gr0k` to get started.\n'
         ;;
     *)
         # Persist BIN_DIR on PATH in the login shell's rc file.
@@ -249,8 +249,8 @@ case ":$PATH:" in
                 printf '\n%s is already configured in %s.\n' "$BIN_DIR" "$rc"
                 return 0
             fi
-            printf '\n# Added by the hyper installer\n%s\n' "$line" >> "$rc" \
-                || err "could not write $rc — add hyper to your PATH manually: $line"
+            printf '\n# Added by the gr0k installer\n%s\n' "$line" >> "$rc" \
+                || err "could not write $rc — add gr0k to your PATH manually: $line"
             printf '\nAdded %s to your PATH in %s.\n' "$BIN_DIR" "$rc"
         }
         EXPORT_LINE="export PATH=\"$BIN_DIR:\$PATH\""
@@ -274,6 +274,6 @@ case ":$PATH:" in
                 persist_line "$HOME/.profile" "$EXPORT_LINE"
                 ;;
         esac
-        printf 'Open a new terminal, then run `hyper` to get started.\n'
+        printf 'Open a new terminal, then run `gr0k` to get started.\n'
         ;;
 esac

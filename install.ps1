@@ -1,17 +1,17 @@
-# Hyper installer (Windows x86_64).
+# gr0k installer (Windows x86_64).
 #
 # Downloads the x86_64-pc-windows-msvc artifact from this repo's GitHub
 # Releases, verifies its SHA-256 against the release's SHA256SUMS manifest,
-# and installs the binary as %USERPROFILE%\.hyper\bin\hyper.exe.
+# and installs the binary as %USERPROFILE%\.gr0k\bin\gr0k.exe.
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/opensamai/gr0k/dev/install.ps1 | iex
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.2.109
 #
 # Environment:
-#   HYPER_SHARE_DIR        install root (default: %USERPROFILE%\.hyper)
-#   HYPER_UPDATE_BASE_URL  GitHub-Releases-shaped API base (default:
-#                          https://api.github.com/repos/DaviRain-Su/hyper-grok-build/releases)
+#   GR0K_SHARE_DIR         install root (default: %USERPROFILE%\.gr0k; legacy HYPER_SHARE_DIR still honored)
+#   GR0K_UPDATE_BASE_URL   GitHub-Releases-shaped API base (default:
+#                          https://api.github.com/repos/opensamai/gr0k/releases)
 
 [CmdletBinding()]
 param(
@@ -26,14 +26,14 @@ function Fail([string]$Message) {
     exit 1
 }
 
-$Repo = "DaviRain-Su/hyper-grok-build"
-$ApiBase = if ($env:HYPER_UPDATE_BASE_URL) { $env:HYPER_UPDATE_BASE_URL } else { "https://api.github.com/repos/$Repo/releases" }
-$HyperHome = if ($env:HYPER_SHARE_DIR) { $env:HYPER_SHARE_DIR } else { Join-Path $env:USERPROFILE ".hyper" }
+$Repo = "opensamai/gr0k"
+$ApiBase = if ($env:GR0K_UPDATE_BASE_URL) { $env:GR0K_UPDATE_BASE_URL } elseif ($env:HYPER_UPDATE_BASE_URL) { $env:HYPER_UPDATE_BASE_URL } else { "https://api.github.com/repos/$Repo/releases" }
+$Gr0kHome = if ($env:GR0K_SHARE_DIR) { $env:GR0K_SHARE_DIR } elseif ($env:HYPER_SHARE_DIR) { $env:HYPER_SHARE_DIR } else { Join-Path $env:USERPROFILE ".gr0k" }
 $Triple = "x86_64-pc-windows-msvc"
 
 # ── Platform gate ────────────────────────────────────────────────────────────
 if (-not [System.Environment]::Is64BitOperatingSystem) {
-    Fail "hyper requires 64-bit Windows (x86_64)"
+    Fail "gr0k requires 64-bit Windows (x86_64)"
 }
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -ne "AMD64") {
@@ -49,7 +49,7 @@ if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
 # TLS 1.2 for older PowerShell 5.1 defaults.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$Headers = @{ "User-Agent" = "hyper-install"; "Accept" = "application/vnd.github+json" }
+$Headers = @{ "User-Agent" = "gr0k-install"; "Accept" = "application/vnd.github+json" }
 
 # ── Resolve the release ──────────────────────────────────────────────────────
 $ReleaseUrl = if ($Version) { "$ApiBase/tags/v$Version" } else { "$ApiBase/latest" }
@@ -67,20 +67,20 @@ if ($Version -and $ResolvedVersion -ne $Version) {
     Fail "requested version $Version but release tag is $Tag"
 }
 
-$Asset = "hyper-$ResolvedVersion-$Triple.zip"
+$Asset = "gr0k-$ResolvedVersion-$Triple.zip"
 $ArchiveAsset = $Release.assets | Where-Object { $_.name -eq $Asset } | Select-Object -First 1
 $SumsAsset = $Release.assets | Where-Object { $_.name -eq "SHA256SUMS" } | Select-Object -First 1
 if (-not $ArchiveAsset) { Fail "release $Tag has no asset $Asset" }
 if (-not $SumsAsset) { Fail "release $Tag has no SHA256SUMS asset; refusing to install unverified binaries" }
 
 # ── Download + verify ────────────────────────────────────────────────────────
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hyper-install-" + [System.IO.Path]::GetRandomFileName())
+$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("gr0k-install-" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 try {
     $ArchivePath = Join-Path $TmpDir $Asset
     $SumsPath = Join-Path $TmpDir "SHA256SUMS"
 
-    Write-Host "Downloading hyper v$ResolvedVersion ($Triple)..."
+    Write-Host "Downloading gr0k v$ResolvedVersion ($Triple)..."
     Invoke-WebRequest -Uri $ArchiveAsset.browser_download_url -Headers $Headers -OutFile $ArchivePath
     Invoke-WebRequest -Uri $SumsAsset.browser_download_url -Headers $Headers -OutFile $SumsPath
 
@@ -102,12 +102,12 @@ try {
     # ── Extract + install ────────────────────────────────────────────────────
     $ExtractDir = Join-Path $TmpDir "extracted"
     Expand-Archive -Path $ArchivePath -DestinationPath $ExtractDir -Force
-    $Binary = Get-ChildItem -Path $ExtractDir -Recurse -Filter "hyper.exe" | Select-Object -First 1
-    if (-not $Binary) { Fail "archive $Asset does not contain hyper.exe" }
+    $Binary = Get-ChildItem -Path $ExtractDir -Recurse -Filter "gr0k.exe" | Select-Object -First 1
+    if (-not $Binary) { Fail "archive $Asset does not contain gr0k.exe" }
 
-    $BinDir = Join-Path $HyperHome "bin"
+    $BinDir = Join-Path $Gr0kHome "bin"
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
-    $Dest = Join-Path $BinDir "hyper.exe"
+    $Dest = Join-Path $BinDir "gr0k.exe"
 
     # Smoke-test the downloaded binary *before* replacing the active install.
     & $Binary.FullName --version *> $null
@@ -115,14 +115,14 @@ try {
         Fail "downloaded binary failed smoke test (exit $LASTEXITCODE); existing install left untouched"
     }
 
-    # A running hyper.exe blocks writes but allows renames — move it aside first.
+    # A running gr0k.exe blocks writes but allows renames — move it aside first.
     $Aside = "$Dest.old"
     if (Test-Path $Dest) {
         Remove-Item -Path $Aside -Force -ErrorAction SilentlyContinue
         try {
             Move-Item -Path $Dest -Destination $Aside -Force
         } catch {
-            Fail "cannot replace $Dest (close all running hyper sessions and retry): $($_.Exception.Message)"
+            Fail "cannot replace $Dest (close all running gr0k sessions and retry): $($_.Exception.Message)"
         }
     }
     try {
@@ -145,7 +145,7 @@ try {
     }
 
     Write-Host ""
-    Write-Host "hyper v$ResolvedVersion installed to $Dest"
+    Write-Host "gr0k v$ResolvedVersion installed to $Dest"
 
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $OnPath = (($UserPath -split ";") -contains $BinDir) -or
@@ -155,9 +155,9 @@ try {
         [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
         Write-Host ""
         Write-Host "Added $BinDir to your user PATH."
-        Write-Host "Open a new terminal, then run 'hyper' to get started."
+        Write-Host "Open a new terminal, then run 'gr0k' to get started."
     } else {
-        Write-Host "Run 'hyper' to get started."
+        Write-Host "Run 'gr0k' to get started."
     }
 } finally {
     Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue

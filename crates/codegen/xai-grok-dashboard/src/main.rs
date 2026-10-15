@@ -8,9 +8,9 @@ use xai_grok_dashboard::{DashboardServerConfig, serve};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "hyper-dashboard",
+    name = "gr0k-dashboard",
     version,
-    about = "Local web observability for Hyper sessions"
+    about = "Local web observability for gr0k sessions"
 )]
 struct Args {
     /// Loopback address for the HTTP server.

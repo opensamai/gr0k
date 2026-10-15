@@ -107,7 +107,7 @@ codex_live = false
 ```
 
 ```bash
-GROK_CODEX_LIVE=0 hyper
+GROK_CODEX_LIVE=0 gr0k
 ```
 
 For development and test endpoints, `GROK_OPENAI_CODEX_BASE_URL` overrides the

@@ -1,8 +1,7 @@
-//! `hyper completions <shell>` / `grok completions <shell>` — generate shell
+//! `gr0k completions <shell>` / `grok completions <shell>` — generate shell
 //! completion scripts.
 //!
-//! Used by the installers and npm postinstall; must stay side-effect free
-//! (no network, auth, tracing, or tokio).
+//! Used by the installers and npm postinstall; must stay side-effect free (no network, auth, tracing, or tokio).
 
 use clap::CommandFactory as _;
 use clap_complete::{Shell, generate};
@@ -11,11 +10,11 @@ use crate::app::PagerArgs;
 
 /// Public CLI name embedded in completion scripts.
 ///
-/// Community Hyper builds (`community-build` feature) emit `hyper`; upstream-
+/// Community gr0k builds (`community-build` feature) emit `gr0k`; upstream-
 /// style builds keep the historical `grok` name.
 fn cli_bin_name() -> &'static str {
     if cfg!(feature = "community-build") {
-        "hyper"
+        "gr0k"
     } else {
         "grok"
     }
@@ -51,7 +50,7 @@ pub fn run(shell: Shell) {
 /// The generated root `_arguments` spec emits a `'::prompt …'` slot before
 /// the subcommand slot but dispatches subcommands with `case $line[2]`. zsh
 /// assigns the typed subcommand to the *prompt* slot (`$line[1]`), leaves
-/// `$line[2]` empty, and the dispatch falls through — so `hyper worktree <TAB>`
+/// `$line[2]` empty, and the dispatch falls through — so `gr0k worktree <TAB>`
 /// re-offers every top-level command. (`hide = true` on the positional does
 /// not change the generated script.)
 ///
@@ -61,8 +60,8 @@ pub fn run(shell: Shell) {
 /// patterns are unique to the root block (pinned by the test below — delete
 /// this whole workaround once upstream fixes the generator).
 ///
-/// `bin` is the public CLI name (`hyper` or `grok`) embedded by clap_complete
-/// in curcontext paths such as `:hyper-command-$line[2]:`.
+/// `bin` is the public CLI name (`gr0k` or `grok`) embedded by clap_complete
+/// in curcontext paths such as `:gr0k-command-$line[2]:`.
 fn fix_zsh_root_prompt_positional(script: &str, bin: &str) -> String {
     let mut out = String::with_capacity(script.len());
     script
@@ -104,16 +103,13 @@ mod tests {
         String::from_utf8(buf).expect("completion script is UTF-8")
     }
 
-    // The optional `[PROMPT]` positional (app/cli.rs) makes clap_complete emit
-    // a `::prompt` slot before the subcommand slot and dispatch on `$line[2]`,
-    // so `grok worktree <TAB>` re-offered every top-level command (upstream
-    // clap-rs/clap#6282).
+    // The optional `[PROMPT]` positional (app/cli.rs) makes clap_complete emit a `::prompt` slot before the subcommand slot
+    // Dispatch happens on `$line[2]`, so `grok worktree <TAB>` re-offered every top-level command (upstream clap-rs/clap#6282)
     #[test]
     fn zsh_completions_drop_prompt_slot_and_dispatch_on_line_1() {
         let raw = zsh_script();
-        // Preconditions: the workaround is still needed. If these start
-        // failing, clap_complete fixed the positional handling — delete
-        // `fix_zsh_root_prompt_positional` instead of updating the test.
+        // Preconditions: the workaround is still needed
+        // If these start failing, clap_complete fixed the positional handling; delete `fix_zsh_root_prompt_positional` instead of updating the test
         assert!(raw.contains("'::prompt -- "), "raw script has prompt slot");
         assert!(
             raw.contains("case $line[2] in"),
@@ -145,7 +141,7 @@ mod tests {
     #[test]
     fn cli_bin_name_matches_community_feature() {
         if cfg!(feature = "community-build") {
-            assert_eq!(cli_bin_name(), "hyper");
+            assert_eq!(cli_bin_name(), "gr0k");
         } else {
             assert_eq!(cli_bin_name(), "grok");
         }

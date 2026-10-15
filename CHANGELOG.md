@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **Hyper** (`hyper` binary) are documented here.
+All notable changes to **gr0k** (`gr0k` binary, formerly Hyper) are documented here.
 
 ## [Unreleased]
 

@@ -5,21 +5,23 @@
 //!   `/providers` (alias of `/providers clear <platform>`)
 
 use crate::app::actions::Action;
-use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
+use crate::slash::command::{
+    AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand, slash_meta,
+};
+use xai_grok_config::{Capability, Distribution};
 
 pub struct LogoutCommand;
 
 impl SlashCommand for LogoutCommand {
-    fn name(&self) -> &str {
-        "logout"
+    slash_meta! {
+        name: "logout",
+        description: "Log out (xAI session, or a platform API key)",
+        usage: "/logout [provider <platform>]",
     }
 
-    fn description(&self) -> &str {
-        "Log out (xAI session, or a platform API key)"
-    }
-
-    fn usage(&self) -> &str {
-        "/logout [provider <platform>]"
+    /// Not offered where the build has no account; the router refuses a typed one.
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        Distribution::current().allows(Capability::AccountLogin)
     }
 
     fn takes_args(&self) -> bool {

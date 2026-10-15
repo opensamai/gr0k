@@ -186,7 +186,7 @@ impl From<&RuntimeFact<ColorLevel>> for JsonColorLevel {
         match fact {
             RuntimeFact::Available(level) => Self {
                 status: "available",
-                value: Some(level.as_str()),
+                value: Some((*level).into()),
             },
             RuntimeFact::NoReply => Self {
                 status: "no_reply",
@@ -379,6 +379,7 @@ pub(super) fn multiplexer(kind: MultiplexerKind) -> &'static str {
         MultiplexerKind::Screen => "screen",
         MultiplexerKind::Zellij => "zellij",
         MultiplexerKind::Cmux => "cmux",
+        MultiplexerKind::Herdr => "herdr",
         MultiplexerKind::Undetected => "undetected",
     }
 }

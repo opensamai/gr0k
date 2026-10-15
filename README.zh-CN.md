@@ -1,20 +1,20 @@
 <div align="center">
 
-<h1>Hyper(<code>hyper</code>)</h1>
+<h1>gr0k(<code>gr0k</code>)</h1>
 
-<img src="docs/assets/hyper-banner.jpg" alt="Hyper —— 终端 AI 编码代理" width="720">
+<img src="docs/assets/hyper-banner.jpg" alt="gr0k —— 终端 AI 编码代理" width="720">
 
 <p>
-  <a href="https://github.com/DaviRain-Su/hyper-grok-build/releases"><img src="https://img.shields.io/github/v/release/DaviRain-Su/hyper-grok-build?display_name=tag" alt="发布版本"></a>
-  <a href="https://github.com/DaviRain-Su/hyper-grok-build/actions/workflows/release.yml"><img src="https://github.com/DaviRain-Su/hyper-grok-build/actions/workflows/release.yml/badge.svg" alt="发布 CI"></a>
+  <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/v/release/opensamai/gr0k?display_name=tag" alt="发布版本"></a>
+  <a href="https://github.com/opensamai/gr0k/actions/workflows/release.yml"><img src="https://github.com/opensamai/gr0k/actions/workflows/release.yml/badge.svg" alt="发布 CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="许可证"></a>
   <img src="https://img.shields.io/badge/rust-1.92.0-orange?logo=rust" alt="Rust 1.92">
   <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="平台:macOS、Linux、Windows">
-  <a href="https://github.com/DaviRain-Su/hyper-grok-build/releases"><img src="https://img.shields.io/github/downloads/DaviRain-Su/hyper-grok-build/total?label=downloads" alt="下载量"></a>
+  <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/downloads/opensamai/gr0k/total?label=downloads" alt="下载量"></a>
   <img src="https://img.shields.io/badge/i18n-10%20locales-brightgreen" alt="i18n:10 种语言">
 </p>
 
-**Hyper** 是 [Grok Build](https://github.com/xai-org/grok-build) 的非官方多供应商社区构建版本 ——
+**gr0k** 是 [Grok Build](https://github.com/xai-org/grok-build) 的非官方多供应商社区构建版本 ——
 一个用 Rust 编写的终端 AI 编码代理,对多家 LLM 供应商提供一流支持:
 xAI Grok、Kimi Code / Moonshot、ChatGPT Codex、OpenAI、Anthropic、Z.AI、Ollama Cloud 等。
 
@@ -24,7 +24,7 @@ xAI Grok、Kimi Code / Moonshot、ChatGPT Codex、OpenAI、Anthropic、Z.AI、Ol
 还能通过 Agent Client Protocol(ACP)嵌入到编辑器中。
 UI 已本地化为 10 种语言(English、中文、日本語、한국어、Español、
 Português、Français、Deutsch、Русский),并可在设置中实时切换。运行
-`hyper dashboard --web` 可以打开本地只读的纯 Rust Web 仪表盘，查看会话指标、
+`gr0k dashboard --web` 可以打开本地只读的纯 Rust Web 仪表盘，查看会话指标、
 事件时间线、图表、日志和实时事件流。
 
 [安装](#安装) ·
@@ -49,19 +49,19 @@ Português、Français、Deutsch、Русский),并可在设置中实时切�
 
 | English | 简体中文 |
 | ------- | -------- |
-| ![Hyper TUI in English](docs/assets/screenshot-welcome-en.png) | ![中文界面的 Hyper TUI](docs/assets/screenshot-welcome-zh.png) |
+| ![gr0k TUI in English](docs/assets/screenshot-welcome-en.png) | ![中文界面的 gr0k TUI](docs/assets/screenshot-welcome-zh.png) |
 
 ---
 
-## 为什么叫 "Hyper"?
+## 为什么叫 "gr0k"?
 
-本 fork 仓库已经命名为 `hyper-grok-build`,**Hyper** 沿用了这个品牌:
+本 fork 仓库已经命名为 `hyper-grok-build`,**gr0k** 沿用了这个品牌:
 
 | | 官方版本 | 本 fork |
 |---|---|---|
-| 产品 | Grok Build | **Hyper** |
-| 二进制文件 | `grok` | **`hyper`** |
-| 安装目录 | `~/.grok` | **`~/.hyper`**(仅二进制) |
+| 产品 | Grok Build | **gr0k** |
+| 二进制文件 | `grok` | **`gr0k`** |
+| 安装目录 | `~/.grok` | **`~/.gr0k`**(仅二进制) |
 | 配置 / 认证 | `~/.grok` | **`~/.grok`**(共享;同一运行时) |
 | 上游 | [xai-org/grok-build](https://github.com/xai-org/grok-build) | 多供应商社区补丁 |
 
@@ -75,32 +75,32 @@ Português、Français、Deutsch、Русский),并可在设置中实时切�
 适用于 macOS(arm64/x86_64)、Linux(arm64/x86_64,
 glibc / `linux-gnu` —— 适用于 Omarchy、Ubuntu、Fedora 等)以及 Windows
 (x86_64)的预编译单文件二进制已发布在
-[GitHub Releases](https://github.com/DaviRain-Su/hyper-grok-build/releases):
+[GitHub Releases](https://github.com/opensamai/gr0k/releases):
 
 ```sh
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash
 ```
 
 ```powershell
 # Windows PowerShell
-irm https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.ps1 | iex
+irm https://raw.githubusercontent.com/opensamai/gr0k/dev/install.ps1 | iex
 ```
 
 ```sh
-hyper --version
-hyper login          # xAI / Grok 会话(浏览器 OAuth)
-hyper                # 启动 TUI
+gr0k --version
+gr0k login          # xAI / Grok 会话(浏览器 OAuth)
+gr0k                # 启动 TUI
 ```
 
 安装指定版本:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.sh | bash -s -- --version v0.2.110
+curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash -s -- --version v0.2.110
 ```
 
 安装程序会根据发布版的 `SHA256SUMS` 校验每一次下载,
-安装到 `~/.hyper/bin/hyper`(Windows 上为 `%USERPROFILE%\.hyper\bin\hyper.exe`),
+安装到 `~/.gr0k/bin/gr0k`(Windows 上为 `%USERPROFILE%\.gr0k\bin\gr0k.exe`),
 并在需要时打印出需要添加的 PATH 配置行。
 
 > 如需尚未发布的改动，可从下方源码构建；否则请安装上方的最新发布版。
@@ -109,16 +109,16 @@ curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/in
 
 ## 供应商
 
-Hyper 保留了本代码树中的多供应商注册表(见 pager
+gr0k 保留了本代码树中的多供应商注册表(见 pager
 [用户指南（中文）](crates/codegen/xai-grok-pager/docs/user-guide-zh-CN/)):
 
 | 平台 | 认证方式 | 备注 |
 | -------- | ---- | ----- |
-| xAI / Grok | `hyper login`(OIDC)或 `XAI_API_KEY` | 第一方模型 |
+| xAI / Grok | `gr0k login`(OIDC)或 `XAI_API_KEY` | 第一方模型 |
 | Kimi Code | 设备 OAuth / 订阅 | `kimi-code/*` 目录 |
 | Moonshot CN / AI | API key | 开放平台 |
 | ChatGPT Codex | ChatGPT OAuth | GPT-5.x reasoning，并支持实验性全双工 `/live` 语音 |
-| **Anthropic Claude(Pro/Max)** | **`/claude`**(TUI)或 `hyper login --claude` | 订阅号登录;解锁 `anthropic-claude/*` |
+| **Anthropic Claude(Pro/Max)** | **`/claude`**(TUI)或 `gr0k login --claude` | 订阅号登录;解锁 `anthropic-claude/*` |
 | **Nexus 中转站** | **`/nexus <key> [base_url]`**(TUI)或 `NEXUS_API_KEY` | 自托管、兼容 OpenAI/Anthropic 的中转网关;`nexus/*` |
 | OpenAI / Anthropic / DeepSeek 风格 | API keys | BYOK 目录 |
 | Z.AI Coding Plan | 平台 key | 国际版方案 |
@@ -144,10 +144,10 @@ OpenAI Codex 等)。
 /claude                     # 等价于 /login claude
 
 # CLI:打开浏览器 OAuth 流程
-hyper login --claude        # 别名:hyper login --anthropic
+gr0k login --claude        # 别名:gr0k login --anthropic
 
 # 退出登录
-hyper logout --claude       # 或:hyper logout --all
+gr0k logout --claude       # 或:gr0k logout --all
 ```
 
 凭据存储在 `~/.grok/auth.json` 的 `oauth/anthropic-claude` 作用域下,
@@ -165,10 +165,10 @@ OpenAI 的 `chat/completions`、Claude **Messages** 以及 **Responses** API,
 
 ```sh
 # 0. 命令行(登录 xAI 之前就能用)—— 全局一次性配置
-hyper nexus <api_key>                   # 保存 key 到 ~/.grok/auth.json
-hyper nexus <api_key> https://your-gw   # 保存 key + 自定义网关根地址
-hyper nexus --clear                     # 删除已保存的 key
-hyper nexus                             # 打印引导 + 当前状态
+gr0k nexus <api_key>                   # 保存 key 到 ~/.grok/auth.json
+gr0k nexus <api_key> https://your-gw   # 保存 key + 自定义网关根地址
+gr0k nexus --clear                     # 删除已保存的 key
+gr0k nexus                             # 打印引导 + 当前状态
 
 # 1. TUI(最简)—— key 只需输一次,自动持久化到 ~/.grok/auth.json
 /nexus                                 # 打印引导(去哪申请 key、怎么用)
@@ -185,7 +185,7 @@ export GROK_NEXUS_BASE_URL=https://your-gateway   # 覆盖根地址
 ```
 
 base URL 可以是任意面向客户端的形态(`https://your-gateway`、
-`…/v1`、`…/openai/v1`)—— Hyper 会将其规范化为裸根地址,并自动推导出
+`…/v1`、`…/openai/v1`)—— gr0k 会将其规范化为裸根地址,并自动推导出
 各后端路径(`{root}/openai/v1`、`{root}/v1`)。key 和根地址会与其他
 供应商一起保存到 `~/.grok/auth.json`。
 
@@ -206,29 +206,29 @@ base URL 可以是任意面向客户端的形态(`https://your-gateway`、
   `CMAKE_POLICY_VERSION_MINIMUM=3.5`
 
 ```sh
-cargo run -p xai-grok-pager-bin              # 构建并启动 TUI(二进制名:hyper)
+cargo run -p xai-grok-pager-bin              # 构建并启动 TUI(二进制名:gr0k)
 cargo build -p xai-grok-pager-bin --profile release-dist
-./target/release-dist/hyper --version
+./target/release-dist/gr0k --version
 ```
 
 组合根包仍然是 `xai-grok-pager-bin`(monorepo 布局);
-**发布的二进制名称**是 `hyper`。
+**发布的二进制名称**是 `gr0k`。
 
 ### 将源码构建全局安装
 
-如果想把你自己的改动作为托管的 `~/.hyper/bin/hyper` 运行(与 `install.sh`
+如果想把你自己的改动作为托管的 `~/.gr0k/bin/gr0k` 运行(与 `install.sh`
 生成的目录布局一致,但从当前检出的源码构建,而非 GitHub 发布版),
 可使用 [`scripts/install-local.sh`](scripts/install-local.sh):
 
 ```sh
-scripts/install-local.sh                 # 构建并安装,覆盖 ~/.hyper/bin/hyper
+scripts/install-local.sh                 # 构建并安装,覆盖 ~/.gr0k/bin/gr0k
 scripts/install-local.sh --no-link       # 构建并暂存到 downloads/,保留当前软链接
-HYPER_SHARE_DIR=~/.hyper-dev scripts/install-local.sh   # 安装到独立目录
+GR0K_SHARE_DIR=~/.gr0k-dev scripts/install-local.sh   # 安装到独立目录
 ```
 
-脚本会执行 `cargo install --locked`,在 `~/.hyper/downloads/` 下暂存带版本号
+脚本会执行 `cargo install --locked`,在 `~/.gr0k/downloads/` 下暂存带版本号
 的二进制,在 macOS 上重新签名,冒烟测试 `--version`,再原子地将
-`~/.hyper/bin/hyper` 指向新版本。需要 `cargo`、`cmake` 以及真实的 `ripgrep`
+`~/.gr0k/bin/gr0k` 指向新版本。需要 `cargo`、`cmake` 以及真实的 `ripgrep`
 二进制(自动探测,或设置 `GROK_SHELL_BUNDLE_RG_PATH`)。首次构建约需 13 分钟。
 
 ---
@@ -262,11 +262,11 @@ git push origin "v${VERSION}"
 
 | 产物 | 示例 |
 | ----- | ------- |
-| macOS arm64 | `hyper-0.2.110-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `hyper-0.2.110-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64(glibc) | `hyper-0.2.110-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64(glibc) | `hyper-0.2.110-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `hyper-0.2.110-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `gr0k-0.2.110-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `gr0k-0.2.110-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64(glibc) | `gr0k-0.2.110-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64(glibc) | `gr0k-0.2.110-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `gr0k-0.2.110-x86_64-pc-windows-msvc.zip` |
 | 校验和 | `SHA256SUMS` |
 
 标签必须与 `VERSION` 完全一致(`v0.2.110` ↔ `0.2.110`),否则构建会失败。
@@ -275,12 +275,12 @@ git push origin "v${VERSION}"
 
 ## 与官方 `grok` 共存
 
-Hyper 与 xAI / SpaceXAI **没有隶属关系**。在同一台机器上:
+gr0k 与 xAI / SpaceXAI **没有隶属关系**。在同一台机器上:
 
-| 项目 | 官方 `grok` | Hyper |
+| 项目 | 官方 `grok` | gr0k |
 |---------|-----------------|-------|
-| 二进制 | `grok` | `hyper` |
-| 托管安装目录 | `~/.grok/bin` | `~/.hyper/bin` |
+| 二进制 | `grok` | `gr0k` |
+| 托管安装目录 | `~/.grok/bin` | `~/.gr0k/bin`(旧版 `~/.hyper/bin`) |
 | 配置 / 认证 / 会话 | `~/.grok` | **相同的** `~/.grok` |
 | Leader IPC(`leader*.sock` / `.lock`) | 位于 `~/.grok` | **相同的**命名空间 |
 
@@ -288,16 +288,16 @@ Hyper 与 xAI / SpaceXAI **没有隶属关系**。在同一台机器上:
 
 - 会话、API key 和 OAuth 权限是共享的 —— 登录一次,两个 CLI 都能看到。
 - Leader 的 list/kill 可以同时看到两个产品的 leader。请只 kill 你自己启动的 leader。
-- 社区构建版禁用了上游的自更新功能,因此 `hyper update` 不会覆盖 `~/.grok/bin/grok`。升级 Hyper 请重新运行 `install.sh` / `install.ps1`。
+- 社区构建版禁用了上游的自更新功能,因此 `gr0k update` 不会覆盖 `~/.grok/bin/grok`。升级 gr0k 请重新运行 `install.sh` / `install.ps1`。
 
-Hyper 的安装脚本不会改写官方安装程序的任何内容。
+gr0k 的安装脚本不会改写官方安装程序的任何内容。
 
 ---
 
 ## 构建说明(本 fork)
 
 ```sh
-# 默认启用 community-build(Hyper 品牌 + 禁用上游更新器)。
+# 默认启用 community-build(gr0k 品牌 + 禁用上游更新器)。
 cargo run -p xai-grok-pager-bin
 
 # 显式构建发布风格的本地二进制
@@ -313,8 +313,8 @@ Amp 风格的 **agent 模式**(low / medium / high / ultra 档位)目前**仅有
 
 ## 文档
 
-仓库内用户指南(示例中可能仍写着 `grok`;Hyper 的二进制名是
-`hyper`,路径仍在 `~/.grok` 下):
+仓库内用户指南(示例中可能仍写着 `grok`;gr0k 的二进制名是
+`gr0k`,路径仍在 `~/.grok` 下):
 
 - 中文：[用户指南（中文）](crates/codegen/xai-grok-pager/docs/user-guide-zh-CN/)
 - English：[User Guide](crates/codegen/xai-grok-pager/docs/user-guide/)
@@ -334,7 +334,7 @@ Amp 风格的 **agent 模式**(low / medium / high / ultra 档位)目前**仅有
 
 | 路径 | 内容 |
 |------|----------|
-| `crates/codegen/xai-grok-pager-bin` | 组合根;构建 `hyper` 二进制 |
+| `crates/codegen/xai-grok-pager-bin` | 组合根;构建 `gr0k` 二进制 |
 | `crates/codegen/xai-grok-pager` | TUI |
 | `crates/codegen/xai-grok-shell` | Agent 运行时 |
 | `install.sh` / `install.ps1` | 发布安装脚本 |

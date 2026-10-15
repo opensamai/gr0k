@@ -1,22 +1,21 @@
 //! Read-only system-block text for `/queue`, `/tasks`, and `/usage`.
 //!
-//! Plain text committed into scrollback — the primary inspection surface in
-//! minimal mode (no interactive panes). Kept out of `dispatch` for easy
-//! unit tests.
-
-use crate::app::agent::BgTaskStatus;
+//! Plain text committed into scrollback; minimal mode has no interactive panes, so these blocks are its main way to inspect that state.
+//! The formatting lives outside `dispatch` so it is easy to unit test.
+use crate::app::agent::{BgTaskState, BgTaskStatus};
 use crate::app::agent_view::AgentView;
 use crate::app::subagent::format_subagent_label;
 use crate::util::{format_duration, group_thousands};
-
-/// `/queue` body — a read-only list of the queued prompts.
-///
-/// Server-authoritative shared-queue rows (the in-flight prompt excluded) come
-/// first in broadcast order, then the local drip-feed queue — matching
-/// [`crate::views::queue_pane::QueuePane::sync_from_merged`]'s ordering.
+impl BgTaskState {
+    pub(crate) fn display_kind(&self) -> &'static str {
+        if self.is_monitor { "Monitor" } else { "Task" }
+    }
+}
+/// `/queue` body: a read-only list of the queued prompts.
+/// Rows from the server's shared queue (minus the prompt already running) come first in broadcast order, then the local queue (`pending_prompts`).
+/// This matches [`crate::views::queue_pane::QueuePane::sync_from_merged`]'s ordering.
 pub(crate) fn queue_block_text(agent: &AgentView) -> String {
     let running_id = agent.session.current_prompt_id.as_deref();
-
     let mut rows: Vec<String> = Vec::new();
     let mut pos = 1usize;
     for wire in &agent.shared_queue {
@@ -30,7 +29,6 @@ pub(crate) fn queue_block_text(agent: &AgentView) -> String {
         rows.push(format_queue_row(pos, &prompt.text));
         pos += 1;
     }
-
     if rows.is_empty() {
         rust_i18n::t!("status.queue_empty").into_owned()
     } else {
@@ -42,12 +40,9 @@ pub(crate) fn queue_block_text(agent: &AgentView) -> String {
         join_header_rows(header, rows)
     }
 }
-
-///
-/// [`crate::views::tasks_pane::TasksPane`] without its styled rows.
+/// `/tasks` body: [`crate::views::tasks_pane::TasksPane`] without its styled rows.
 pub(crate) fn tasks_block_text(agent: &AgentView) -> String {
     let mut rows: Vec<String> = Vec::new();
-
     let mut workflows: Vec<_> = agent.workflow_runs.iter().collect();
     workflows.sort_by(|a, b| {
         b.is_active()
@@ -86,27 +81,26 @@ pub(crate) fn tasks_block_text(agent: &AgentView) -> String {
             .into_owned(),
         );
     }
-
-    // ── Subagents ──
     let mut subs: Vec<_> = agent
         .subagent_sessions
         .values()
-        .filter(|s| s.workflow_run_id.is_none())
+        .filter(|s| s.attempt.workflow_run_id.is_none())
         .collect();
     subs.sort_by(|a, b| {
         b.is_running()
             .cmp(&a.is_running())
-            .then(b.started_at.cmp(&a.started_at))
+            .then(b.attempt.started_at.cmp(&a.attempt.started_at))
             .then(a.child_session_id.cmp(&b.child_session_id))
     });
     for info in subs {
         let (type_label, desc) = format_subagent_label(info);
-        let status = if info.pending_kill {
+        let status = if info.attempt.pending_kill {
             rust_i18n::t!("status.word.stopping").into_owned()
         } else if info.is_running() {
             rust_i18n::t!("status.word.running").into_owned()
         } else {
-            info.status
+            info.attempt
+                .status
                 .as_deref()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| rust_i18n::t!("status.word.done").into_owned())
@@ -126,8 +120,6 @@ pub(crate) fn tasks_block_text(agent: &AgentView) -> String {
             .into_owned(),
         );
     }
-
-    // ── Background tasks / monitors ──
     let mut tasks: Vec<_> = agent.session.bg_tasks.values().collect();
     tasks.sort_by(|a, b| {
         let (ar, br) = (
@@ -170,8 +162,6 @@ pub(crate) fn tasks_block_text(agent: &AgentView) -> String {
             .into_owned(),
         );
     }
-
-    // ── Scheduled (/loop) tasks ──
     let mut sched: Vec<_> = agent.session.scheduled_tasks.values().collect();
     sched.sort_by(|a, b| {
         a.tag
@@ -191,7 +181,6 @@ pub(crate) fn tasks_block_text(agent: &AgentView) -> String {
             .into_owned(),
         );
     }
-
     if rows.is_empty() {
         rust_i18n::t!("status.tasks_empty").into_owned()
     } else {
@@ -203,9 +192,7 @@ pub(crate) fn tasks_block_text(agent: &AgentView) -> String {
         join_header_rows(header, rows)
     }
 }
-
-/// `/usage` body — per-session token and cost totals, scoped to the ledger's
-/// lifetime: since session start, or since the last `/resume`.
+/// `/usage` body: per-session token and cost totals, covering the ledger's lifetime (since session start, or since the last `/resume`).
 pub(crate) fn session_usage_block_text(
     usage: &xai_grok_shell::extensions::notification::PromptUsage,
 ) -> String {
@@ -217,7 +204,6 @@ pub(crate) fn session_usage_block_text(
             rust_i18n::t!("status.usage_empty").into_owned()
         };
     }
-
     let mut rows = Vec::new();
     rows.push(
         rust_i18n::t!(
@@ -266,29 +252,31 @@ pub(crate) fn session_usage_block_text(
     rows.push(rust_i18n::t!("status.usage_cost", cost = format_cost(t)).into_owned());
 
     if usage.model_usage.len() > 1 {
+        rows.push(String::new());
         rows.push(rust_i18n::t!("status.usage_by_model").into_owned());
         for (model, m) in &usage.model_usage {
-            rows.push(
-                rust_i18n::t!(
-                    "status.usage_model_row",
-                    model = model,
-                    input = group_thousands(m.input_tokens),
-                    output = group_thousands(m.output_tokens),
-                    cost = format_cost(m)
-                )
-                .into_owned(),
-            );
+            rows.push(format_by_model_row(model, m));
         }
     }
-
     if usage.usage_is_incomplete {
         rows.push(rust_i18n::t!("status.usage_note_incomplete").into_owned());
     }
 
     join_header_rows(rust_i18n::t!("status.usage_header").into_owned(), rows)
 }
-
-/// Cost cell. Ticks are 1e10 per USD; partial sums are scrubbed to absent.
+/// Formats one `By model:` row. The cost cell is omitted when `cost_usd_ticks` is `None`.
+fn format_by_model_row(
+    model: &str,
+    m: &xai_grok_shell::extensions::notification::PromptUsageModel,
+) -> String {
+    let tokens = group_thousands(m.total_tokens);
+    if m.cost_usd_ticks.is_some() {
+        format!("    {model}: {tokens} Tokens · {}", format_cost(m))
+    } else {
+        format!("    {model}: {tokens} Tokens")
+    }
+}
+/// Formats the cost cell. Ticks are 1e10 per USD; a partial sum is reported as absent.
 fn format_cost(m: &xai_grok_shell::extensions::notification::PromptUsageModel) -> String {
     use xai_grok_shell::extensions::notification::ticks_to_usd;
     match m.cost_usd_ticks {
@@ -297,10 +285,8 @@ fn format_cost(m: &xai_grok_shell::extensions::notification::PromptUsageModel) -
         None => rust_i18n::t!("status.cost_unavailable").into_owned(),
     }
 }
-
-/// First non-empty, trimmed line of `text` (empty string if none). Collapses a
-/// multi-line prompt/command to a single display line.
-fn first_nonempty_line(text: &str) -> &str {
+/// First non-empty, trimmed line of `text` (empty string if none). Collapses a multi-line prompt/command to a single display line.
+pub(crate) fn first_nonempty_line(text: &str) -> &str {
     text.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -350,26 +336,23 @@ fn format_queue_row(pos: usize, text: &str) -> String {
         rust_i18n::t!("status.queue_row", pos = pos, line = first_line).into_owned()
     }
 }
-
-/// Join a header line above its rows into a single block string.
 fn join_header_rows(header: String, rows: Vec<String>) -> String {
     std::iter::once(header)
         .chain(rows)
         .collect::<Vec<_>>()
         .join("\n")
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use xai_grok_shell::extensions::notification::{PromptUsage, PromptUsageModel};
-
     fn model_row(input: u64, output: u64, ticks: Option<i64>) -> PromptUsageModel {
         PromptUsageModel {
             input_tokens: input,
             output_tokens: output,
             total_tokens: input + output,
             cached_read_tokens: 0,
+            cache_creation_tokens: 0,
             reasoning_tokens: 0,
             model_calls: 1,
             api_duration_ms: 1_000,
@@ -378,7 +361,6 @@ mod tests {
             cost_missing_calls: 0,
         }
     }
-
     #[test]
     fn session_usage_block_empty_ledger() {
         let usage = PromptUsage::default();
@@ -386,15 +368,12 @@ mod tests {
             session_usage_block_text(&usage),
             "Session usage: no model calls yet in this session."
         );
-
-        // Empty but incomplete must not read as a clean zero.
         let incomplete = PromptUsage {
             usage_is_incomplete: true,
             ..Default::default()
         };
         assert!(session_usage_block_text(&incomplete).contains("incomplete"));
     }
-
     #[test]
     fn session_usage_block_formats_tokens_and_cost() {
         let mut totals = model_row(1_234_567, 45_678, Some(12_345_000_000));
@@ -407,11 +386,8 @@ mod tests {
             ..Default::default()
         };
         let text = session_usage_block_text(&usage);
-        // Snapshot pins content and column alignment together; single-model
-        // sessions must skip the redundant by-model breakdown.
         insta::assert_snapshot!("session_usage_block_full", text);
     }
-
     #[test]
     fn session_usage_block_lists_models_when_multiple() {
         let mut usage = PromptUsage {
@@ -425,11 +401,36 @@ mod tests {
             .model_usage
             .insert("grok-4".into(), model_row(50, 5, None));
         let text = session_usage_block_text(&usage);
-        assert!(text.contains("By model:"), "{text}");
-        assert!(text.contains("grok-build — 100 in / 10 out"), "{text}");
-        assert!(text.contains("grok-4 — 50 in / 5 out"), "{text}");
+        insta::assert_snapshot!("session_usage_block_by_model", text);
     }
-
+    #[test]
+    fn session_usage_block_by_model_shows_cost_only_when_known() {
+        let mut usage = PromptUsage {
+            totals: model_row(123_556, 1_010, Some(20_000_000)),
+            ..Default::default()
+        };
+        usage.model_usage.insert(
+            "grok-4.7-build".into(),
+            model_row(123_456, 1_000, Some(20_000_000)),
+        );
+        usage
+            .model_usage
+            .insert("grok-4".into(), model_row(100, 10, None));
+        let text = session_usage_block_text(&usage);
+        let rows: Vec<&str> = text
+            .lines()
+            .skip_while(|line| *line != "  By model:")
+            .skip(1)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "    grok-4.7-build: 124,456 Tokens · $0.0020",
+                "    grok-4: 110 Tokens",
+            ],
+            "{text}"
+        );
+    }
     #[test]
     fn session_usage_block_absent_cost_is_unknown_not_free() {
         let usage = PromptUsage {
@@ -438,10 +439,8 @@ mod tests {
         };
         let text = session_usage_block_text(&usage);
         insta::assert_snapshot!("session_usage_block_absent_cost", text);
-        // Unknown cost must never read as free.
         assert!(!text.contains("$0"), "{text}");
     }
-
     #[test]
     fn session_usage_block_flags_partial_and_incomplete() {
         let mut totals = model_row(100, 10, None);
@@ -455,7 +454,6 @@ mod tests {
         assert!(text.contains("not reported for some calls"), "{text}");
         assert!(text.contains("usage is incomplete"), "{text}");
     }
-
     #[test]
     fn pad_display_pads_by_terminal_width() {
         use unicode_width::UnicodeWidthStr;
@@ -475,7 +473,6 @@ mod tests {
         assert_eq!(group_thousands(1_000), "1,000");
         assert_eq!(group_thousands(1_234_567), "1,234,567");
     }
-
     #[test]
     fn first_nonempty_line_skips_blank_leading_lines() {
         assert_eq!(first_nonempty_line("\n  \n  hello \nworld"), "hello");
@@ -483,12 +480,10 @@ mod tests {
         assert_eq!(first_nonempty_line(""), "");
         assert_eq!(first_nonempty_line("only"), "only");
     }
-
     #[test]
     fn format_queue_row_single_line() {
         assert_eq!(format_queue_row(1, "fix the bug"), "  #1  fix the bug");
     }
-
     #[test]
     fn format_queue_row_multiline_reports_extra_lines() {
         assert_eq!(

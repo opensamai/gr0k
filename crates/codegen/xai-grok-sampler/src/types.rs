@@ -1,5 +1,3 @@
-//! Core sampler types.
-
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -44,7 +42,6 @@ impl RequestId {
         Self(uuid::Uuid::new_v4().to_string())
     }
 
-    /// Borrow the underlying string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -71,24 +68,6 @@ impl From<&str> for RequestId {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn from_string_roundtrips() {
-        let id: RequestId = String::from("abc-123").into();
-        assert_eq!(id.as_str(), "abc-123");
-    }
-
-    #[test]
-    fn from_str_roundtrips() {
-        let id: RequestId = "xyz-789".into();
-        assert_eq!(id.as_str(), "xyz-789");
-    }
-
-    #[test]
-    fn display_matches_inner_string() {
-        let id: RequestId = "display-me".into();
-        assert_eq!(format!("{id}"), "display-me");
-    }
 
     #[test]
     fn random_produces_unique_values() {

@@ -1,20 +1,20 @@
 <div align="center">
 
-<h1>Hyper (<code>hyper</code>)</h1>
+<h1>gr0k (<code>gr0k</code>)</h1>
 
-<img src="docs/assets/hyper-banner.jpg" alt="Hyper — terminal AI coding agent" width="720">
+<img src="docs/assets/hyper-banner.jpg" alt="gr0k — terminal AI coding agent" width="720">
 
 <p>
-  <a href="https://github.com/DaviRain-Su/hyper-grok-build/releases"><img src="https://img.shields.io/github/v/release/DaviRain-Su/hyper-grok-build?display_name=tag" alt="Release"></a>
-  <a href="https://github.com/DaviRain-Su/hyper-grok-build/actions/workflows/release.yml"><img src="https://github.com/DaviRain-Su/hyper-grok-build/actions/workflows/release.yml/badge.svg" alt="Release CI"></a>
+  <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/v/release/opensamai/gr0k?display_name=tag" alt="Release"></a>
+  <a href="https://github.com/opensamai/gr0k/actions/workflows/release.yml"><img src="https://github.com/opensamai/gr0k/actions/workflows/release.yml/badge.svg" alt="Release CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/rust-1.92.0-orange?logo=rust" alt="Rust 1.92">
   <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="Platforms: macOS, Linux, Windows">
-  <a href="https://github.com/DaviRain-Su/hyper-grok-build/releases"><img src="https://img.shields.io/github/downloads/DaviRain-Su/hyper-grok-build/total?label=downloads" alt="Downloads"></a>
+  <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/downloads/opensamai/gr0k/total?label=downloads" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/i18n-10%20locales-brightgreen" alt="i18n: 10 locales">
 </p>
 
-**Hyper** is an unofficial multi-provider community build of
+**gr0k** is an unofficial multi-provider community build of
 [Grok Build](https://github.com/xai-org/grok-build) — a terminal-based AI
 coding agent written in Rust, with first-class multi-provider LLM support:
 xAI Grok, Kimi Code / Moonshot, ChatGPT Codex, OpenAI, Anthropic, Z.AI,
@@ -26,7 +26,7 @@ interactively, headlessly for scripting/CI, or embedded in editors via the
 Agent Client Protocol (ACP). The UI is localized in 10 languages
 (English, 中文, 日本語, 한국어, Español, Português, Français, Deutsch,
 Русский) and switchable live from Settings. A local, read-only Rust web
-dashboard is available with `hyper dashboard --web` for session metrics,
+dashboard is available with `gr0k dashboard --web` for session metrics,
 timelines, charts, logs, and live event streaming.
 
 [Installation](#installation) ·
@@ -51,19 +51,19 @@ harness), in two of the ten UI locales:
 
 | English | 简体中文 |
 | ------- | -------- |
-| ![Hyper TUI in English](docs/assets/screenshot-welcome-en.png) | ![中文界面的 Hyper TUI](docs/assets/screenshot-welcome-zh.png) |
+| ![gr0k TUI in English](docs/assets/screenshot-welcome-en.png) | ![中文界面的 gr0k TUI](docs/assets/screenshot-welcome-zh.png) |
 
 ---
 
-## Why “Hyper”?
+## Why “gr0k”?
 
-The fork repo is already named `hyper-grok-build`. **Hyper** keeps that brand:
+The fork repo is already named `hyper-grok-build`. **gr0k** keeps that brand:
 
 | | Official | This fork |
 |---|---|---|
-| Product | Grok Build | **Hyper** |
-| Binary | `grok` | **`hyper`** |
-| Install root | `~/.grok` | **`~/.hyper`** (binary only) |
+| Product | Grok Build | **gr0k** |
+| Binary | `grok` | **`gr0k`** |
+| Install root | `~/.grok` | **`~/.gr0k`** (binary only) |
 | Config / auth | `~/.grok` | **`~/.grok`** (shared; same runtime) |
 | Upstream | [xai-org/grok-build](https://github.com/xai-org/grok-build) | multi-provider community patches |
 
@@ -77,32 +77,32 @@ Short CLI, no clash with `grok`, and room to grow beyond a single provider
 Prebuilt single-file binaries for macOS (arm64/x86_64), Linux (arm64/x86_64,
 glibc / `linux-gnu` — correct for Omarchy, Ubuntu, Fedora, etc.), and Windows
 (x86_64) are published on
-[GitHub Releases](https://github.com/DaviRain-Su/hyper-grok-build/releases):
+[GitHub Releases](https://github.com/opensamai/gr0k/releases):
 
 ```sh
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash
 ```
 
 ```powershell
 # Windows PowerShell
-irm https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.ps1 | iex
+irm https://raw.githubusercontent.com/opensamai/gr0k/dev/install.ps1 | iex
 ```
 
 ```sh
-hyper --version
-hyper login          # xAI / Grok session (browser OAuth)
-hyper                # start the TUI
+gr0k --version
+gr0k login          # xAI / Grok session (browser OAuth)
+gr0k                # start the TUI
 ```
 
 Pin a release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DaviRain-Su/hyper-grok-build/dev/install.sh | bash -s -- --version v0.2.110
+curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash -s -- --version v0.2.110
 ```
 
 The installer verifies every download against the release’s `SHA256SUMS`,
-installs into `~/.hyper/bin/hyper` (`%USERPROFILE%\.hyper\bin\hyper.exe` on
+installs into `~/.gr0k/bin/gr0k` (`%USERPROFILE%\.gr0k\bin\gr0k.exe` on
 Windows), and prints the PATH line to add when needed.
 
 > Need unreleased changes? Build from source below; otherwise install the latest release above.
@@ -111,16 +111,16 @@ Windows), and prints the PATH line to add when needed.
 
 ## Providers
 
-Hyper keeps the multi-provider registry from this tree (see the pager
+gr0k keeps the multi-provider registry from this tree (see the pager
 [user guide](crates/codegen/xai-grok-pager/docs/user-guide/)):
 
 | Platform | Auth | Notes |
 | -------- | ---- | ----- |
-| xAI / Grok | `hyper login` (OIDC) or `XAI_API_KEY` | First-party models |
+| xAI / Grok | `gr0k login` (OIDC) or `XAI_API_KEY` | First-party models |
 | Kimi Code | device OAuth / subscription | `kimi-code/*` catalog |
 | Moonshot CN / AI | API key | open platform |
 | ChatGPT Codex | ChatGPT OAuth | GPT-5.x reasoning plus experimental full-duplex `/live` voice |
-| **Anthropic Claude (Pro/Max)** | **`/claude`** (TUI) or `hyper login --claude` | Subscription login; unlocks `anthropic-claude/*` |
+| **Anthropic Claude (Pro/Max)** | **`/claude`** (TUI) or `gr0k login --claude` | Subscription login; unlocks `anthropic-claude/*` |
 | **Nexus relay gateway** | **`/nexus <key> [base_url]`** (TUI) or `NEXUS_API_KEY` | Self-hosted OpenAI/Anthropic-compatible relay; `nexus/*` |
 | OpenAI / Anthropic / DeepSeek-style | API keys | BYOK catalog |
 | Z.AI Coding Plan | platform key | international plan |
@@ -148,10 +148,10 @@ be signed into Grok and Claude at the same time.
 /claude                     # same as /login claude
 
 # CLI: opens the browser OAuth flow
-hyper login --claude        # alias: hyper login --anthropic
+gr0k login --claude        # alias: gr0k login --anthropic
 
 # Sign out again
-hyper logout --claude       # or: hyper logout --all
+gr0k logout --claude       # or: gr0k logout --all
 ```
 
 Credentials are stored under the `oauth/anthropic-claude` scope in
@@ -170,10 +170,10 @@ self-hosted, you can point it at your own deployment three ways:
 
 ```sh
 # 0. CLI (works BEFORE any xAI login) — global one-time setup
-hyper nexus <api_key>                   # save the key to ~/.grok/auth.json
-hyper nexus <api_key> https://your-gw   # save key + custom gateway root
-hyper nexus --clear                     # remove the stored key
-hyper nexus                             # print setup guide + current status
+gr0k nexus <api_key>                   # save the key to ~/.grok/auth.json
+gr0k nexus <api_key> https://your-gw   # save key + custom gateway root
+gr0k nexus --clear                     # remove the stored key
+gr0k nexus                             # print setup guide + current status
 
 # 1. TUI (simplest) — enter the key once; it persists to ~/.grok/auth.json
 /nexus                                 # print setup guidance (how to get a key)
@@ -190,7 +190,7 @@ export GROK_NEXUS_BASE_URL=https://your-gateway   # override the root
 ```
 
 The base URL accepts any client-facing shape (`https://your-gateway`,
-`…/v1`, `…/openai/v1`) — Hyper normalizes it to the bare root and derives the
+`…/v1`, `…/openai/v1`) — gr0k normalizes it to the bare root and derives the
 per-backend paths (`{root}/openai/v1`, `{root}/v1`) automatically. The key
 and root are saved to `~/.grok/auth.json` alongside the other providers.
 
@@ -211,29 +211,29 @@ Requirements:
   `/live` voice (the workspace pins `CMAKE_POLICY_VERSION_MINIMUM=3.5`)
 
 ```sh
-cargo run -p xai-grok-pager-bin              # build + launch TUI (binary: hyper)
+cargo run -p xai-grok-pager-bin              # build + launch TUI (binary: gr0k)
 cargo build -p xai-grok-pager-bin --profile release-dist
-./target/release-dist/hyper --version
+./target/release-dist/gr0k --version
 ```
 
 The composition-root package is still `xai-grok-pager-bin` (monorepo
-layout); the **shipped binary name** is `hyper`.
+layout); the **shipped binary name** is `gr0k`.
 
 ### Install a source build globally
 
-To run your own edits as the managed `~/.hyper/bin/hyper` (the same layout
+To run your own edits as the managed `~/.gr0k/bin/gr0k` (the same layout
 `install.sh` produces, but built from this checkout instead of a GitHub
 Release), use [`scripts/install-local.sh`](scripts/install-local.sh):
 
 ```sh
-scripts/install-local.sh                 # build + install over ~/.hyper/bin/hyper
+scripts/install-local.sh                 # build + install over ~/.gr0k/bin/gr0k
 scripts/install-local.sh --no-link       # build + stage in downloads/, keep current symlink
-HYPER_SHARE_DIR=~/.hyper-dev scripts/install-local.sh   # install to a separate root
+GR0K_SHARE_DIR=~/.gr0k-dev scripts/install-local.sh   # install to a separate root
 ```
 
 It runs `cargo install --locked`, stages a versioned binary under
-`~/.hyper/downloads/`, re-signs it on macOS, smoke-tests `--version`, then
-atomically repoints `~/.hyper/bin/hyper`. Requires `cargo`, `cmake`, and a real
+`~/.gr0k/downloads/`, re-signs it on macOS, smoke-tests `--version`, then
+atomically repoints `~/.gr0k/bin/gr0k`. Requires `cargo`, `cmake`, and a real
 `ripgrep` binary (auto-detected, or set `GROK_SHELL_BUNDLE_RG_PATH`). The first
 build takes ~13 min.
 
@@ -268,11 +268,11 @@ Artifacts:
 
 | Asset | Example |
 | ----- | ------- |
-| macOS arm64 | `hyper-0.2.110-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `hyper-0.2.110-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc) | `hyper-0.2.110-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc) | `hyper-0.2.110-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `hyper-0.2.110-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `gr0k-0.2.110-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `gr0k-0.2.110-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc) | `gr0k-0.2.110-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc) | `gr0k-0.2.110-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `gr0k-0.2.110-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
 The tag must match `VERSION` exactly (`v0.2.110` ↔ `0.2.110`) or the build fails.
@@ -281,12 +281,12 @@ The tag must match `VERSION` exactly (`v0.2.110` ↔ `0.2.110`) or the build fai
 
 ## Coexistence with official `grok`
 
-Hyper is **not** affiliated with xAI / SpaceXAI. On the same machine:
+gr0k is **not** affiliated with xAI / SpaceXAI. On the same machine:
 
-| Surface | Official `grok` | Hyper |
+| Surface | Official `grok` | gr0k |
 |---------|-----------------|-------|
-| Binary | `grok` | `hyper` |
-| Managed install root | `~/.grok/bin` | `~/.hyper/bin` |
+| Binary | `grok` | `gr0k` |
+| Managed install root | `~/.grok/bin` | `~/.gr0k/bin` (legacy `~/.hyper/bin`) |
 | Config / auth / sessions | `~/.grok` | **same** `~/.grok` |
 | Leader IPC (`leader*.sock` / `.lock`) | under `~/.grok` | **same** namespace |
 
@@ -294,16 +294,16 @@ Implications:
 
 - Sessions, API keys, and OAuth scopes are shared — log in once, both CLIs can see them.
 - Leader list/kill can see both products’ leaders. Prefer killing only leaders you started.
-- Community builds disable the upstream self-updater so `hyper update` cannot overwrite `~/.grok/bin/grok`. Upgrade Hyper by re-running `install.sh` / `install.ps1`.
+- Community builds disable the upstream self-updater so `gr0k update` cannot overwrite `~/.grok/bin/grok`. Upgrade gr0k by re-running `install.sh` / `install.ps1`.
 
-Nothing in the official installer is rewritten by Hyper’s install script.
+Nothing in the official installer is rewritten by gr0k’s install script.
 
 ---
 
 ## Building notes (this fork)
 
 ```sh
-# Defaults enable community-build (Hyper branding + no upstream updater).
+# Defaults enable community-build (gr0k branding + no upstream updater).
 cargo run -p xai-grok-pager-bin
 
 # Explicit release-style local binary
@@ -319,8 +319,8 @@ Known issues and remaining work: [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
 ## Documentation
 
-In-tree user guide (examples may still say `grok`; the Hyper binary name is
-`hyper`, paths remain under `~/.grok`):
+In-tree user guide (examples may still say `grok`; the gr0k binary name is
+`gr0k`, paths remain under `~/.grok`):
 
 - English: [`crates/codegen/xai-grok-pager/docs/user-guide/`](crates/codegen/xai-grok-pager/docs/user-guide/)
 - 中文: [`crates/codegen/xai-grok-pager/docs/user-guide-zh-CN/`](crates/codegen/xai-grok-pager/docs/user-guide-zh-CN/)
@@ -338,7 +338,7 @@ Upstream product docs: [docs.x.ai/build](https://docs.x.ai/build/overview)
 
 | Path | Contents |
 |------|----------|
-| `crates/codegen/xai-grok-pager-bin` | Composition root; builds the `hyper` binary |
+| `crates/codegen/xai-grok-pager-bin` | Composition root; builds the `gr0k` binary |
 | `crates/codegen/xai-grok-pager` | TUI |
 | `crates/codegen/xai-grok-shell` | Agent runtime |
 | `install.sh` / `install.ps1` | Release installers |
