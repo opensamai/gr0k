@@ -8,7 +8,7 @@
   <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/v/release/opensamai/gr0k?display_name=tag" alt="发布版本"></a>
   <a href="https://github.com/opensamai/gr0k/actions/workflows/release.yml"><img src="https://github.com/opensamai/gr0k/actions/workflows/release.yml/badge.svg" alt="发布 CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="许可证"></a>
-  <img src="https://img.shields.io/badge/rust-1.92.0-orange?logo=rust" alt="Rust 1.92">
+  <img src="https://img.shields.io/badge/rust-1.94.0-orange?logo=rust" alt="Rust 1.94">
   <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="平台:macOS、Linux、Windows">
   <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/downloads/opensamai/gr0k/total?label=downloads" alt="下载量"></a>
   <img src="https://img.shields.io/badge/i18n-10%20locales-brightgreen" alt="i18n:10 种语言">
@@ -22,8 +22,8 @@ xAI Grok、Kimi Code / Moonshot、ChatGPT Codex、OpenAI、Anthropic、Z.AI、Ol
 执行 shell 命令、搜索网页,并管理长时间运行的任务 ——
 既可以在终端中交互使用,也可以无头模式用于脚本/CI,
 还能通过 Agent Client Protocol(ACP)嵌入到编辑器中。
-UI 已本地化为 10 种语言(English、中文、日本語、한국어、Español、
-Português、Français、Deutsch、Русский),并可在设置中实时切换。运行
+UI 已本地化为 10 种语言（English、简体中文、繁體中文、日本語、한국어、
+Español、Português、Français、Deutsch、Русский），并可在设置中实时切换。运行
 `gr0k dashboard --web` 可以打开本地只读的纯 Rust Web 仪表盘，查看会话指标、
 事件时间线、图表、日志和实时事件流。
 
@@ -53,57 +53,56 @@ Português、Français、Deutsch、Русский),并可在设置中实时切�
 
 ---
 
-## 为什么叫 "gr0k"?
+## 为什么叫 “gr0k”？
 
-本 fork 仓库已经命名为 `hyper-grok-build`,**gr0k** 沿用了这个品牌:
+这个社区构建以前以 `hyper` 发布。产品名现在是 **gr0k**，仓库是
+[opensamai/gr0k](https://github.com/opensamai/gr0k)。合入官方 Grok Build
+并保留多供应商补丁的代码在 `merge-official` 分支。`main` 仍是更早的单平台快照。
 
-| | 官方版本 | 本 fork |
+| | 官方版本 | 本构建 |
 |---|---|---|
 | 产品 | Grok Build | **gr0k** |
 | 二进制文件 | `grok` | **`gr0k`** |
-| 安装目录 | `~/.grok` | **`~/.gr0k`**(仅二进制) |
-| 配置 / 认证 | `~/.grok` | **`~/.grok`**(共享;同一运行时) |
-| 上游 | [xai-org/grok-build](https://github.com/xai-org/grok-build) | 多供应商社区补丁 |
+| 安装目录 | `~/.grok` | **`~/.gr0k`**（仅二进制） |
+| 配置 / 认证 / 会话 | `~/.grok` | **`~/.grok`**（同一运行时） |
+| 上游 | [xai-org/grok-build](https://github.com/xai-org/grok-build) | `merge-official` |
 
-简短的 CLI 名称,不与 `grok` 冲突,也为超越单一供应商留出了发展空间
-(不像 [Kigi](https://github.com/ZacharyZhang-NY/Kigi-CLI) 这样只支持 Kimi 的 fork)。
+`GR0K_SHARE_DIR` 可改安装根目录。旧变量 `HYPER_SHARE_DIR` 仍然有效。
+以前装在 `~/.hyper/bin/hyper` 的文件不会被自动搬走，新安装使用
+`~/.gr0k/bin/gr0k`。
 
 ---
 
 ## 安装
 
-适用于 macOS(arm64/x86_64)、Linux(arm64/x86_64,
-glibc / `linux-gnu` —— 适用于 Omarchy、Ubuntu、Fedora 等)以及 Windows
-(x86_64)的预编译单文件二进制已发布在
-[GitHub Releases](https://github.com/opensamai/gr0k/releases):
+安装脚本会下载发布包，用 `SHA256SUMS` 校验，再链到
+`~/.gr0k/bin/gr0k`（Windows 为 `%USERPROFILE%\.gr0k\bin\gr0k.exe`）。
 
 ```sh
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash
+# macOS / Linux —— 脚本在合并分支上
+curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/merge-official/install.sh | bash
 ```
 
 ```powershell
 # Windows PowerShell
-irm https://raw.githubusercontent.com/opensamai/gr0k/dev/install.ps1 | iex
+irm https://raw.githubusercontent.com/opensamai/gr0k/merge-official/install.ps1 | iex
 ```
 
 ```sh
 gr0k --version
-gr0k login          # xAI / Grok 会话(浏览器 OAuth)
 gr0k                # 启动 TUI
 ```
 
-安装指定版本:
+当前已发布的 `v0.2.115` 是更早的快照：只有一个仍叫
+`hyper-0.2.115-…` 的 macOS arm64 包。合并后的代码版本号相同，但二进制名是
+`gr0k`，目标是五个平台（macOS arm64/x86_64、Linux glibc arm64/x86_64、
+Windows x86_64）。这些包由
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 生成，
+**在推送新 tag 之前不会挂到 Release 上**。在那之前，请按下面的方式从源码安装。
+手动触发 workflow 只上传 Actions 产物，不会发布 Release。
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash -s -- --version v0.2.110
-```
-
-安装程序会根据发布版的 `SHA256SUMS` 校验每一次下载,
-安装到 `~/.gr0k/bin/gr0k`(Windows 上为 `%USERPROFILE%\.gr0k\bin\gr0k.exe`),
-并在需要时打印出需要添加的 PATH 配置行。
-
-> 如需尚未发布的改动，可从下方源码构建；否则请安装上方的最新发布版。
+> 未签名的 macOS 二进制从浏览器下载后，Gatekeeper 仍会警告。`install.sh`
+> 安装后会清掉隔离属性。签名和公证需要 Apple Developer ID，CI 里没有这一步。
 
 ---
 
@@ -114,11 +113,11 @@ gr0k 保留了本代码树中的多供应商注册表(见 pager
 
 | 平台 | 认证方式 | 备注 |
 | -------- | ---- | ----- |
-| xAI / Grok | `gr0k login`(OIDC)或 `XAI_API_KEY` | 第一方模型 |
-| Kimi Code | 设备 OAuth / 订阅 | `kimi-code/*` 目录 |
+| xAI / Grok | `gr0k login`（OIDC）或 `XAI_API_KEY` | 第一方模型 |
+| Kimi Code | `gr0k login --kimi` 或 `/kimi` | 设备 OAuth；`kimi-code/*` |
 | Moonshot CN / AI | API key | 开放平台 |
-| ChatGPT Codex | ChatGPT OAuth | GPT-5.x reasoning，并支持实验性全双工 `/live` 语音 |
-| **Anthropic Claude(Pro/Max)** | **`/claude`**(TUI)或 `gr0k login --claude` | 订阅号登录;解锁 `anthropic-claude/*` |
+| ChatGPT Codex | `gr0k login --openai` 或 `/codex` | ChatGPT OAuth；实验性 `/live` 语音 |
+| **Anthropic Claude（Pro/Max）** | **`gr0k login --claude`** 或 **`/claude`** | 订阅登录；`anthropic-claude/*` |
 | **Nexus 中转站** | **`/nexus <key> [base_url]`**(TUI)或 `NEXUS_API_KEY` | 自托管、兼容 OpenAI/Anthropic 的中转网关;`nexus/*` |
 | OpenAI / Anthropic / DeepSeek 风格 | API keys | BYOK 目录 |
 | Z.AI Coding Plan | 平台 key | 国际版方案 |
@@ -132,7 +131,30 @@ OpenAI Codex 等)。
 配置和凭据仍然存放在 **`~/.grok`**(与上游 Grok Build 相同的路径),
 因此已有的会话、API key 和 `auth.json` 可以继续使用。
 
-### Anthropic Claude 号登录(Pro/Max)
+Kimi、Codex 或 Claude 返回 401 时，只刷新**该订阅**的令牌，不会改去刷新
+xAI 会话。Ollama 一类开放平台的 BYOK 端点同样不会靠刷新 xAI 来修复。
+`gr0k logout --all` 会清掉 xAI 会话以及 Kimi、Codex、Claude 的 OAuth
+范围，不会删除 BYOK 平台密钥。
+
+```sh
+gr0k login                  # xAI / Grok
+gr0k login --kimi           # Kimi Code
+gr0k login --openai         # ChatGPT Codex（别名：--chatgpt）
+gr0k login --claude         # Claude Pro/Max（别名：--anthropic）
+gr0k logout --kimi          # 只清一个范围
+gr0k logout --openai
+gr0k logout --claude
+gr0k logout --all           # xAI + 上述三个订阅
+```
+
+### 主题
+
+`/theme` 除上游主题外，还有 gr0k 预设：Everforest、Nord、Dracula、Gruvbox、
+Catppuccin Mocha/Latte、Solarized 暗色/亮色、Deep Ocean、Ember、Midnight OLED
+和 Paper。`terminal` 保留终端自己的背景。`auto` 跟随系统外观。预设编号
+`6` 到 `17` 是磁盘上的稳定值，不要改号。
+
+### Anthropic Claude 号登录（Pro/Max）
 
 使用 Anthropic Claude 的 **Pro/Max 订阅账号**登录,即可直接使用
 `anthropic-claude/*` 模型 —— 无需 API key。认证走浏览器 OAuth 流程
@@ -244,11 +266,15 @@ GR0K_SHARE_DIR=~/.gr0k-dev scripts/install-local.sh   # 安装到独立目录
 
 1. 将根目录的 [`VERSION`](VERSION) 文件设置为 **monorepo 锁步客户端版本**
    (与 `crates/codegen/xai-grok-pager/Cargo.toml` /
-   `xai-grok-version` 保持一致,当前为 `0.2.110`)。CI 会把它编译进
-   `x-grok-client-version`;xAI 会拒绝低于 **0.1.202** 的客户端(HTTP 426)。
-   **不要**自己编造一个较低的营销版本号(例如 `0.1.0`)。
-2. 在 `dev`(或你的发布分支)上提交;更新 `CHANGELOG.md`。
-3. 打标签并推送 —— CI 会构建五个目标平台并发布 GitHub Release:
+   `xai-grok-version` 保持一致，当前为 `0.2.115`）。CI 会把它编译进
+   `x-grok-client-version`；xAI 会拒绝低于 **0.1.202** 的客户端（HTTP 426）。
+   **不要**自己编造一个较低的营销版本号（例如 `0.1.0`）。
+2. 在 `merge-official`（或你的发布分支）上提交；更新 `CHANGELOG.md`。
+3. 打标签并推送 —— CI 会构建五个目标并发布 GitHub Release。
+   `workflow_dispatch` 编同样的五个目标，但只上传 Actions 产物。
+   Windows 目标在 Rust 1.94 上编译 `cc` 1.2.48 会失败
+   （`FILE_ATTRIBUTE_TEMPORARY` 在该版本是 `i32`）；macOS 和 Linux
+   不会编译这段代码。
 
 ```sh
 VERSION=$(tr -d '[:space:]' < VERSION)
@@ -262,14 +288,14 @@ git push origin "v${VERSION}"
 
 | 产物 | 示例 |
 | ----- | ------- |
-| macOS arm64 | `gr0k-0.2.110-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `gr0k-0.2.110-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64(glibc) | `gr0k-0.2.110-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64(glibc) | `gr0k-0.2.110-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `gr0k-0.2.110-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `gr0k-0.2.115-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `gr0k-0.2.115-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64（glibc） | `gr0k-0.2.115-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64（glibc） | `gr0k-0.2.115-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `gr0k-0.2.115-x86_64-pc-windows-msvc.zip` |
 | 校验和 | `SHA256SUMS` |
 
-标签必须与 `VERSION` 完全一致(`v0.2.110` ↔ `0.2.110`),否则构建会失败。
+标签必须与 `VERSION` 完全一致（`v0.2.115` ↔ `0.2.115`），否则构建会失败。
 
 ---
 

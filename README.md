@@ -8,7 +8,7 @@
   <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/v/release/opensamai/gr0k?display_name=tag" alt="Release"></a>
   <a href="https://github.com/opensamai/gr0k/actions/workflows/release.yml"><img src="https://github.com/opensamai/gr0k/actions/workflows/release.yml/badge.svg" alt="Release CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
-  <img src="https://img.shields.io/badge/rust-1.92.0-orange?logo=rust" alt="Rust 1.92">
+  <img src="https://img.shields.io/badge/rust-1.94.0-orange?logo=rust" alt="Rust 1.94">
   <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="Platforms: macOS, Linux, Windows">
   <a href="https://github.com/opensamai/gr0k/releases"><img src="https://img.shields.io/github/downloads/opensamai/gr0k/total?label=downloads" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/i18n-10%20locales-brightgreen" alt="i18n: 10 locales">
@@ -24,8 +24,8 @@ It runs as a full-screen TUI that understands your codebase, edits files,
 executes shell commands, searches the web, and manages long-running tasks —
 interactively, headlessly for scripting/CI, or embedded in editors via the
 Agent Client Protocol (ACP). The UI is localized in 10 languages
-(English, 中文, 日本語, 한국어, Español, Português, Français, Deutsch,
-Русский) and switchable live from Settings. A local, read-only Rust web
+(English, 简体中文, 繁體中文, 日本語, 한국어, Español, Português, Français,
+Deutsch, Русский) and switchable live from Settings. A local, read-only Rust web
 dashboard is available with `gr0k dashboard --web` for session metrics,
 timelines, charts, logs, and live event streaming.
 
@@ -57,55 +57,59 @@ harness), in two of the ten UI locales:
 
 ## Why “gr0k”?
 
-The fork repo is already named `hyper-grok-build`. **gr0k** keeps that brand:
+This community build used to ship as `hyper`. The product is now **gr0k**,
+and the repository is [opensamai/gr0k](https://github.com/opensamai/gr0k).
+Current source, including the official Grok Build merge plus the
+multi-provider patches, is the `merge-official` branch. `main` is still the
+older single-platform snapshot.
 
-| | Official | This fork |
+| | Official | This build |
 |---|---|---|
 | Product | Grok Build | **gr0k** |
 | Binary | `grok` | **`gr0k`** |
 | Install root | `~/.grok` | **`~/.gr0k`** (binary only) |
-| Config / auth | `~/.grok` | **`~/.grok`** (shared; same runtime) |
-| Upstream | [xai-org/grok-build](https://github.com/xai-org/grok-build) | multi-provider community patches |
+| Config / auth / sessions | `~/.grok` | **`~/.grok`** (shared runtime) |
+| Upstream | [xai-org/grok-build](https://github.com/xai-org/grok-build) | `merge-official` |
 
-Short CLI, no clash with `grok`, and room to grow beyond a single provider
-(unlike Kimi-only forks such as [Kigi](https://github.com/ZacharyZhang-NY/Kigi-CLI)).
+`GR0K_SHARE_DIR` overrides the install root. The old `HYPER_SHARE_DIR` name
+still works. A previous `~/.hyper/bin/hyper` install is left in place; new
+installs use `~/.gr0k/bin/gr0k`.
 
 ---
 
 ## Installation
 
-Prebuilt single-file binaries for macOS (arm64/x86_64), Linux (arm64/x86_64,
-glibc / `linux-gnu` — correct for Omarchy, Ubuntu, Fedora, etc.), and Windows
-(x86_64) are published on
-[GitHub Releases](https://github.com/opensamai/gr0k/releases):
+The installer downloads a release archive, checks it against `SHA256SUMS`,
+and links `~/.gr0k/bin/gr0k` (`%USERPROFILE%\.gr0k\bin\gr0k.exe` on Windows).
 
 ```sh
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash
+# macOS / Linux — script from the merged branch
+curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/merge-official/install.sh | bash
 ```
 
 ```powershell
 # Windows PowerShell
-irm https://raw.githubusercontent.com/opensamai/gr0k/dev/install.ps1 | iex
+irm https://raw.githubusercontent.com/opensamai/gr0k/merge-official/install.ps1 | iex
 ```
 
 ```sh
 gr0k --version
-gr0k login          # xAI / Grok session (browser OAuth)
 gr0k                # start the TUI
 ```
 
-Pin a release:
+The release currently published as `v0.2.115` is the older snapshot: one
+macOS arm64 archive still named `hyper-0.2.115-…`. The merged tree keeps the
+same version number but ships the binary as `gr0k` for five targets
+(macOS arm64/x86_64, Linux glibc arm64/x86_64, Windows x86_64). Those
+archives are produced by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) and are
+**not** attached to a Release until a new tag is pushed. Until then, install
+this tree from source (below). A manual workflow run uploads artifacts only
+and does not publish a Release.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/opensamai/gr0k/dev/install.sh | bash -s -- --version v0.2.110
-```
-
-The installer verifies every download against the release’s `SHA256SUMS`,
-installs into `~/.gr0k/bin/gr0k` (`%USERPROFILE%\.gr0k\bin\gr0k.exe` on
-Windows), and prints the PATH line to add when needed.
-
-> Need unreleased changes? Build from source below; otherwise install the latest release above.
+> macOS Gatekeeper still warns on a downloaded unsigned binary. `install.sh`
+> clears the quarantine flag after install. Signing and notarization need an
+> Apple Developer ID and are not part of CI.
 
 ---
 
@@ -117,10 +121,10 @@ gr0k keeps the multi-provider registry from this tree (see the pager
 | Platform | Auth | Notes |
 | -------- | ---- | ----- |
 | xAI / Grok | `gr0k login` (OIDC) or `XAI_API_KEY` | First-party models |
-| Kimi Code | device OAuth / subscription | `kimi-code/*` catalog |
+| Kimi Code | `gr0k login --kimi` or `/kimi` | Device OAuth; `kimi-code/*` |
 | Moonshot CN / AI | API key | open platform |
-| ChatGPT Codex | ChatGPT OAuth | GPT-5.x reasoning plus experimental full-duplex `/live` voice |
-| **Anthropic Claude (Pro/Max)** | **`/claude`** (TUI) or `gr0k login --claude` | Subscription login; unlocks `anthropic-claude/*` |
+| ChatGPT Codex | `gr0k login --openai` or `/codex` | ChatGPT OAuth; experimental `/live` voice |
+| **Anthropic Claude (Pro/Max)** | **`gr0k login --claude`** or **`/claude`** | Subscription login; `anthropic-claude/*` |
 | **Nexus relay gateway** | **`/nexus <key> [base_url]`** (TUI) or `NEXUS_API_KEY` | Self-hosted OpenAI/Anthropic-compatible relay; `nexus/*` |
 | OpenAI / Anthropic / DeepSeek-style | API keys | BYOK catalog |
 | Z.AI Coding Plan | platform key | international plan |
@@ -134,6 +138,31 @@ OpenAI Codex, …).
 Config and credentials still live under **`~/.grok`** (same paths as
 upstream Grok Build), so existing sessions, API keys, and `auth.json`
 keep working.
+
+A 401 on Kimi, Codex, or Claude refreshes **that** subscription. It does not
+fall through to the xAI session. Open-platform BYOK endpoints (Ollama and
+similar) are not “fixed” by refreshing xAI either. `gr0k logout --all` clears
+the xAI session and the Kimi, Codex, and Claude OAuth scopes. It does not
+delete BYOK platform keys.
+
+```sh
+gr0k login                  # xAI / Grok
+gr0k login --kimi           # Kimi Code
+gr0k login --openai         # ChatGPT Codex (alias: --chatgpt)
+gr0k login --claude         # Claude Pro/Max (alias: --anthropic)
+gr0k logout --kimi          # one scope
+gr0k logout --openai
+gr0k logout --claude
+gr0k logout --all           # xAI + the three subscription scopes
+```
+
+### Themes
+
+`/theme` includes the upstream themes plus the gr0k preset set: Everforest,
+Nord, Dracula, Gruvbox, Catppuccin Mocha/Latte, Solarized dark/light,
+Deep Ocean, Ember, Midnight OLED, and Paper. `terminal` leaves the terminal
+background untouched. `auto` follows the system appearance. Preset ids `6`
+through `17` are stable on-disk values; do not renumber them.
 
 ### Anthropic Claude login (Pro/Max)
 
@@ -250,11 +279,15 @@ See [`CHANGELOG.md`](./CHANGELOG.md) for release notes. Known limitations:
 
 1. Set the root [`VERSION`](VERSION) file to the **monorepo lockstep client
    version** (same as `crates/codegen/xai-grok-pager/Cargo.toml` /
-   `xai-grok-version`, currently `0.2.110`). CI compiles this into
+   `xai-grok-version`, currently `0.2.115`). CI compiles this into
    `x-grok-client-version`; xAI rejects clients below **0.1.202** (HTTP 426).
    Do **not** invent a separate low marketing version (e.g. `0.1.0`).
-2. Commit on `dev` (or your release branch); update `CHANGELOG.md`.
-3. Tag and push — CI builds five targets and publishes a GitHub Release:
+2. Commit on `merge-official` (or your release branch); update `CHANGELOG.md`.
+3. Tag and push — CI builds five targets and publishes a GitHub Release.
+   `workflow_dispatch` builds the same targets and uploads Actions artifacts
+   only. The Windows target currently fails to compile `cc` 1.2.48 on
+   Rust 1.94 (`FILE_ATTRIBUTE_TEMPORARY` is `i32` there); macOS and Linux
+   do not compile that code.
 
 ```sh
 VERSION=$(tr -d '[:space:]' < VERSION)
@@ -268,14 +301,14 @@ Artifacts:
 
 | Asset | Example |
 | ----- | ------- |
-| macOS arm64 | `gr0k-0.2.110-aarch64-apple-darwin.tar.gz` |
-| macOS x86_64 | `gr0k-0.2.110-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 (glibc) | `gr0k-0.2.110-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 (glibc) | `gr0k-0.2.110-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `gr0k-0.2.110-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `gr0k-0.2.115-aarch64-apple-darwin.tar.gz` |
+| macOS x86_64 | `gr0k-0.2.115-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 (glibc) | `gr0k-0.2.115-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (glibc) | `gr0k-0.2.115-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `gr0k-0.2.115-x86_64-pc-windows-msvc.zip` |
 | Checksums | `SHA256SUMS` |
 
-The tag must match `VERSION` exactly (`v0.2.110` ↔ `0.2.110`) or the build fails.
+The tag must match `VERSION` exactly (`v0.2.115` ↔ `0.2.115`) or the build fails.
 
 ---
 

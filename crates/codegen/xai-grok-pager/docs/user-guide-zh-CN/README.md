@@ -1,6 +1,8 @@
-# Grok Build 用户指南
+# gr0k 用户指南
 
-了解如何安装、配置和扩展 Grok Build——由 SpaceXAI 提供的终端 AI 编程助手。
+了解如何安装、配置和扩展 **gr0k**。它是 Grok Build 的多供应商社区构建。二进制名是 `gr0k`。配置、登录和会话仍在 `~/.grok`。二进制安装目录是 `~/.gr0k`。
+
+下文若仍写成 `grok`，那是上游写法。本构建请改用 `gr0k`（`gr0k login --kimi`、`gr0k login --openai`、`gr0k login --claude`、`gr0k logout --all`）。
 
 > **English:** [User Guide (EN)](../user-guide/README.md)
 
@@ -35,7 +37,7 @@
 | 29 | [模型、平台与 Scoped 选择](29-models-providers-and-scoped-selection.md) | OpenAI 兼容立场、目录、`/scoped-models` 与 Alt+] 循环 |
 | 30 | [OpenAI 提示缓存](30-openai-prompt-caching.md) | `prompt_cache_key`、retention、`/usage` 命中率（仅 OpenAI） |
 | 25 | [Moonshot 提供方](25-moonshot-providers.md) | 内置 Moonshot / Kimi 开放平台 API 密钥（`moonshot-cn`、`moonshot-ai`） |
-| 26 | [Kimi Code 订阅](26-kimi-code.md) | Kimi Code 的设备 OAuth 登录（`grok login --kimi`） |
+| 26 | [Kimi Code 订阅](26-kimi-code.md) | Kimi Code 的设备 OAuth 登录（`gr0k login --kimi`） |
 | 27 | [OpenAI 与 Anthropic](27-openai-anthropic.md) | 内置 OpenAI Responses 与 Anthropic Messages 平台 |
 | 12 | [项目规则（AGENTS.md）](12-project-rules.md) | 按目录生效的 AGENTS.md 指令及其优先级 |
 | 13 | [记忆](13-memory.md) | 跨会话知识持久化，配合 `/flush`、`/dream` 与混合搜索 |

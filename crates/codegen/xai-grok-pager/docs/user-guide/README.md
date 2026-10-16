@@ -1,6 +1,8 @@
-# Grok Build User Guide
+# gr0k User Guide
 
-Learn how to install, configure, and extend Grok Build, the terminal-based AI coding assistant from SpaceXAI.
+Learn how to install, configure, and extend **gr0k**, the multi-provider community build of Grok Build. The binary is `gr0k`. Config, auth, and sessions stay in `~/.grok`. The install root for the binary is `~/.gr0k`.
+
+Commands below that still say `grok` are the upstream spelling. On this build, run `gr0k` instead (`gr0k login --kimi`, `gr0k login --openai`, `gr0k login --claude`, `gr0k logout --all`).
 
 > **中文:** [用户指南（中文）](../user-guide-zh-CN/README.md)
 
@@ -35,7 +37,7 @@ Customize and extend Grok Build.
 | 29 | [Models, Providers, Scoped Selection](29-models-providers-and-scoped-selection.md) | OpenAI-compat stance, catalog, `/scoped-models` + Alt+] cycle |
 | 30 | [OpenAI Prompt Caching](30-openai-prompt-caching.md) | `prompt_cache_key`, retention, `/usage` hit rate (OpenAI only) |
 | 25 | [Moonshot Providers](25-moonshot-providers.md) | Built-in Moonshot / Kimi open-platform API keys (`moonshot-cn`, `moonshot-ai`) |
-| 26 | [Kimi Code Subscription](26-kimi-code.md) | Device OAuth login for Kimi Code (`grok login --kimi`) |
+| 26 | [Kimi Code Subscription](26-kimi-code.md) | Device OAuth login for Kimi Code (`gr0k login --kimi`) |
 | 27 | [OpenAI & Anthropic](27-openai-anthropic.md) | Built-in OpenAI Responses and Anthropic Messages platforms |
 | 12 | [Project Rules (AGENTS.md)](12-project-rules.md) | Per-directory AGENTS.md instructions and their precedence |
 | 13 | [Memory](13-memory.md) | Cross-session knowledge persistence with `/flush`, `/dream`, and hybrid search |
