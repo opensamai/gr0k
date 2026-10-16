@@ -55,13 +55,13 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
     use xai_grok_telemetry::process_info::LeaderMode::Standalone;
     let (entrypoint, interactivity) = match command {
         Some(Command::Agent(_)) => return None,
-        Some(Command::Dashboard) => return None,
+        Some(Command::Dashboard(_)) => return None,
         Some(Command::Login { .. }) => (Entrypoint::Cli, Interactivity::Interactive),
         Some(
             Command::Inspect { .. }
             | Command::Doctor(_)
             | Command::Leader(_)
-            | Command::Logout
+            | Command::Logout { .. }
             | Command::Mcp(_)
             | Command::Plugin(_)
             | Command::Memory(_)
@@ -98,14 +98,14 @@ fn command_needs_pre_sandbox_policy_heal(command: Option<&Command>) -> bool {
     match command {
         None
         | Some(Command::Agent(_))
-        | Some(Command::Dashboard)
+        | Some(Command::Dashboard(_))
         | Some(Command::Models)
         | Some(Command::Worktree(_)) => true,
         Some(
             Command::Inspect { .. }
             | Command::Doctor(_)
             | Command::Leader(_)
-            | Command::Logout
+            | Command::Logout { .. }
             | Command::Login { .. }
             | Command::Mcp(_)
             | Command::Plugin(_)
@@ -2506,8 +2506,9 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 } else {
                     let config = xai_grok_shell::config::load_agent_config_disk_only()
                         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
+                    let grok_com_config = config.grok_com_config.clone();
                     let authenticated = xai_grok_login::run_cli_login(
-                        config.grok_com_config.clone(),
+                        grok_com_config,
                         config.login_device_flow,
                         config.endpoints.proxy_url(),
                         oauth,
@@ -2516,7 +2517,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                         |auth_manager| {
                             xai_grok_shell::agent::init::update_telemetry_config(
                                 &config, auth_manager,
-                            )
+                            );
                         },
                     )
                     .await?;
@@ -2537,7 +2538,10 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
                     let config = AgentConfig::new_from_toml_cfg(&config)
                         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                    xai_grok_shell::auth::run_cli_logout_all(&config)?;
+                    let grok_com = config.grok_com_config.clone();
+                    xai_grok_shell::auth::run_cli_logout_all(move || {
+                        xai_grok_shell::auth::run_cli_logout(&grok_com)
+                    })?;
                 } else if kimi {
                     xai_grok_shell::auth::run_cli_logout_kimi()?;
                 } else if openai {
@@ -2549,7 +2553,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
                     let config = AgentConfig::new_from_toml_cfg(&config)
                         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-                    xai_grok_shell::auth::run_cli_logout(&config)?;
+                    xai_grok_shell::auth::run_cli_logout(&config.grok_com_config)?;
                 }
                 xai_grok_shell::instrumentation::finalize_and_exit(0);
             }
