@@ -13,7 +13,7 @@ use crate::live::state::{DraftSnapshot, LiveState};
 /// Stop `/voice` dictation if it's active or pending (mutual exclusion —
 /// starting Live stops Voice, including asynchronous/pending starts).
 fn stop_voice_for_live(app: &mut AppView) {
-    if app.voice_listening() || app.voice_state.pending_cold_start() {
+    if app.voice_listening() || app.voice_state.is_pending_cold_start() {
         app.voice_reset();
     }
     app.voice_ui_active = false;
@@ -66,8 +66,45 @@ pub(super) fn dispatch_live_toggle(app: &mut AppView) -> Vec<Effect> {
         // session for this same agent_id and transitions to ColdStart exactly
         // once.
         app.live_runtime.state = LiveState::PendingUnbound { agent_id, draft };
-        super::session::lifecycle::skip_picker_and_create_session(app, agent_id)
+        create_session_for_live(app, agent_id)
     }
+}
+
+/// Create an ACP session on an EXISTING agent (the former
+/// `lifecycle::skip_picker_and_create_session`, removed in the official
+/// lifecycle refactor). Used only by the Live `PendingUnbound` path: the
+/// picker is already dismissed and the agent shell exists, so this just arms
+/// MCP progress/history loading and emits `Effect::CreateSession`.
+fn create_session_for_live(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
+    if app
+        .agents
+        .get(&agent_id)
+        .is_some_and(|a| a.session.session_id.is_some() || a.mcp_init_progress.is_some())
+    {
+        return vec![];
+    }
+    let chat_kind = super::prompt::consume_chat_kind(app);
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.chat_kind = chat_kind;
+        agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.mcp_init_progress = Some(crate::app::agent_view::McpInitProgress {
+            total: 0,
+            connected: 0,
+        });
+        agent.session.prompt_history_loading = true;
+        if let Some(qv) = agent.question_view.take() {
+            agent.prompt.restore(qv.stashed_prompt);
+        }
+    }
+    let preferred_session_id = app.deferred_startup.preferred_session_id.take();
+    vec![Effect::CreateSession {
+        agent_id,
+        cwd: app.cwd.clone(),
+        model_id: None,
+        permission_mode_override: None,
+        preferred_session_id,
+        chat_kind,
+    }]
 }
 
 /// Transition to `ColdStart` — the event loop picks this up and spawns the

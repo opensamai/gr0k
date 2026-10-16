@@ -111,22 +111,22 @@ impl FeedbackModalState {
         );
         let mut shortcuts = vec![
             Shortcut {
-                label: "↑↓/j k move",
+                label: std::borrow::Cow::Borrowed("↑↓/j k move"),
                 clickable: false,
                 id: 0,
             },
             Shortcut {
-                label: "/ search",
+                label: std::borrow::Cow::Borrowed("/ search"),
                 clickable: false,
                 id: 0,
             },
             Shortcut {
-                label: "Enter open",
+                label: std::borrow::Cow::Borrowed("Enter open"),
                 clickable: false,
                 id: 0,
             },
             Shortcut {
-                label: "d delete",
+                label: std::borrow::Cow::Borrowed("d delete"),
                 clickable: false,
                 id: 0,
             },
@@ -373,7 +373,7 @@ impl FeedbackModalState {
         PromptStyle {
             show_prefix: false,
             placeholder_when_focused: true,
-            placeholder_override: Some("Tell us what happened"),
+            placeholder_override: Some(std::borrow::Cow::Borrowed("Tell us what happened")),
             // Chips only: the fullscreen preview overlay would paint over the modal.
             image_preview: false,
             ..PromptStyle::overlay()
@@ -382,25 +382,25 @@ impl FeedbackModalState {
 
     const WRITE_SHORTCUTS: &[Shortcut<'static>] = &[
         Shortcut {
-            label: "Enter submit",
+            label: std::borrow::Cow::Borrowed("Enter submit"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Esc cancel",
+            label: std::borrow::Cow::Borrowed("Esc cancel"),
             clickable: true,
             id: CANCEL_SHORTCUT_ID,
         },
     ];
 
     const UNKNOWN_SUBMIT_SHORTCUTS: &[Shortcut<'static>] = &[Shortcut {
-        label: "Esc close",
+        label: std::borrow::Cow::Borrowed("Esc close"),
         clickable: false,
         id: 0,
     }];
 
     const TERMINAL_SUBMIT_SHORTCUTS: &[Shortcut<'static>] = &[Shortcut {
-        label: "Esc close",
+        label: std::borrow::Cow::Borrowed("Esc close"),
         clickable: false,
         id: 0,
     }];
@@ -408,17 +408,17 @@ impl FeedbackModalState {
     /// Same as [`Self::WRITE_SHORTCUTS`] plus the label-row hint; shown only when enums were supplied.
     const WRITE_SHORTCUTS_WITH_LABELS: &[Shortcut<'static>] = &[
         Shortcut {
-            label: "Enter submit",
+            label: std::borrow::Cow::Borrowed("Enter submit"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "↑/Tab labels",
+            label: std::borrow::Cow::Borrowed("↑/Tab labels"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Esc cancel",
+            label: std::borrow::Cow::Borrowed("Esc cancel"),
             clickable: true,
             id: CANCEL_SHORTCUT_ID,
         },
@@ -427,22 +427,22 @@ impl FeedbackModalState {
     // Esc while a label row is focused returns to the composer, so no cancel hint here.
     const METADATA_SHORTCUTS: &[Shortcut<'static>] = &[
         Shortcut {
-            label: "↑↓ move",
+            label: std::borrow::Cow::Borrowed("↑↓ move"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "←→ value",
+            label: std::borrow::Cow::Borrowed("←→ value"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Enter edit",
+            label: std::borrow::Cow::Borrowed("Enter edit"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Tab done",
+            label: std::borrow::Cow::Borrowed("Tab done"),
             clickable: false,
             id: 0,
         },
@@ -451,12 +451,12 @@ impl FeedbackModalState {
     // Not clickable: a click must not confirm a consent choice, and Esc here backs out instead of cancelling.
     const TRACE_SHORTCUTS: &[Shortcut<'static>] = &[
         Shortcut {
-            label: "Enter select",
+            label: std::borrow::Cow::Borrowed("Enter select"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Esc back",
+            label: std::borrow::Cow::Borrowed("Esc back"),
             clickable: false,
             id: 2,
         },

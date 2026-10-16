@@ -3651,19 +3651,19 @@ pub fn render_extensions_modal(
                 .is_some_and(|k| k.0 == MCP_SERVERS_REFRESH_KEY)
         }) {
             shortcuts.push(Shortcut {
-                label,
+                label: std::borrow::Cow::Borrowed(label.as_str()),
                 clickable: true,
                 id: 100 + i,
             });
         }
         // Same non-clickable hint as the list footer; the painted URL is the mouse target.
         shortcuts.push(Shortcut {
-            label: MCP_SERVERS_OPEN_CONNECTORS_FOOTER,
+            label: std::borrow::Cow::Borrowed(MCP_SERVERS_OPEN_CONNECTORS_FOOTER),
             clickable: false,
             id: 0,
         });
         shortcuts.push(Shortcut {
-            label: "esc back",
+            label: std::borrow::Cow::Borrowed("esc back"),
             clickable: true,
             id: WAIT_BACK_SHORTCUT_ID,
         });

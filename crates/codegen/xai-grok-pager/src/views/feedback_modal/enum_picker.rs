@@ -94,22 +94,22 @@ impl FeedbackModalState {
     // Esc closes the picker back to the label rows, never the modal, so no cancel hint here.
     pub(super) const PICKER_SHORTCUTS: &[Shortcut<'static>] = &[
         Shortcut {
-            label: "↑↓ move",
+            label: std::borrow::Cow::Borrowed("↑↓ move"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "type filter",
+            label: std::borrow::Cow::Borrowed("type filter"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Enter select",
+            label: std::borrow::Cow::Borrowed("Enter select"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Esc back",
+            label: std::borrow::Cow::Borrowed("Esc back"),
             clickable: false,
             id: 0,
         },

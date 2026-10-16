@@ -2187,7 +2187,7 @@ impl AgentView {
                         });
                     }
                     shortcuts.push(Shortcut {
-                        label: "/ search",
+                        label: std::borrow::Cow::Borrowed("/ search"),
                         clickable: false,
                         id: 0,
                     });

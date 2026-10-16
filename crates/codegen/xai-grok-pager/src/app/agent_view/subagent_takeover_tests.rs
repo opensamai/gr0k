@@ -249,7 +249,7 @@ fn takeover_draw_forwards_pending_hint_and_child_cursor() {
         &mut scratch,
         Some(PendingHint {
             shortcut: crate::key!(Esc),
-            label: "clear pending hint",
+            label: std::borrow::Cow::Borrowed("clear pending hint"),
         }),
         false,
         crate::app::agent_view::BannerSlotParams::none(),

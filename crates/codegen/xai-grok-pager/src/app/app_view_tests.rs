@@ -327,6 +327,10 @@ pub(crate) fn test_app() -> AppView {
         voice_clip_deadline: None,
         voice_cmd_tx: None,
         voice_state: VoiceState::Idle,
+        #[cfg(feature = "codex-live")]
+        live_runtime: crate::live::state::LiveRuntime::default(),
+        #[cfg(feature = "codex-live")]
+        live_mode_enabled: false,
     }
 }
 pub(crate) fn test_app_with_agent() -> AppView {
@@ -3485,7 +3489,10 @@ fn ctrl_d_double_press_quits_from_prompt() {
         "first Ctrl+D should set pending quit, got: {outcome:?}",
     );
     assert!(app.pending_action.is_some());
-    assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+    assert_eq!(
+        app.pending_action.as_ref().unwrap().label.as_deref(),
+        Some("quit")
+    );
     let outcome = app.handle_input(&ctrl_d());
     assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
     assert!(app.pending_action.is_none());
@@ -3510,7 +3517,10 @@ fn ctrl_d_in_vscode_quits_from_scrollback() {
         "first Ctrl+D should set pending quit, got: {outcome:?}",
     );
     assert!(app.pending_action.is_some());
-    assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+    assert_eq!(
+        app.pending_action.as_ref().unwrap().label.as_deref(),
+        Some("quit")
+    );
     let outcome = app.handle_input(&ctrl_d());
     assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
     assert!(app.pending_action.is_none());
@@ -3521,7 +3531,10 @@ fn ctrl_q_sets_pending_action() {
     let outcome = app.handle_input(&ctrl_q());
     assert!(matches!(outcome, InputOutcome::Changed));
     assert!(app.pending_action.is_some());
-    assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+    assert_eq!(
+        app.pending_action.as_ref().unwrap().label.as_deref(),
+        Some("quit")
+    );
 }
 #[test]
 fn ctrl_q_double_press_quits() {
@@ -3569,7 +3582,7 @@ fn ctrl_n_sets_pending_new_session() {
     let outcome = app.handle_input(&ctrl_n());
     assert!(matches!(outcome, InputOutcome::Changed));
     let pending = app.pending_action.as_ref().expect("pending action");
-    assert_eq!(pending.label, Some("new"));
+    assert_eq!(pending.label.as_deref(), Some("new"));
 }
 #[test]
 fn welcome_ctrl_n_starts_session_without_confirm() {
@@ -3628,14 +3641,17 @@ fn ctrl_c_cancelling_escalates_to_quit_pending() {
     let outcome = app.handle_input(&ctrl_c());
     assert!(matches!(outcome, InputOutcome::Changed));
     assert!(app.pending_action.is_some());
-    assert_eq!(app.pending_action.as_ref().unwrap().label, Some("quit"));
+    assert_eq!(
+        app.pending_action.as_ref().unwrap().label.as_deref(),
+        Some("quit")
+    );
 }
 fn assert_pending_quit(app: &AppView) {
     let pending = app
         .pending_action
         .as_ref()
         .expect("expected pending action");
-    assert_eq!(pending.label, Some("quit"));
+    assert_eq!(pending.label.as_deref(), Some("quit"));
     assert!(matches!(pending.action, Action::Quit));
 }
 #[test]
@@ -4040,7 +4056,7 @@ fn idle_non_empty_double_esc_clears_prompt() {
     let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
     assert!(matches!(outcome, InputOutcome::Changed));
     let pending = app.pending_action.as_ref().expect("arm clear");
-    assert_eq!(pending.label, Some("clear"));
+    assert_eq!(pending.label.as_deref(), Some("clear"));
     assert!(matches!(pending.action, Action::ClearPrompt));
     let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
     assert!(matches!(outcome, InputOutcome::Action(Action::ClearPrompt)));
@@ -4396,7 +4412,7 @@ fn idle_non_empty_esc_ttl_expiry_re_arms_without_clearing() {
         "expired first Esc must not clear"
     );
     let pending = app.pending_action.as_ref().expect("re-arm clear");
-    assert_eq!(pending.label, Some("clear"));
+    assert_eq!(pending.label.as_deref(), Some("clear"));
 }
 #[test]
 fn idle_images_only_double_esc_arms_clear() {
@@ -6641,7 +6657,7 @@ fn overlay_esc_with_draft_arms_clear_not_backout() {
         "a drafted overlay prompt Esc must NOT back out, got {outcome:?}",
     );
     let pending = app.pending_action.as_ref().expect("clear arm");
-    assert_eq!(pending.label, Some("clear"));
+    assert_eq!(pending.label.as_deref(), Some("clear"));
 }
 /// A Bash/Remember empty prompt keeps Esc as its mode-exit even in an overlay.
 /// The back-out is gated to `PromptInputMode::Normal`, so the special-mode Esc is not stolen as a dashboard back-out.
@@ -6708,6 +6724,7 @@ fn open_agents_modal() -> crate::views::agents_modal::AgentsModalState {
         None,
         None,
         None,
+        Vec::new(),
     )
 }
 /// With a pending input overlay, neither `q` nor `Esc` is consumed as a dashboard-overlay exit.
@@ -7710,7 +7727,7 @@ fn v2_overlay_ctrl_x_confirms_local_close_for_unbound_working_agent() {
     assert_eq!(
         app.pending_action
             .as_ref()
-            .and_then(|pending| pending.label),
+            .and_then(|pending| pending.label.as_deref()),
         Some("close this session")
     );
     let second = app.handle_input(&key_event(KeyCode::Char('x'), KeyModifiers::CONTROL));
@@ -7734,7 +7751,7 @@ fn overlay_ctrl_x_idle_agent_arms_close_confirm() {
         matches!(pending.action, Action::DashboardOverlayStop),
         "pending action must be the overlay stop",
     );
-    assert_eq!(pending.label, Some("close this session"));
+    assert_eq!(pending.label.as_deref(), Some("close this session"));
     assert!(
         !pending.expired(),
         "the confirm window must still be live right after arming",
@@ -7754,7 +7771,7 @@ fn workspace_overlay_ctrl_x_uses_archive_confirmation_copy() {
     assert!(matches!(outcome, InputOutcome::Changed));
     let pending = app.pending_action.as_ref().expect("confirm must be armed");
     assert!(matches!(pending.action, Action::DashboardOverlayStop));
-    assert_eq!(pending.label, Some("archive this session"));
+    assert_eq!(pending.label.as_deref(), Some("archive this session"));
 }
 #[test]
 fn overlay_ctrl_x_second_press_fires_overlay_stop() {

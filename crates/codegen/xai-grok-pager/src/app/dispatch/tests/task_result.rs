@@ -1330,8 +1330,7 @@ fn switch_model_complete_warns_when_context_nears_target_window() {
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
-            model_id: model_id.clone(),
-            effort: None,
+            choice: ModelChoice::new(model_id.clone()),
             result: Ok(()),
             prev_model_id: None,
         }),
@@ -1367,8 +1366,7 @@ fn switch_model_complete_never_persists_codex_as_grok_default() {
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SwitchModelComplete {
             agent_id: id,
-            model_id: model_id.clone(),
-            effort: None,
+            choice: ModelChoice::new(model_id.clone()),
             result: Ok(()),
             prev_model_id: None,
         }),

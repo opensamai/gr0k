@@ -893,7 +893,7 @@ pub fn render_welcome(
                     notice,
                     params.selected,
                     params.consent_hover_link,
-                    params.pending_hint,
+                    params.pending_hint.clone(),
                     h_margin,
                     params.compact,
                 )

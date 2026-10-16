@@ -19,7 +19,7 @@ impl Drop for VimModeGuard {
 
 fn header(label: &'static str, idx: usize, count: usize) -> ShortcutsHelpEntry {
     ShortcutsHelpEntry::SectionHeader {
-        label,
+        label: std::borrow::Cow::Borrowed(label),
         category_idx: idx,
         entry_count: count,
     }
@@ -262,7 +262,7 @@ fn build_entries_groups_by_category() {
     let headers: Vec<&str> = entries
         .iter()
         .filter_map(|e| match e {
-            ShortcutsHelpEntry::SectionHeader { label, .. } => Some(*label),
+            ShortcutsHelpEntry::SectionHeader { label, .. } => Some(label.as_ref()),
             _ => None,
         })
         .collect();
@@ -2218,7 +2218,7 @@ fn render_modal_shows_long_help_only_when_expanded() {
     item.description = Some("Quit the app".into());
     let entries = vec![
         ShortcutsHelpEntry::SectionHeader {
-            label: "Essentials",
+            label: std::borrow::Cow::Borrowed("Essentials"),
             category_idx: 0,
             entry_count: 1,
         },
@@ -2279,7 +2279,7 @@ fn cheatsheet_rows_inline_help_joins_newlines_with_spaces() {
     item.description = Some("Quit the app".into());
     let entries = vec![
         ShortcutsHelpEntry::SectionHeader {
-            label: "Essentials",
+            label: std::borrow::Cow::Borrowed("Essentials"),
             category_idx: 0,
             entry_count: 1,
         },
@@ -2315,7 +2315,7 @@ fn inline_expand_with_no_help_renders_no_description_line() {
     let item = HintItem::new(key!('q', CONTROL), "quit");
     let entries = vec![
         ShortcutsHelpEntry::SectionHeader {
-            label: "Essentials",
+            label: std::borrow::Cow::Borrowed("Essentials"),
             category_idx: 0,
             entry_count: 1,
         },

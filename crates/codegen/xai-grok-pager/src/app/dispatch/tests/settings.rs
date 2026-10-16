@@ -336,7 +336,7 @@ fn slash_codex_model_switch_never_persists_into_grok_config() {
     assert_eq!(effects.len(), 1, "Codex selection must be session-only");
     assert!(matches!(
         &effects[0],
-        Effect::SwitchModel { model_id: selected, .. } if selected == &model_id
+        Effect::SwitchModel { choice, .. } if choice.model_id == model_id
     ));
     assert!(
         !effects.iter().any(|effect| matches!(

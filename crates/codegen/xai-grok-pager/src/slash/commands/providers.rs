@@ -383,6 +383,7 @@ mod tests {
             bundle_state: &EMPTY_BUNDLE,
             screen_mode: crate::app::ScreenMode::Inline,
             billing_surface_visible: true,
+            usage_command_visible: true,
             pager_state: crate::settings::PagerLocalSnapshot::default(),
         }
     }
@@ -513,7 +514,9 @@ mod tests {
         let models = ModelState::default();
         let mut ctx = dummy_exec_ctx(&models);
         match ProvidersCommand.run(&mut ctx, "zai clear") {
-            CommandResult::Action(Action::SetPlatformApiKey { platform, api_key, .. }) => {
+            CommandResult::Action(Action::SetPlatformApiKey {
+                platform, api_key, ..
+            }) => {
                 assert_eq!(platform, "zai");
                 assert!(api_key.is_empty());
             }
@@ -527,7 +530,9 @@ mod tests {
         let mut ctx = dummy_exec_ctx(&models);
         for cmd in ["clear zai-coding", "logout zai-coding", "remove zai-coding"] {
             match ProvidersCommand.run(&mut ctx, cmd) {
-                CommandResult::Action(Action::SetPlatformApiKey { platform, api_key, .. }) => {
+                CommandResult::Action(Action::SetPlatformApiKey {
+                    platform, api_key, ..
+                }) => {
                     assert_eq!(platform, "zai-coding", "cmd={cmd}");
                     assert!(api_key.is_empty(), "cmd={cmd}");
                 }
@@ -554,8 +559,12 @@ mod tests {
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
             billing_surface_visible: true,
+            usage_command_visible: true,
             workflows_available: true,
+            saved_workflows: &[],
+            workflow_runs: &[],
             screen_mode: crate::app::ScreenMode::Inline,
+            current_title: None,
         };
         let items = ProvidersCommand.suggest_args(&ctx, "").expect("items");
         assert!(
@@ -574,8 +583,12 @@ mod tests {
             cwd: std::path::Path::new("."),
             has_session_announcements: false,
             billing_surface_visible: true,
+            usage_command_visible: true,
             workflows_available: true,
+            saved_workflows: &[],
+            workflow_runs: &[],
             screen_mode: crate::app::ScreenMode::Inline,
+            current_title: None,
         };
         let items = ProvidersCommand
             .suggest_args(&ctx, "clear ")

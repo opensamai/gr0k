@@ -221,6 +221,8 @@ mod tests {
                 child_session_id: child.to_owned(),
                 status: "completed".to_owned(),
                 error: Some(output.to_owned()),
+                termination_reason: None,
+                usage: None,
                 tool_calls: 0,
                 turns: 0,
                 duration_ms: 1,

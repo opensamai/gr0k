@@ -162,7 +162,7 @@ fn a_pending_double_press_replaces_the_version_badge() {
 
     let hint = crate::views::shortcuts_bar::PendingHint {
         shortcut: crate::input::key::KeyShortcut::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        label: "quit",
+        label: std::borrow::Cow::Borrowed("quit"),
     };
 
     let (buf, _) = render_with(100, 40, &notice(), None, Some(hint));

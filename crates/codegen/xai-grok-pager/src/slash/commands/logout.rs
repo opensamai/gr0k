@@ -147,6 +147,7 @@ mod tests {
             bundle_state: &EMPTY_BUNDLE,
             screen_mode: crate::app::ScreenMode::Inline,
             billing_surface_visible: true,
+            usage_command_visible: true,
             pager_state: PagerLocalSnapshot::default(),
         }
     }
@@ -166,7 +167,9 @@ mod tests {
         let models = ModelState::default();
         let mut c = ctx(&models);
         match LogoutCommand.run(&mut c, "provider zai-coding") {
-            CommandResult::Action(Action::SetPlatformApiKey { platform, api_key, .. }) => {
+            CommandResult::Action(Action::SetPlatformApiKey {
+                platform, api_key, ..
+            }) => {
                 assert_eq!(platform, "zai-coding");
                 assert!(api_key.is_empty());
             }

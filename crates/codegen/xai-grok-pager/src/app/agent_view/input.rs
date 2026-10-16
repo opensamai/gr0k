@@ -2271,7 +2271,7 @@ mod mid_turn_esc_hint_tests {
             } else {
                 assert_eq!(
                     Some("Press Ctrl+c to cancel the turn"),
-                    agent.active_toast_message(),
+                    agent.active_toast_message().as_deref(),
                     "vim={vim_mode} pane={pane:?}"
                 );
             }

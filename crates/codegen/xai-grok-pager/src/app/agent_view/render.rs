@@ -190,7 +190,10 @@ impl AgentView {
                 ]
             }
             QuestionFocus::InputMode => {
-                vec![HintItem::new(key!(Enter), rust_i18n::t!("hints.submit")), esc]
+                vec![
+                    HintItem::new(key!(Enter), rust_i18n::t!("hints.submit")),
+                    esc,
+                ]
             }
             QuestionFocus::Navigation if qv.is_prompt_blocked() => {
                 vec![HintItem::new(key!(Tab), "next answer"), esc]
@@ -4791,7 +4794,7 @@ mod overlay_cycle_hint_tests {
         assert!(!text.contains("Ctrl+x:stop"), "{text}");
         let confirming = render(Some(crate::views::shortcuts_bar::PendingHint {
             shortcut: crate::key!('x', CONTROL),
-            label: "archive",
+            label: std::borrow::Cow::Borrowed("archive"),
         }));
         assert!(
             confirming.contains("press again to archive"),

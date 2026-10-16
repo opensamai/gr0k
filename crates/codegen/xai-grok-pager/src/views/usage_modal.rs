@@ -547,19 +547,19 @@ pub fn render_usage_modal(
 
     let mut shortcuts: Vec<Shortcut> = vec![
         Shortcut {
-            label: "Tab switch",
+            label: std::borrow::Cow::Borrowed("Tab switch"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "\u{2191}/\u{2193} scroll",
+            label: std::borrow::Cow::Borrowed("\u{2191}/\u{2193} scroll"),
             clickable: false,
             id: 0,
         },
     ];
     if state.ctx.session_id.is_some() {
         shortcuts.push(Shortcut {
-            label: "c copy session ID",
+            label: std::borrow::Cow::Borrowed("c copy session ID"),
             clickable: true,
             id: COPY_SESSION_ID_SHORTCUT,
         });
@@ -568,13 +568,13 @@ pub fn render_usage_modal(
         && state.session_fields.as_ref().is_some_and(|f| !f.is_empty())
     {
         shortcuts.push(Shortcut {
-            label: "y copy all",
+            label: std::borrow::Cow::Borrowed("y copy all"),
             clickable: true,
             id: COPY_ALL_SESSION_INFO_SHORTCUT,
         });
     }
     shortcuts.push(Shortcut {
-        label: "Esc close",
+        label: std::borrow::Cow::Borrowed("Esc close"),
         clickable: false,
         id: 0,
     });

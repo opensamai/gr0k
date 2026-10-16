@@ -37,6 +37,9 @@ impl SlashCommand for RenameCommand {
             match_text: title.to_owned(),
             insert_text: title.to_owned(),
             description: "current title".to_string(),
+            locked: false,
+            action_id: None,
+            hidden: false,
         }])
     }
 

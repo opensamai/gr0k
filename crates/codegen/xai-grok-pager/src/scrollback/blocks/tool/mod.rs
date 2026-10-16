@@ -159,6 +159,7 @@ impl VerbGroupKind {
             VerbGroupKind::Command => "command",
             VerbGroupKind::OtherTool => "other_tool",
             VerbGroupKind::EditFile => "edit_file",
+            VerbGroupKind::Message => "message",
         }
     }
 

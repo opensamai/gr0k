@@ -171,22 +171,22 @@ fn render_simple_session_picker_modal(
 
     let shortcuts = vec![
         Shortcut {
-            label: "\u{2191}\u{2193} nav",
+            label: std::borrow::Cow::Borrowed("\u{2191}\u{2193} nav"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Enter select",
+            label: std::borrow::Cow::Borrowed("Enter select"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "/ search",
+            label: std::borrow::Cow::Borrowed("/ search"),
             clickable: false,
             id: 0,
         },
         Shortcut {
-            label: "Esc close",
+            label: std::borrow::Cow::Borrowed("Esc close"),
             clickable: false,
             id: 0,
         },
